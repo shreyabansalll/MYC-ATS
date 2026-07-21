@@ -10,17 +10,16 @@
 # Run: uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2
 
 import os
+import re
 import uuid
 import shutil
 import hashlib
-import traceback
 import logging
 import json
 import time
 import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional
 
 from fastapi import (
@@ -44,22 +43,32 @@ from models.candidate_profile import build_candidate_profile
 
 # ── Logging — structured JSON, NO PII ────────────────────────────────
 
+_PII_PATTERNS = [
+    re.compile(r'[\w.+-]{4,}@[\w-]+\.\w+'),          # email
+    re.compile(r'[+]?\d[\d\s\-().]{8,}\d'),           # phone
+    re.compile(r'\b[A-Z]\d{7,8}\b'),                   # passport
+    re.compile(r'\b\d{2}[A-Z]{2}\d{5,7}\b'),          # CDC
+    re.compile(r'\b\d{2}[A-Z]{2}\d{4}\b'),            # INDOS
+]
+
+
+def redact_pii(text: str) -> str:
+    """
+    Strips email/phone/passport/CDC/INDOS patterns. Shared by PiiFilter
+    (log output) and anything persisted to the DB or returned via the API
+    — error messages aren't exempt from the same privacy guarantee just
+    because they're stored instead of logged.
+    """
+    for pat in _PII_PATTERNS:
+        text = pat.sub('[REDACTED]', text)
+    return text
+
+
 class PiiFilter(logging.Filter):
-    """Strips email, phone, passport patterns from log messages."""
-    import re as _re
-    _PATTERNS = [
-        _re.compile(r'[\w.+-]{4,}@[\w-]+\.\w+'),          # email
-        _re.compile(r'[+]?\d[\d\s\-().]{8,}\d'),           # phone
-        _re.compile(r'\b[A-Z]\d{7,8}\b'),                   # passport
-        _re.compile(r'\b\d{2}[A-Z]{2}\d{5,7}\b'),          # CDC
-        _re.compile(r'\b\d{2}[A-Z]{2}\d{4}\b'),            # INDOS
-    ]
+    """Strips PII patterns from log messages — see redact_pii() above."""
 
     def filter(self, record):
-        msg = str(record.getMessage())
-        for pat in self._PATTERNS:
-            msg = pat.sub('[REDACTED]', msg)
-        record.msg = msg
+        record.msg = redact_pii(str(record.getMessage()))
         record.args = ()
         return True
 
@@ -87,10 +96,6 @@ API_KEY          = os.getenv('MYC_API_KEY', '')
 MAX_FILE_MB      = int(os.getenv('MAX_FILE_MB', '5'))
 MAX_FILE_BYTES   = MAX_FILE_MB * 1024 * 1024
 ALLOWED_EXTS     = {'pdf', 'docx'}
-ALLOWED_MIMES    = {
-    'application/pdf',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-}
 JOB_TTL_HOURS    = int(os.getenv('JOB_TTL_HOURS', '48'))   # auto-delete outputs after 48h
 MIN_DISK_FREE_MB = 200                                        # refuse uploads if disk low
 
@@ -239,10 +244,13 @@ app.add_middleware(
 # ── Validators ────────────────────────────────────────────────────────
 
 def _check_disk_space():
-    stat = shutil.disk_usage(OUTPUT_DIR)
-    free_mb = stat.free // (1024 * 1024)
-    if free_mb < MIN_DISK_FREE_MB:
-        raise HTTPException(507, f'Insufficient disk space ({free_mb}MB free)')
+    # Uploads land in TMP_DIR first, then outputs go to OUTPUT_DIR — check
+    # both, since they can be different filesystems (e.g. TMP_DIR on tmpfs).
+    for directory in (TMP_DIR, OUTPUT_DIR):
+        stat = shutil.disk_usage(directory)
+        free_mb = stat.free // (1024 * 1024)
+        if free_mb < MIN_DISK_FREE_MB:
+            raise HTTPException(507, f'Insufficient disk space ({free_mb}MB free on {directory})')
 
 
 def _validate_file(contents: bytes, filename: str) -> str:
@@ -373,7 +381,10 @@ def run_pipeline(
         # ── 4. AI Rewrite ─────────────────────────────────────────────
         stage('Rewriting for ATS optimisation', 50)
         rank       = target_rank or candidate_profile.rank_detected
-        all_issues = ats_before['issues'] + maritime_before['issues']
+        # Scrubbed here (not just at log time) since this list is persisted
+        # to issues_json and returned via /ats/result — a PDF/DOCX read
+        # error occasionally embeds raw file content in str(e).
+        all_issues = [redact_pii(i) for i in ats_before['issues'] + maritime_before['issues']]
 
         rewritten = rewrite_resume(
             parsed=parsed,
@@ -480,13 +491,20 @@ def run_pipeline(
     except Exception as e:
         _finish_open_stage()
         log.error(f'"job_id":"{job_id}","error":"{str(e)}"')
-        update_job(
-            db, job_id,
-            status='failed',
-            progress=0,
-            current_stage='Failed',
-            error_detail=str(e),        # traceback NOT stored — may contain PII
-        )
+        try:
+            update_job(
+                db, job_id,
+                status='failed',
+                progress=0,
+                current_stage='Failed',
+                error_detail=redact_pii(str(e)),   # traceback NOT stored — may contain PII
+            )
+        except Exception as db_err:
+            # If even marking the job failed doesn't succeed (e.g. a locked
+            # SQLite write under WAL contention), don't let that mask the
+            # original error or leave the job silently stuck in "processing"
+            # with no trace in the logs of why.
+            log.error(f'"job_id":"{job_id}","error":"failed to record failure: {str(db_err)}"')
     finally:
         # Always clean up temp upload file
         try:
@@ -498,14 +516,15 @@ def run_pipeline(
 # ── Endpoints ─────────────────────────────────────────────────────────
 
 @app.get('/', summary='API root — welcome and documentation')
-def root():
+def root(request: Request):
     """Welcome endpoint. Links to API documentation and health check."""
+    base = str(request.base_url).rstrip('/')
     return {
         'service': 'Marine Your Career — ATS API',
         'version': '2.0.0',
         'description': 'Resume scoring and optimisation for seafarers.',
-        'documentation': 'http://127.0.0.1:8000/docs',
-        'health_check': 'http://127.0.0.1:8000/health',
+        'documentation': f'{base}/docs',
+        'health_check': f'{base}/health',
         'endpoints': {
             'submit_resume': 'POST /ats/submit',
             'check_status': 'GET /ats/status/{job_id}',
@@ -561,8 +580,12 @@ async def submit(
     # Save to temp
     job_id   = str(uuid.uuid4())
     tmp_path = os.path.join(TMP_DIR, f'{job_id}.{ext}')
-    with open(tmp_path, 'wb') as f:
-        f.write(contents)
+    try:
+        with open(tmp_path, 'wb') as f:
+            f.write(contents)
+    except OSError as e:
+        log.error(f'"job_id":"{job_id}","error":"tmp write failed: {redact_pii(str(e))}"')
+        raise HTTPException(500, 'Could not save upload — please try again')
 
     # Create job record
     db.add(Job(job_id=job_id, file_hash=fhash))
