@@ -2,8 +2,19 @@
 import json
 import re
 import time
+import logging
 from groq import Groq, APIConnectionError, APITimeoutError, RateLimitError
 from config import GROQ_API_KEY, GROQ_MODEL
+
+log = logging.getLogger(__name__)
+
+if not GROQ_API_KEY:
+    # Same "warn, don't crash at import" pattern api.py uses for
+    # MYC_API_KEY — every rewrite_resume() call will fail at the Groq
+    # call (caught and handled via the existing AI-rewrite-unavailable
+    # fallback), but this makes a missing key visible at startup in the
+    # logs rather than only showing up as job-level Groq failures.
+    log.warning('"GROQ_API_KEY not set — AI rewrite will fail for every job"')
 
 client = Groq(api_key=GROQ_API_KEY)
 
