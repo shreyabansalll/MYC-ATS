@@ -13,6 +13,7 @@ from pipeline.scorer import score_resume
 from pipeline.maritime_scorer import maritime_score
 from pipeline.ai_rewriter import rewrite_resume
 from pipeline.generator import generate_docx
+from models.candidate_profile import build_candidate_profile
 
 
 def run_pipeline(file_path: str, job_description: str = '') -> dict:
@@ -55,17 +56,21 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     print(f'         Sea      : {maritime["sea_months"]} months')
     print(f'         Certs    : {maritime["cert_coverage"]}')
 
+    # Typed domain object — canonical candidate record for this job.
+    # Downstream stages (rewrite, generate) read from this rather than
+    # the loose parsed/maritime dicts at the scoring/rewriting boundary.
+    candidate_profile = build_candidate_profile(parsed, maritime)
+
     # ── Stage 5: AI Rewrite ──────────────────────────────────────────
     print('\n[5/6] Rewriting resume (Groq)...')
     all_issues = ats['issues'] + maritime['issues']
 
-    # In run_pipeline(), change Stage 5 call:
     rewritten = rewrite_resume(
-    parsed=parsed,
-    issues=all_issues,
-    job_description=job_description,
-    rank=maritime['rank_detected'],
-    license_rank=maritime.get('license_rank', ''),   # ← add this line
+        parsed=parsed,
+        issues=all_issues,
+        job_description=job_description,
+        rank=candidate_profile.rank_detected,
+        license_rank=candidate_profile.license_rank,
     )
 
     if 'error' in rewritten:
@@ -80,9 +85,9 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         }
 
     # Inject fields rewriter doesn't carry
-    rewritten['name']    = parsed['name']
-    rewritten['contact'] = parsed['contact']
-    rewritten['rank']    = maritime['rank_detected']
+    rewritten['name']    = candidate_profile.name
+    rewritten['contact'] = candidate_profile.contact.model_dump()
+    rewritten['rank']    = candidate_profile.rank_detected
 
     print(f'      ✓  Rewrite complete')
     print(f'         Issues to fix: {len(rewritten.get("issues_fixed", []))}')
@@ -116,10 +121,10 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     # ── Final Report ─────────────────────────────────────────────────
     return {
         'candidate': {
-            'name':    parsed['name'],
-            'contact': parsed['contact'],
-            'rank':    maritime['rank_detected'],
-            'skills':  parsed['skills'],
+            'name':    candidate_profile.name,
+            'contact': candidate_profile.contact.model_dump(),
+            'rank':    candidate_profile.rank_detected,
+            'skills':  candidate_profile.skills,
         },
         'scores': {
             'ats_before':      score_before,

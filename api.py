@@ -37,6 +37,7 @@ from pipeline.scorer import score_resume
 from pipeline.maritime_scorer import maritime_score
 from pipeline.ai_rewriter import rewrite_resume
 from pipeline.generator import generate_docx
+from models.candidate_profile import build_candidate_profile
 
 # ── Logging — structured JSON, NO PII ────────────────────────────────
 
@@ -317,9 +318,14 @@ def run_pipeline(
         ats_before      = score_resume(extracted, parsed, job_description)
         maritime_before = maritime_score(extracted['raw_text'], parsed, pdf_path=file_path)
 
+        # Typed domain object — canonical candidate record for this job.
+        # Downstream stages (rewrite, generate) read from this rather than
+        # the loose parsed/maritime dicts at the scoring/rewriting boundary.
+        candidate_profile = build_candidate_profile(parsed, maritime_before)
+
         # ── 4. AI Rewrite ─────────────────────────────────────────────
         stage('Rewriting for ATS optimisation', 50)
-        rank       = target_rank or maritime_before.get('rank_detected', '')
+        rank       = target_rank or candidate_profile.rank_detected
         all_issues = ats_before['issues'] + maritime_before['issues']
 
         rewritten = rewrite_resume(
@@ -327,7 +333,7 @@ def run_pipeline(
             issues=all_issues,
             job_description=job_description,
             rank=rank,
-            license_rank=maritime_before.get('license_rank', ''),
+            license_rank=candidate_profile.license_rank,
         )
 
         # If rewrite failed, use safe fallback (don't crash)
@@ -352,8 +358,8 @@ def run_pipeline(
             log.warning(f'"job_id":"{job_id}","quality_warnings":{json.dumps(quality_warnings)}')
 
         # Inject contact/name back (rewriter doesn't carry these)
-        rewritten['name']    = parsed.get('name', 'Candidate')
-        rewritten['contact'] = parsed.get('contact', {})
+        rewritten['name']    = candidate_profile.name
+        rewritten['contact'] = candidate_profile.contact.model_dump()
         rewritten['rank']    = rank
 
         # ── 5. Generate DOCX ──────────────────────────────────────────
