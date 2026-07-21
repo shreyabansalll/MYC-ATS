@@ -13,6 +13,10 @@ client = Groq(api_key=GROQ_API_KEY)
 GROQ_TRANSIENT_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError)
 GROQ_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
+# Permanent by design, not a stopgap — seafarers submit one resume to many
+# manning agencies/vessels rather than tailoring per posting, so there is no
+# per-candidate JD to ever collect. Do not "fix" this into a JD-upload
+# feature; target_rank + rank-detection is the complete, intended feature.
 MARITIME_JDS = {
     'deck_officer': """
         Seeking experienced Deck Officer with valid STCW certification and CoC.
