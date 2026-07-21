@@ -16,6 +16,9 @@ import hashlib
 import traceback
 import logging
 import json
+import time
+import threading
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -174,6 +177,35 @@ def update_job(db: Session, job_id: str, **kwargs):
             setattr(job, k, v)
         db.commit()
 
+# ── In-memory observability counters ────────────────────────────────────
+# Score deltas and job counts live in the Job table already — these cover
+# what doesn't: per-stage durations and Groq retry/failure counts. Reset on
+# process restart, and NOT shared across `--workers N` (each worker is a
+# separate process) — acceptable for a single-client, single-VPS deployment;
+# revisit only if that stops being true (see architecture doc trigger table).
+
+class _Metrics:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.groq_calls          = 0
+        self.groq_retries_total  = 0
+        self.groq_failures       = 0
+        self.stage_durations     = defaultdict(list)   # stage label -> [seconds, ...]
+
+    def record_stage(self, label: str, seconds: float):
+        with self._lock:
+            self.stage_durations[label].append(seconds)
+
+    def record_groq_attempt(self, retries: int, failed: bool):
+        with self._lock:
+            self.groq_calls += 1
+            self.groq_retries_total += retries
+            if failed:
+                self.groq_failures += 1
+
+
+_metrics = _Metrics()
+
 # ── Auth ──────────────────────────────────────────────────────────────
 
 _api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
@@ -296,7 +328,22 @@ def run_pipeline(
 
     db = get_db()
 
+    _stage_state = {'label': None, 'started': None}
+
+    def _finish_open_stage():
+        if _stage_state['label'] is not None:
+            elapsed = time.monotonic() - _stage_state['started']
+            _metrics.record_stage(_stage_state['label'], elapsed)
+            log.info(
+                f'"job_id":"{job_id}","stage_complete":"{_stage_state["label"]}",'
+                f'"duration_s":{elapsed:.2f}'
+            )
+            _stage_state['label'] = None
+
     def stage(label: str, pct: int):
+        _finish_open_stage()
+        _stage_state['label']   = label
+        _stage_state['started'] = time.monotonic()
         update_job(db, job_id, current_stage=label, progress=pct, status='processing')
         log.info(f'"job_id":"{job_id}","stage":"{label}","pct":{pct}')
 
@@ -335,6 +382,11 @@ def run_pipeline(
             rank=rank,
             license_rank=candidate_profile.license_rank,
         )
+
+        groq_retry_count = rewritten.pop('_groq_retry_count', 0)
+        groq_failed      = 'error' in rewritten
+        _metrics.record_groq_attempt(retries=groq_retry_count, failed=groq_failed)
+        log.info(f'"job_id":"{job_id}","groq_retry_count":{groq_retry_count},"groq_failed":{str(groq_failed).lower()}')
 
         # If rewrite failed, use safe fallback (don't crash)
         if 'error' in rewritten:
@@ -423,8 +475,10 @@ def run_pipeline(
             issues_fixed_json=json.dumps(rewritten.get('issues_fixed', [])),
             keyword_data_json=json.dumps(ats_before.get('keyword_data', {})),
         )
+        _finish_open_stage()
 
     except Exception as e:
+        _finish_open_stage()
         log.error(f'"job_id":"{job_id}","error":"{str(e)}"')
         update_job(
             db, job_id,
@@ -709,6 +763,69 @@ def cleanup():
 
     log.info(f'"cleanup_deleted":{deleted}')
     return {'deleted_jobs': deleted, 'timestamp': now.isoformat()}
+
+
+@app.get(
+    '/ats/admin/metrics',
+    summary='Aggregate pipeline metrics — jobs, score deltas, Groq health, stage durations',
+    dependencies=[Depends(require_api_key)],
+)
+def admin_metrics():
+    """
+    Jobs-processed and score-delta stats come from the Job table (durable).
+    Groq retry/failure counts and stage durations come from in-memory
+    counters (reset on restart, per-worker-process — see note in response).
+    """
+    db = get_db()
+    try:
+        total_jobs  = db.query(Job).count()
+        done_jobs   = db.query(Job).filter(Job.status == 'done').all()
+        failed_jobs = db.query(Job).filter(Job.status == 'failed').count()
+    finally:
+        db.close()
+
+    def _avg(vals):
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    ats_deltas = [
+        j.ats_score_after - j.ats_score_before
+        for j in done_jobs
+        if j.ats_score_after is not None and j.ats_score_before is not None
+    ]
+    maritime_deltas = [
+        j.maritime_score_after - j.maritime_score_before
+        for j in done_jobs
+        if j.maritime_score_after is not None and j.maritime_score_before is not None
+    ]
+
+    groq_calls = _metrics.groq_calls
+    groq_failure_rate = (
+        round(_metrics.groq_failures / groq_calls, 4) if groq_calls else None
+    )
+    avg_stage_durations = {
+        label: round(sum(durations) / len(durations), 2)
+        for label, durations in _metrics.stage_durations.items()
+    }
+
+    return {
+        'jobs_processed':           total_jobs,
+        'jobs_done':                len(done_jobs),
+        'jobs_failed':              failed_jobs,
+        'avg_ats_score_delta':      _avg(ats_deltas),
+        'avg_maritime_score_delta': _avg(maritime_deltas),
+        'groq_calls':               groq_calls,
+        'groq_retries_total':       _metrics.groq_retries_total,
+        'groq_failures_total':      _metrics.groq_failures,
+        'groq_failure_rate':        groq_failure_rate,
+        'avg_stage_durations_seconds': avg_stage_durations,
+        'note': (
+            'groq_* and stage-duration figures are in-memory counters for '
+            'this worker process only — they reset on restart and are not '
+            'aggregated across `--workers N`. jobs_*/score-delta figures '
+            'come from the Job table and are accurate process-wide.'
+        ),
+    }
 
 
 @app.get('/health', summary='Health check')

@@ -462,13 +462,16 @@ def _call_groq_with_retry(prompt: str):
     Calls the Groq chat completion endpoint, retrying transient failures
     (timeouts, rate limits, connection errors) with exponential backoff
     (1s / 2s / 4s). Exhausts all retries before propagating the last error.
+
+    Returns (response, retries_used) — retries_used is 0 on a first-try
+    success, so callers can track Groq retry counts per job.
     """
     last_exc = None
-    for delay in (0,) + GROQ_RETRY_BACKOFF_SECONDS:
+    for retries_used, delay in enumerate((0,) + GROQ_RETRY_BACKOFF_SECONDS):
         if delay:
             time.sleep(delay)
         try:
-            return client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
                     {
@@ -487,6 +490,7 @@ def _call_groq_with_retry(prompt: str):
                 temperature=0.3,
                 max_tokens=3000,
             )
+            return response, retries_used
         except GROQ_TRANSIENT_ERRORS as e:
             last_exc = e
     raise last_exc
@@ -505,10 +509,12 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
         parsed = {**parsed, 'sections': sections}
         prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
 
-    raw_text = ''
+    raw_text      = ''
+    total_retries = 0
     for attempt in range(3):
         try:
-            response = _call_groq_with_retry(prompt)
+            response, retries_used = _call_groq_with_retry(prompt)
+            total_retries += retries_used
 
             raw_text = response.choices[0].message.content.strip()
             if not raw_text:
@@ -532,6 +538,7 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
             result = enforce_minimum_quality(result, rank)
             if not result.get('rank'):
                 result['rank'] = rank
+            result['_groq_retry_count'] = total_retries
             return result
 
         except json.JSONDecodeError:
@@ -540,10 +547,15 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                     'error':        'JSON_PARSE_FAILED',
                     'raw_response': raw_text[:500],
                     'detail':       f'Failed after 3 attempts. Last: {raw_text[:200]}',
+                    '_groq_retry_count': total_retries,
                 }
             continue
 
         except Exception as e:
-            return {'error': 'API_CALL_FAILED', 'detail': str(e)}
+            return {'error': 'API_CALL_FAILED', 'detail': str(e), '_groq_retry_count': total_retries}
 
-    return {'error': 'JSON_PARSE_FAILED', 'detail': 'Empty response after 3 retries'}
+    return {
+        'error':  'JSON_PARSE_FAILED',
+        'detail': 'Empty response after 3 retries',
+        '_groq_retry_count': total_retries,
+    }
