@@ -7,6 +7,7 @@ import re
 import pdfplumber
 from datetime import datetime
 import spacy
+from rules.aliases import RANK_KEYWORDS
 
 # Load spaCy model once at startup
 nlp = spacy.load('en_core_web_lg')
@@ -25,27 +26,6 @@ SECTION_HEADERS = {
     'license':             r'(?i)^\s*(licen[sc]e[s]?|coc details?|certificate of competency|meo class)\s*$',
     'languages':           r'(?i)^\s*(languages?|language proficiency|language skills)\s*$',
     'additional_experience': r'(?i)^\s*(additional experience|shore experience|pre-sea experience|other experience)\s*$',
-}
-
-
-# Rank detection keywords — used for fallback matching when primary NER fails
-RANK_KEYWORDS = {
-    'master':           ['master mariner', 'dg approved master', 'master fg', 'captain', 'master '],
-    'chief officer':    ['chief officer', 'c/o ', 'chief mate', 'first officer', 'first mate', '1st officer'],
-    'second officer':   ['second officer', '2nd officer', '2/o '],
-    'third officer':    ['third officer', '3rd officer', '3/o '],
-    'chief engineer':   ['chief engineer', 'c/e ', 'chief eng'],
-    'second engineer':  ['second engineer', '2nd engineer', '2/e '],
-    'third engineer':   ['third engineer', '3rd engineer', '3/e '],
-    'fourth engineer':  ['fourth engineer', '4th engineer', '4/e ', 'third assistant engineer', 'fifth engineer'],
-    'eto':              ['eto', 'electro technical', 'electrical officer'],
-    'oiler':            ['oiler ', 'motorman', 'wiper '],
-    'ab seaman':        ['able seaman', 'ab seaman', ' a.b. seaman', 'able bodied seaman', 'ordinary seaman'],
-    'bosun':            ['bosun', 'boatswain'],
-    'deck cadet':       ['deck cadet', 'nautical cadet'],
-    'engine cadet':     ['engine cadet', 'engineering cadet', 'trainee marine engineer', 'junior engineer', 'junior marine engineer'],
-    'jwko':             ['junior watchkeeping officer', 'jwko', 'j.w.k.o'],
-    'deck officer':     ['deck officer', 'navigating officer', 'watch officer'],
 }
 
 
