@@ -28,6 +28,27 @@ def test_cert_present_coc_not_falsely_matched_by_job_duty_terms():
     assert m.cert_present('CoC', 'holds Certificate of Competency (CoC)') is True
 
 
+def test_detect_rank_not_falsely_matched_by_degree_titles():
+    """
+    Regression test: a bare 'master ' keyword in RANK_KEYWORDS['master']
+    previously matched "Master of Business Administration" on an
+    Education line, misclassifying a hospitality-industry candidate with
+    zero sea service as rank='master' — the most senior deck officer
+    rank. Confirmed on a real generated resume (a hotel front-desk
+    worker's summary literally read "Held the rank of Master").
+    """
+    text = (
+        'Front Office Associate managing front desk operations.\n'
+        'Education: Master of Business Administration — Hospitality '
+        'and Tourism Management — 2019-2021'
+    )
+    assert m.detect_rank(text) != 'master'
+
+    # Genuine master-rank mentions must still be detected correctly.
+    genuine = 'Sailing as Master on MV Example, Master Mariner certificate held.'
+    assert m.detect_rank(genuine) == 'master'
+
+
 def test_detect_vessel_types_finds_known_types():
     assert m.detect_vessel_types('worked on chemical tanker and bulk carrier') == [
         'chemical tanker', 'bulk carrier',

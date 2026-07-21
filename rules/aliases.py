@@ -4,7 +4,13 @@
 # (CERT_ALIASES) — data, not logic.
 
 RANK_KEYWORDS = {
-    'master':           ['master mariner', 'dg approved master', 'master fg', 'captain', 'master '],
+    # Bare 'master ' removed — confirmed false-positive on real generated
+    # output: it matched "Master of Business Administration" (an MBA on
+    # an Education line), misclassifying a hospitality-industry candidate
+    # with zero sea service as rank='master', the most senior deck
+    # officer rank. The remaining phrases below are specific enough not
+    # to match a degree title.
+    'master':           ['master mariner', 'dg approved master', 'master fg', 'captain'],
     'chief officer':    ['chief officer', 'c/o ', 'chief mate', 'first officer', 'first mate', '1st officer'],
     'second officer':   ['second officer', '2nd officer', '2/o '],
     'third officer':    ['third officer', '3rd officer', '3/o '],
