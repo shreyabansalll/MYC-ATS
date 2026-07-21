@@ -312,6 +312,13 @@ REWRITING RULES — FOLLOW EXACTLY:
    drops the subject entirely or opens with the rank/title, e.g. 'Third
    Officer with 5 years of sea service...' or 'Experienced Electro
    Technical Officer with...' — use the name at most once, if at all.
+   Refer to vessel TYPES only in the summary (e.g. "Chemical/Oil Products
+   Tankers and Bulk Carriers"), never specific vessel names — those
+   belong in the Experience bullets (Rule 2), which already require them
+   with exact GRT. A real generated summary once introduced a stray space
+   into a vessel prefix mid-rewrite ("M. T SG Pegasus" instead of the
+   source's "M.T SG Pegasus"); keeping vessel names out of the summary
+   entirely removes that risk rather than relying on careful copying.
 
 2. Experience bullets: Open each bullet with a strong, specific action
    verb, and vary the verb across bullets — do not open two bullets (in
@@ -334,6 +341,18 @@ REWRITING RULES — FOLLOW EXACTLY:
    generalise to just vessel types — use actual names from source.
    Maximum 3 bullets per role. Include ALL vessel entries from source —
    do not drop any.
+
+   NO CROSS-ROLE REPETITION: do not reuse the same clause or sentence
+   across bullets in DIFFERENT roles, even when the underlying duties are
+   genuinely similar (e.g. a Cadet role and the Officer role that
+   followed it at the same company). Reusing a phrase like "ensuring
+   compliance with safety and environmental regulations" or "including
+   high voltage equipment and automation systems" verbatim (or just
+   reordered) across two role entries reads as templated, not written for
+   this candidate. Instead, let each role's bullets reflect what's
+   actually distinct about it — the specific equipment, the scope of
+   responsibility, or the level of supervision — even where the general
+   subject matter overlaps between consecutive roles.
 
 2b. ACCURACY IS MANDATORY:
    Copy vessel names, GRT numbers, company names, dates, and job titles EXACTLY
