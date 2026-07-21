@@ -37,7 +37,8 @@ def detect_rank(text: str) -> str:
         ('engine cadet',    ['engine cadet', 'engineering cadet']),
         ('jwko',            ['jwko', 'junior watchkeeping']),
         ('master',          ['master mariner', 'rank: master', 'position: master',
-                             'sailing as master', 'captain ']),
+                             'sailing as master', "ship's captain", 'ship captain',
+                             'vessel captain', 'sea captain']),
     ]
     for rank, patterns in rank_patterns:
         if any(p in text_lower for p in patterns):

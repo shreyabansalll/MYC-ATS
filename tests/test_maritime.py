@@ -49,6 +49,30 @@ def test_detect_rank_not_falsely_matched_by_degree_titles():
     assert m.detect_rank(genuine) == 'master'
 
 
+def test_detect_rank_not_falsely_matched_by_restaurant_captain():
+    """
+    Regression test: a bare 'captain ' pattern in detect_rank()'s primary
+    'master' pattern list (and the equivalent bare 'captain' in
+    RANK_KEYWORDS['master']) previously matched "Restaurant Captain" — a
+    hospitality job title — misclassifying that candidate as rank='master'
+    despite 0/4 cert coverage. Confirmed on a real 269-resume batch run
+    (folder name literally "Achuthan Restaurant Captain").
+    """
+    text = (
+        'Achuthan Restaurant Captain\n'
+        '+974 30494583\n'
+        'Managed front-of-house operations and guest service on a cruise ship.'
+    )
+    assert m.detect_rank(text) != 'master'
+
+    # Genuine ship-captain phrasing must still be detected correctly.
+    for genuine in [
+        "Working as Ship's Captain on MV Example for 10 years.",
+        'Currently serving as Vessel Captain, Anglo Eastern Ship Management.',
+    ]:
+        assert m.detect_rank(genuine) == 'master', genuine
+
+
 def test_detect_vessel_types_finds_known_types():
     assert m.detect_vessel_types('worked on chemical tanker and bulk carrier') == [
         'chemical tanker', 'bulk carrier',

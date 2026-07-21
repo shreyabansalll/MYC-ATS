@@ -8,9 +8,13 @@ RANK_KEYWORDS = {
     # output: it matched "Master of Business Administration" (an MBA on
     # an Education line), misclassifying a hospitality-industry candidate
     # with zero sea service as rank='master', the most senior deck
-    # officer rank. The remaining phrases below are specific enough not
-    # to match a degree title.
-    'master':           ['master mariner', 'dg approved master', 'master fg', 'captain'],
+    # officer rank. Bare 'captain' removed for the same reason — confirmed
+    # on a real 269-resume batch run: it matched "Restaurant Captain" (a
+    # hospitality job title, cert_coverage 0/4), misclassifying that
+    # candidate as rank='master' too. The remaining phrases are specific
+    # enough not to match a degree title or an unrelated "Captain" title.
+    'master':           ['master mariner', 'dg approved master', 'master fg',
+                          "ship's captain", 'ship captain', 'vessel captain', 'sea captain'],
     'chief officer':    ['chief officer', 'c/o ', 'chief mate', 'first officer', 'first mate', '1st officer'],
     'second officer':   ['second officer', '2nd officer', '2/o '],
     'third officer':    ['third officer', '3rd officer', '3/o '],
