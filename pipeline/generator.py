@@ -186,6 +186,20 @@ def generate_docx(content: dict, job_id: str = 'output') -> str:
         add_section_heading(doc, 'Professional Summary')
         add_body_text(doc, content['summary'])
 
+    # ── CERTIFICATIONS (R23) ─────────────────────────────────────────
+    # Placed immediately after the summary, ahead of Work Experience.
+    # Maritime recruiters scan resumes in a strict priority order —
+    # certificates first (the eligibility gate), then sea service, then
+    # vessel type experience (see CLAUDE.md's Project Overview) — so the
+    # #1 thing they check for shouldn't be buried mid-document. Section
+    # detection in pipeline/scorer.py is presence-based, not
+    # position-based, so this has no effect on the ATS score.
+    certifications = _as_list(content.get('certifications', []))
+    if certifications:
+        add_section_heading(doc, 'Certifications')
+        for cert in certifications:
+            add_body_text(doc, str(cert))
+
     # ── WORK EXPERIENCE (R21, R22) ────────────────────────────────────
     experience = _as_list(content.get('experience_bullets', []))
     if experience:
@@ -205,13 +219,6 @@ def generate_docx(content: dict, job_id: str = 'output') -> str:
         add_section_heading(doc, 'Skills')
         skills_text = '  •  '.join(str(s) for s in skills)
         add_body_text(doc, skills_text)
-
-    # ── CERTIFICATIONS (R23) ─────────────────────────────────────────
-    certifications = _as_list(content.get('certifications', []))
-    if certifications:
-        add_section_heading(doc, 'Certifications')
-        for cert in certifications:
-            add_body_text(doc, str(cert))
 
     # ── EDUCATION ─────────────────────────────────────────────────────
     education = _as_list(content.get('education', []))

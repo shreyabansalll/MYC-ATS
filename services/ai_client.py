@@ -263,16 +263,40 @@ TARGET JOB DESCRIPTION:
 {job_description}
 
 REWRITING RULES — FOLLOW EXACTLY:
-1. Summary: EXACTLY 3 sentences.
-   '[Sailing Rank] with [X] years/months sea service on [vessel types]. Holds [top 3 certs]. [Key competency].'
-   If candidate holds higher license than sailing rank:
-   'Third Engineer holding Second Engineer (MEO Class II) CoC...'
+1. Summary: EXACTLY 3 sentences, written naturally in confident, direct
+   professional prose — not a fill-in-the-blank template restated the same
+   way for every candidate. Cover, across the three sentences: (a) rank,
+   total sea service duration, and vessel types sailed, (b) top
+   certifications held, (c) one genuine strength evident from the actual
+   experience (e.g. cargo operations, engine room management, bridge
+   watchkeeping, safety compliance) — do not default to a generic phrase
+   like "strong communication skills" unless the source actually supports
+   it. Vary sentence structure and word choice candidate to candidate.
+   If candidate holds a higher license than their sailing rank, work this
+   in naturally rather than as a bolted-on clause, e.g. 'Third Engineer
+   holding Second Engineer (MEO Class II) CoC...'.
 
-2. Experience bullets: Active verb required. VESSEL DETAILS MANDATORY:
-   First bullet MUST include vessel name and GRT:
-   'Operated [systems] onboard [Vessel Name] (GRT [number]), a [vessel type].'
-   Never generalise to just vessel types — use actual names from source.
-   Maximum 3 bullets per role. Include ALL vessel entries from source — do not drop any.
+2. Experience bullets: Open each bullet with a strong, specific action
+   verb, and vary the verb across bullets — do not open two bullets (in
+   the same role or across different roles) with the same verb. Choose
+   from verbs that fit the actual duty described, for example: Commanded,
+   Directed, Navigated, Operated, Maintained, Oversaw, Coordinated,
+   Executed, Managed, Supervised, Conducted, Inspected, Monitored,
+   Diagnosed, Repaired, Enforced, Led, Trained, Streamlined — or an
+   equally strong, specific alternative.
+
+   Quantify wherever the source already provides a number — crew size
+   managed, cargo volume/tonnage, GRT/DWT, number of vessels, inspection
+   or safety record, contract duration. Never invent a number that isn't
+   in the source; omit the metric entirely rather than estimate it.
+
+   VESSEL DETAILS MANDATORY: every role entry must state the vessel
+   name(s) and GRT somewhere in its bullets, phrased as part of a natural
+   sentence about what was actually done — not a bolted-on fragment, and
+   not the same sentence pattern repeated for every entry. Never
+   generalise to just vessel types — use actual names from source.
+   Maximum 3 bullets per role. Include ALL vessel entries from source —
+   do not drop any.
 
 2b. ACCURACY IS MANDATORY:
    Copy vessel names, GRT numbers, company names, dates, and job titles EXACTLY

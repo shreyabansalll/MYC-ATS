@@ -97,10 +97,10 @@ def test_score_sections_raw_text_path_matches_generated_docx_headings():
     """
     raw_text = (
         f'PROFESSIONAL SUMMARY\n{SUMMARY}\n\n'
+        f'CERTIFICATIONS\n{CERTS}\n\n'
         f'WORK EXPERIENCE\n{EXPERIENCE}\n\n'
-        f'EDUCATION\n{EDUCATION}\n\n'
         f'SKILLS\n{SKILLS_TEXT}\n\n'
-        f'CERTIFICATIONS\n{CERTS}\n'
+        f'EDUCATION\n{EDUCATION}\n'
     )
     parsed_empty = {'sections': {}, 'skills': SKILLS_LIST}
     score, issues = score_sections(parsed_empty, raw_text)
@@ -123,10 +123,10 @@ def test_score_sections_both_paths_agree():
 
     raw_text = (
         f'PROFESSIONAL SUMMARY\n{SUMMARY}\n\n'
+        f'CERTIFICATIONS\n{CERTS}\n\n'
         f'WORK EXPERIENCE\n{EXPERIENCE}\n\n'
-        f'EDUCATION\n{EDUCATION}\n\n'
         f'SKILLS\n{SKILLS_TEXT}\n\n'
-        f'CERTIFICATIONS\n{CERTS}\n'
+        f'EDUCATION\n{EDUCATION}\n'
     )
     raw_score, raw_issues = score_sections({'sections': {}, 'skills': SKILLS_LIST}, raw_text)
 
