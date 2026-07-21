@@ -1,6 +1,6 @@
 # pipeline/generator.py
 # STAGE 7 — ATS-Compliant DOCX Generator
-# Takes rewritten JSON from ai_rewriter.py
+# Takes rewritten JSON from services/ai_client.py
 # Builds a clean single-column ATS-friendly DOCX
 # Library: python-docx
 # Rules applied: R1-R15 (format), R16-R25 (sections) from ATS PDF
@@ -122,7 +122,7 @@ def add_bullet(doc, text):
 def generate_docx(content: dict, job_id: str = 'output') -> str:
     """
     Main entry point.
-    Takes rewritten content JSON from ai_rewriter.py.
+    Takes rewritten content JSON from services/ai_client.py.
     Returns path to the generated DOCX file.
 
     Expected content keys:

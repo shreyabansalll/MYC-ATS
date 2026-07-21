@@ -1,4 +1,4 @@
-# pipeline/ai_rewriter.py
+# services/ai_client.py
 import json
 import re
 import time

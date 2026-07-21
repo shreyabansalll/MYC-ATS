@@ -1,4 +1,4 @@
-# pipeline/maritime_scorer.py
+# pipeline/maritime.py
 from pipeline import parser as parser_module
 from rules.cert_rules import CERT_REQUIREMENTS, SEA_SERVICE_MIN
 from rules.aliases import CERT_ALIASES

@@ -1,6 +1,6 @@
 # rules/aliases.py
 # Rank-detection keywords and certificate-name aliases. Externalized from
-# pipeline/parser.py (RANK_KEYWORDS) and pipeline/maritime_scorer.py
+# pipeline/parser.py (RANK_KEYWORDS) and pipeline/maritime.py
 # (CERT_ALIASES) — data, not logic.
 
 RANK_KEYWORDS = {

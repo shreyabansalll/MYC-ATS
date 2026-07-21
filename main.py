@@ -10,8 +10,8 @@ logging.getLogger('pdfminer').setLevel(logging.ERROR)
 from pipeline.extractor import extract_text
 from pipeline.parser import parse_resume
 from pipeline.scorer import score_resume
-from pipeline.maritime_scorer import maritime_score
-from pipeline.ai_rewriter import rewrite_resume
+from pipeline.maritime import maritime_score
+from services.ai_client import rewrite_resume
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
 

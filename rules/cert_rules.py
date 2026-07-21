@@ -1,6 +1,6 @@
 # rules/cert_rules.py
 # Rank -> required certificates and rank -> minimum sea service (months).
-# Externalized from pipeline/maritime_scorer.py — this is a lookup-table
+# Externalized from pipeline/maritime.py — this is a lookup-table
 # problem (~20 ranks, ~5 cert types), not logic, so it lives as data here.
 # Plain Python dicts for now; move to YAML/JSON only if these start being
 # edited by non-engineers.

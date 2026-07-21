@@ -21,7 +21,7 @@ if ROOT_DIR not in sys.path:
 from pipeline.extractor import extract_text
 from pipeline.parser import parse_resume
 from pipeline.scorer import score_resume
-from pipeline.maritime_scorer import maritime_score
+from pipeline.maritime import maritime_score
 
 
 def process_single(file_path: str) -> dict:
