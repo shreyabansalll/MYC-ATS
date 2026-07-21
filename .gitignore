@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/outputs/
+data/prelabel_checkpoint.json
+data/resume_file_list.txt
+*.log
+.DS_Store
