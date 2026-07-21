@@ -96,17 +96,22 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     extracted2 = extract_text(docx_path, 'docx')
     parsed2    = parse_resume(extracted2['raw_text'])
     ats2       = score_resume(extracted2, parsed2, job_description)
+    # No PDF to read for the regenerated DOCX — maritime_score() falls back
+    # to text-based sea-months extraction from parsed2's sections.
+    maritime2  = maritime_score(extracted2['raw_text'], parsed2)
 
     score_before = ats['total_score']
     score_after  = ats2['total_score']
     improvement  = score_after - score_before
 
     print(f'      ✓  DOCX saved: {docx_path}')
-    print(f'\n  ┌─────────────────────────────┐')
-    print(f'  │  Score before : {score_before:3d}/100 {ats["grade"]:<10}│')
-    print(f'  │  Score after  : {score_after:3d}/100 {ats2["grade"]:<10}│')
-    print(f'  │  Improvement  : {improvement:+4d} pts            │')
-    print(f'  └─────────────────────────────┘')
+    print(f'\n  ┌─────────────────────────────────────────┐')
+    print(f'  │  ATS Score before      : {score_before:3d}/100 {ats["grade"]:<10}│')
+    print(f'  │  ATS Score after       : {score_after:3d}/100 {ats2["grade"]:<10}│')
+    print(f'  │  Improvement           : {improvement:+4d} pts               │')
+    print(f'  │  Maritime Score before : {maritime["maritime_score"]:3d} {maritime["maritime_grade"]:<10}    │')
+    print(f'  │  Maritime Score after  : {maritime2["maritime_score"]:3d} {maritime2["maritime_grade"]:<10}    │')
+    print(f'  └─────────────────────────────────────────┘')
 
     # ── Final Report ─────────────────────────────────────────────────
     return {
@@ -122,6 +127,11 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
             'improvement':     improvement,
             'grade_before':    ats['grade'],
             'grade_after':     ats2['grade'],
+            'maritime_before':       maritime['maritime_score'],
+            'maritime_grade_before': maritime['maritime_grade'],
+            'maritime_after':        maritime2['maritime_score'],
+            'maritime_grade_after':  maritime2['maritime_grade'],
+            # Back-compat aliases — historically pointed at the pre-rewrite value
             'maritime':        maritime['maritime_score'],
             'maritime_grade':  maritime['maritime_grade'],
         },
@@ -164,7 +174,8 @@ if __name__ == '__main__':
     print(f'\nATS Before   : {report["scores"]["ats_before"]}/100 — {report["scores"]["grade_before"]}')
     print(f'ATS After    : {report["scores"]["ats_after"]}/100  — {report["scores"]["grade_after"]}')
     print(f'Improvement  : {report["scores"]["improvement"]:+d} pts')
-    print(f'Maritime     : {report["scores"]["maritime"]} — {report["scores"]["maritime_grade"]}')
+    print(f'Maritime Before : {report["scores"]["maritime_before"]} — {report["scores"]["maritime_grade_before"]}')
+    print(f'Maritime After  : {report["scores"]["maritime_after"]} — {report["scores"]["maritime_grade_after"]}')
     print(f'\nOutput DOCX  : {report["output"]["docx_path"]}')
     if report['issues_fixed']:
         print(f'\nISSUES FIXED ({len(report["issues_fixed"])}):')

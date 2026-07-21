@@ -167,10 +167,23 @@ def extract_certificates(text: str) -> list:
 
 
 def estimate_sea_service(pdf_path: str = None, text: str = None) -> int:
+    """
+    Tries PDF-table/PDF-text extraction first (richest source). Falls back
+    to regex date-range parsing against plain text — used when re-scoring a
+    generated DOCX, which has no PDF to read sea service from.
+    """
     if pdf_path:
         try:
             from pipeline import parser as p
-            return int(p.extract_sea_months(pdf_path))
+            months = int(p.extract_sea_months(pdf_path))
+            if months > 0:
+                return months
+        except Exception:
+            pass
+    if text:
+        from pipeline import parser as p
+        try:
+            return int(p.extract_sea_months_from_text(text))
         except Exception:
             return 0
     return 0
@@ -211,7 +224,8 @@ def maritime_score(raw_text: str, parsed: dict = None, pdf_path: str = None) -> 
     rank         = detect_rank(raw_text)
     license_rank = detect_license_rank(raw_text)
     certs        = extract_certificates(raw_text)
-    sea_months   = estimate_sea_service(pdf_path=pdf_path)
+    experience_text = (parsed.get('sections', {}).get('experience', '') if parsed else '') or raw_text
+    sea_months   = estimate_sea_service(pdf_path=pdf_path, text=experience_text)
     vessel_types = detect_vessel_types(raw_text)
 
     # 1. Certificate check (25pts)

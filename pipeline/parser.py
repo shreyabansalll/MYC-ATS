@@ -261,6 +261,71 @@ def extract_sea_months(pdf_path: str) -> int:
     return min(total, 400)
 
 
+def extract_sea_months_from_text(text: str) -> int:
+    """
+    Text-based fallback for sea service estimation when no PDF is available
+    (e.g. re-scoring a generated DOCX). Parses MM/YYYY date ranges directly
+    from experience text using the same pattern as the PDF-extraction
+    fallback in extract_sea_months() above, minus the table/page handling.
+    """
+    if not text:
+        return 0
+
+    service_periods = []
+
+    for line in text.split('\n'):
+        if any(kw in line.lower() for kw in [
+            'passport', 'visa', 'dob', 'born', 'coc ', 'cdc ',
+            'indos', 'medical', 'expiry', 'valid till'
+        ]):
+            continue
+        ranges = re.findall(
+            r'(\d{2}/\d{4})\s*[-–]\s*(\d{2}/\d{4}|[Pp]resent|[Cc]urrent|[Dd]ate)',
+            line
+        )
+        for s, e in ranges:
+            try:
+                d1 = datetime.strptime(s, '%m/%Y')
+                d2 = (datetime.now() if any(x in e.lower()
+                      for x in ['present', 'current', 'date'])
+                      else datetime.strptime(e, '%m/%Y'))
+                if d2 > d1 and 2005 <= d1.year <= 2026:
+                    service_periods.append((d1, d2))
+            except Exception:
+                pass
+
+    if not service_periods:
+        # Last resort: any MM/YYYY pairs in the text
+        all_mm_yyyy = re.findall(r'(\d{2}/\d{4})', text)
+        sea_dates = []
+        for d in all_mm_yyyy:
+            try:
+                dt = datetime.strptime(d, '%m/%Y')
+                if 2005 <= dt.year <= 2026:
+                    sea_dates.append(dt)
+            except Exception:
+                pass
+        sea_dates.sort()
+        for i in range(0, len(sea_dates) - 1, 2):
+            d1, d2 = sea_dates[i], sea_dates[i + 1]
+            if d2 > d1 and (d2 - d1).days < 365 * 4:
+                service_periods.append((d1, d2))
+
+    if not service_periods:
+        return 0
+
+    service_periods.sort(key=lambda x: x[0])
+    merged = [list(service_periods[0])]
+    for start, end in service_periods[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    total = sum((e - s).days // 30 for s, e in merged)
+    return min(total, 400)
+
+
 def extract_skills(text: str) -> list:
     """
     Matches resume text against a hardcoded skills list.

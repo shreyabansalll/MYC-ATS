@@ -133,6 +133,7 @@ class Job(Base):
     ats_score_after       = Column(Integer, nullable=True)
     ats_grade_after       = Column(String(20), nullable=True)
     maritime_score_before = Column(Integer, nullable=True)
+    maritime_grade_before = Column(String(20), nullable=True)
     maritime_score_after  = Column(Integer, nullable=True)
     maritime_grade_after  = Column(String(20), nullable=True)
     improvement           = Column(Integer, nullable=True)
@@ -372,6 +373,9 @@ def run_pipeline(
         extracted2 = extract_text(docx_path, 'docx')
         parsed2    = parse_resume(extracted2['raw_text'])
         ats_after  = score_resume(extracted2, parsed2, job_description)
+        # No PDF to read for the regenerated DOCX — maritime_score() falls
+        # back to text-based sea-months extraction from parsed2's sections.
+        maritime_after = maritime_score(extracted2['raw_text'], parsed2)
 
         improvement = ats_after['total_score'] - ats_before['total_score']
         log.info(
@@ -396,8 +400,9 @@ def run_pipeline(
             ats_score_after=ats_after['total_score'],
             ats_grade_after=ats_after['grade'],
             maritime_score_before=maritime_before['maritime_score'],
-            maritime_score_after=maritime_before['maritime_score'],  # unchanged post-rewrite
-            maritime_grade_after=maritime_before['maritime_grade'],
+            maritime_grade_before=maritime_before['maritime_grade'],
+            maritime_score_after=maritime_after['maritime_score'],
+            maritime_grade_after=maritime_after['maritime_grade'],
             improvement=improvement,
 
             output_docx=docx_path,
@@ -581,8 +586,13 @@ def result(job_id: str):
         'score_after':          job.ats_score_after,
         'grade_after':          job.ats_grade_after,
         'improvement':          job.improvement,
+        'maritime_score_before': job.maritime_score_before,
+        'maritime_grade_before': job.maritime_grade_before,
+        'maritime_score_after':  job.maritime_score_after,
+        'maritime_grade_after':  job.maritime_grade_after,
+        # Back-compat aliases — historically pointed at the pre-rewrite value
         'maritime_score':       job.maritime_score_before,
-        'maritime_grade':       job.maritime_grade_after,
+        'maritime_grade':       job.maritime_grade_before,
 
         # Maritime details
         'rank_detected':        job.rank_detected,
