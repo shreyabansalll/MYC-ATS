@@ -1,10 +1,17 @@
 # pipeline/ai_rewriter.py
 import json
 import re
-from groq import Groq
+import time
+from groq import Groq, APIConnectionError, APITimeoutError, RateLimitError
 from config import GROQ_API_KEY, GROQ_MODEL
 
 client = Groq(api_key=GROQ_API_KEY)
+
+# Transient failures worth retrying — timeouts, connection drops, rate limits.
+# Non-transient errors (auth, bad request, etc.) propagate immediately since
+# retrying them would just waste time before failing the same way.
+GROQ_TRANSIENT_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError)
+GROQ_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
 MARITIME_JDS = {
     'deck_officer': """
@@ -450,23 +457,18 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
     return result
 
 
-def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
-                   rank: str = '', license_rank: str = '') -> dict:
-
-    rank   = _normalize_rank(rank)
-    prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
-
-    # Trim experience section if prompt is too long for Groq context
-    if len(prompt) > 6000:
-        sections = parsed.get('sections', {})
-        sections['experience'] = sections.get('experience', '')[:1000]
-        parsed = {**parsed, 'sections': sections}
-        prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
-
-    raw_text = ''
-    for attempt in range(3):
+def _call_groq_with_retry(prompt: str):
+    """
+    Calls the Groq chat completion endpoint, retrying transient failures
+    (timeouts, rate limits, connection errors) with exponential backoff
+    (1s / 2s / 4s). Exhausts all retries before propagating the last error.
+    """
+    last_exc = None
+    for delay in (0,) + GROQ_RETRY_BACKOFF_SECONDS:
+        if delay:
+            time.sleep(delay)
         try:
-            response = client.chat.completions.create(
+            return client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
                     {
@@ -485,6 +487,28 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                 temperature=0.3,
                 max_tokens=3000,
             )
+        except GROQ_TRANSIENT_ERRORS as e:
+            last_exc = e
+    raise last_exc
+
+
+def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
+                   rank: str = '', license_rank: str = '') -> dict:
+
+    rank   = _normalize_rank(rank)
+    prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
+
+    # Trim experience section if prompt is too long for Groq context
+    if len(prompt) > 6000:
+        sections = parsed.get('sections', {})
+        sections['experience'] = sections.get('experience', '')[:1000]
+        parsed = {**parsed, 'sections': sections}
+        prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
+
+    raw_text = ''
+    for attempt in range(3):
+        try:
+            response = _call_groq_with_retry(prompt)
 
             raw_text = response.choices[0].message.content.strip()
             if not raw_text:
