@@ -420,6 +420,20 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
 
     # Rule 3: Skills minimum 15
     skills = result.get('skills', [])
+    # De-duplicate case-insensitively first — confirmed on real generated
+    # output: raw (uncorrected) LLM output repeated "Chemical Tanker",
+    # "Oil Tanker", and "Crisis Management" verbatim in the same Skills list.
+    # The padding loop below only guards against adding a NEW duplicate; it
+    # never removes ones the LLM already produced on its own.
+    seen = set()
+    deduped_skills = []
+    for skill in skills:
+        key = skill.lower().strip() if isinstance(skill, str) else skill
+        if key not in seen:
+            seen.add(key)
+            deduped_skills.append(skill)
+    skills = deduped_skills
+    result['skills'] = skills
     if len(skills) < 15:
         min_skills = MIN_SKILLS_BY_RANK.get(rank_lower, [])
         existing_lower = {s.lower() for s in skills}
