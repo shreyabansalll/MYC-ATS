@@ -90,16 +90,25 @@ def extract_certificates(text: str) -> list:
 
 def estimate_sea_service(pdf_path: str = None, text: str = None) -> int:
     """
-    Tries PDF-table/PDF-text extraction first (richest source). Falls back
-    to regex date-range parsing against plain text — used when re-scoring a
-    generated DOCX, which has no PDF to read sea service from.
+    Tries PDF-table/PDF-text extraction first (richest source) when
+    pdf_path actually points at a PDF. Falls back to regex date-range
+    parsing against plain text otherwise — used when re-scoring a
+    generated DOCX (no PDF at all), or when the original upload itself
+    was a DOCX (nothing to extract from with a PDF reader).
+
+    A successful PDF extraction is trusted even when it returns 0 — that's
+    the correct, expected value for cadets (SEA_SERVICE_MIN['deck cadet']
+    and ['engine cadet'] are both 0), not a signal that extraction failed.
+    extract_sea_months() already swallows its own read/parse errors and
+    returns 0 on failure (it never raises for a bad/non-PDF path), so a
+    bare 0 alone can't distinguish "legitimately zero" from "couldn't even
+    open this as a PDF" — checking the extension up front avoids ever
+    needing to guess from the return value.
     """
-    if pdf_path:
+    if pdf_path and pdf_path.lower().endswith('.pdf'):
         try:
             from pipeline import parser as p
-            months = int(p.extract_sea_months(pdf_path))
-            if months > 0:
-                return months
+            return int(p.extract_sea_months(pdf_path))
         except Exception:
             pass
     if text:

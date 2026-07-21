@@ -34,6 +34,51 @@ def test_estimate_sea_service_falls_back_to_text_when_no_pdf():
     assert m.estimate_sea_service(pdf_path=None, text=text) > 0
 
 
+def test_estimate_sea_service_trusts_legitimate_zero_from_pdf(monkeypatch):
+    """
+    Regression test for a fixed bug: a PDF that legitimately parses to 0
+    sea months (e.g. a cadet's empty service-record table — SEA_SERVICE_MIN
+    is 0 for both cadet ranks) must NOT be overridden by the less-reliable
+    text fallback, even when the supplied text contains date-range-shaped
+    patterns that would produce a non-zero result if the fallback fired.
+    A prior version treated "PDF extraction returned 0" the same as
+    "PDF extraction failed," silently fabricating sea service for cadets.
+    """
+    import pipeline.parser as parser_module
+    monkeypatch.setattr(parser_module, 'extract_sea_months', lambda pdf_path: 0)
+
+    spurious_text = 'Certificate issued 01/2020 - 06/2020, unrelated to sea service.'
+    result = m.estimate_sea_service(pdf_path='/fake/cadet_resume.pdf', text=spurious_text)
+    assert result == 0, 'A legitimate PDF-parsed zero must not be overridden by the text fallback'
+
+
+def test_estimate_sea_service_falls_back_to_text_when_docx_passed_as_pdf_path():
+    """
+    A DOCX path passed as pdf_path (e.g. the original upload was a DOCX)
+    isn't even attempted as a PDF — falls straight to the text estimate,
+    since a PDF reader can't extract anything from it anyway.
+    """
+    text = 'Second Officer — ABC Shipping | 01/2020 - 06/2022'
+    result = m.estimate_sea_service(pdf_path='/fake/upload.docx', text=text)
+    assert result > 0, 'A non-PDF path should fall back to the text-based estimate'
+
+
+def test_estimate_sea_service_accepted_tradeoff_unreadable_pdf_returns_zero():
+    """
+    Documents a known, accepted tradeoff (not a bug): extract_sea_months()
+    already catches its own read/parse errors internally and returns 0
+    on failure — it never raises for a corrupt or unreadable .pdf path.
+    That means a genuinely-unreadable .pdf is indistinguishable from a
+    legitimately-empty service-record table once it reaches
+    estimate_sea_service(), which now trusts a PDF-extension path's result
+    unconditionally (see its docstring). This test exists so a future
+    change doesn't "fix" this back into the original zero-vs-failure bug.
+    """
+    text = 'Second Officer — ABC Shipping | 01/2020 - 06/2022'
+    result = m.estimate_sea_service(pdf_path='/fake/nonexistent.pdf', text=text)
+    assert result == 0
+
+
 def test_estimate_sea_service_zero_for_empty_input():
     assert m.estimate_sea_service(pdf_path=None, text='') == 0
     assert m.estimate_sea_service(pdf_path=None, text=None) == 0
