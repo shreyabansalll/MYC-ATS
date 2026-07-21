@@ -1,5 +1,6 @@
 # services/ai_client.py
 import json
+import os
 import re
 import time
 import logging
@@ -16,7 +17,25 @@ if not GROQ_API_KEY:
     # logs rather than only showing up as job-level Groq failures.
     log.warning('"GROQ_API_KEY not set — AI rewrite will fail for every job"')
 
-client = Groq(api_key=GROQ_API_KEY)
+def _build_groq_client():
+    """Create a Groq client without crashing when proxies or API config are problematic."""
+    if not GROQ_API_KEY:
+        return None
+
+    proxy_url = os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY') or os.getenv('ALL_PROXY')
+    if proxy_url and proxy_url.startswith('socks5h://'):
+        try:
+            return Groq(api_key=GROQ_API_KEY, http_client=None)
+        except Exception:
+            return None
+
+    try:
+        return Groq(api_key=GROQ_API_KEY)
+    except Exception:
+        return None
+
+
+client = _build_groq_client()
 
 # Transient failures worth retrying — timeouts, connection drops, rate limits.
 # Non-transient errors (auth, bad request, etc.) propagate immediately since
@@ -575,6 +594,9 @@ def _call_groq_with_retry(prompt: str):
     Returns (response, retries_used) — retries_used is 0 on a first-try
     success, so callers can track Groq retry counts per job.
     """
+    if client is None:
+        raise RuntimeError('GROQ client unavailable')
+
     last_exc = None
     for retries_used, delay in enumerate((0,) + GROQ_RETRY_BACKOFF_SECONDS):
         if delay:

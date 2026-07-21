@@ -4,7 +4,21 @@
 # Not full ai_client.py coverage (that needs a live/mocked Groq client);
 # this covers the pure post-processing function.
 
+import importlib
+import sys
+
 from services.ai_client import enforce_minimum_quality
+
+
+def test_ai_client_import_handles_proxy_env(monkeypatch):
+    monkeypatch.setenv('HTTP_PROXY', 'socks5h://localhost:54937')
+    monkeypatch.setenv('HTTPS_PROXY', 'socks5h://localhost:54937')
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
+
+    sys.modules.pop('services.ai_client', None)
+    module = importlib.import_module('services.ai_client')
+
+    assert hasattr(module, 'client')
 
 
 def test_enforce_minimum_quality_deduplicates_skills_case_insensitively():
