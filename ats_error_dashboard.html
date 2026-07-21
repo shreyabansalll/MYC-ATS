@@ -1,0 +1,237 @@
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font-sans); }
+  .dash { padding: 1.5rem 0; }
+  .upload-zone { border: 1.5px dashed var(--color-border-secondary); border-radius: var(--border-radius-lg); padding: 2rem; text-align: center; cursor: pointer; margin-bottom: 1.5rem; transition: background 0.15s; }
+  .upload-zone:hover { background: var(--color-background-secondary); }
+  .upload-zone input { display: none; }
+  .upload-label { font-size: 14px; color: var(--color-text-secondary); }
+  .upload-label span { color: var(--color-text-info); font-weight: 500; cursor: pointer; }
+  .score-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 1.5rem; }
+  .metric { background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 1rem; }
+  .metric-label { font-size: 12px; color: var(--color-text-secondary); margin-bottom: 6px; }
+  .metric-value { font-size: 26px; font-weight: 500; color: var(--color-text-primary); }
+  .metric-sub { font-size: 12px; margin-top: 4px; }
+  .grade-excellent { color: #3B6D11; }
+  .grade-good { color: #BA7517; }
+  .grade-pass { color: #378ADD; }
+  .grade-fail { color: #E24B4A; }
+  .section-title { font-size: 13px; font-weight: 500; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+  .bar-wrap { margin-bottom: 1.25rem; }
+  .bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .bar-name { font-size: 13px; color: var(--color-text-secondary); width: 80px; flex-shrink: 0; }
+  .bar-track { flex: 1; height: 8px; background: var(--color-background-secondary); border-radius: 4px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
+  .bar-score { font-size: 13px; font-weight: 500; color: var(--color-text-primary); width: 50px; text-align: right; }
+  .issues-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 1.5rem; }
+  .issue-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--border-radius-md); border: 0.5px solid var(--color-border-tertiary); background: var(--color-background-primary); }
+  .issue-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+  .dot-critical { background: #E24B4A; }
+  .dot-high { background: #EF9F27; }
+  .dot-medium { background: #378ADD; }
+  .issue-text { font-size: 13px; color: var(--color-text-primary); line-height: 1.5; }
+  .issue-pts { font-size: 12px; color: var(--color-text-secondary); margin-top: 2px; }
+  .skills-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 1.5rem; }
+  .skill-tag { font-size: 12px; padding: 4px 10px; border-radius: 20px; border: 0.5px solid var(--color-border-tertiary); color: var(--color-text-secondary); background: var(--color-background-secondary); }
+  .contact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 1.5rem; }
+  .contact-item { font-size: 13px; padding: 8px 12px; border-radius: var(--border-radius-md); background: var(--color-background-secondary); }
+  .contact-key { color: var(--color-text-secondary); font-size: 11px; margin-bottom: 2px; }
+  .contact-val { color: var(--color-text-primary); font-weight: 500; word-break: break-all; }
+  .contact-val.missing { color: #E24B4A; }
+  .divider { border: none; border-top: 0.5px solid var(--color-border-tertiary); margin: 1.25rem 0; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--color-text-secondary); }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .empty-state { text-align: center; padding: 3rem 1rem; color: var(--color-text-secondary); font-size: 14px; }
+  .candidate-name { font-size: 20px; font-weight: 500; color: var(--color-text-primary); margin-bottom: 4px; }
+  .candidate-email { font-size: 13px; color: var(--color-text-secondary); margin-bottom: 1.5rem; }
+  .analyze-btn { width: 100%; padding: 10px; border-radius: var(--border-radius-md); background: var(--color-text-primary); color: var(--color-background-primary); font-size: 14px; font-weight: 500; border: none; cursor: pointer; margin-top: 12px; }
+  .analyze-btn:hover { opacity: 0.85; }
+  .loading { text-align: center; padding: 2rem; font-size: 14px; color: var(--color-text-secondary); }
+</style>
+
+<div class="dash">
+  <h2 class="sr-only">ATS Resume Error Dashboard — Marine Your Career</h2>
+
+  <div class="upload-zone" id="uploadZone">
+    <input type="file" id="fileInput" accept=".pdf,.docx" />
+    <div class="upload-label">
+      <span onclick="document.getElementById('fileInput').click()">Choose a resume</span> or paste data below
+    </div>
+    <div style="margin-top: 8px; font-size: 12px; color: var(--color-text-secondary);">PDF or DOCX · Max 5MB</div>
+  </div>
+
+  <button class="analyze-btn" onclick="runDemo()">Run demo with sample data ↗</button>
+
+  <hr class="divider" />
+
+  <div id="dashboard">
+    <div class="empty-state">Upload a resume or run the demo to see the ATS error report</div>
+  </div>
+</div>
+
+<script>
+const SAMPLE_DATA = {
+  name: "Rajesh Kumar",
+  email: "rajesh.kumar@gmail.com",
+  phone: "+91-98765 43210",
+  linkedin: "linkedin.com/in/rajesh-kumar-marine",
+  github: null,
+  total_score: 58,
+  grade: "FAIL",
+  breakdown: { format: 22, sections: 16, keywords: 20 },
+  sections_found: ["experience", "education", "certifications"],
+  skills: ["Leadership", "Communication", "STCW", "Watchkeeping", "GMDSS"],
+  issues: [
+    { text: "Tables detected in layout — ATS cannot parse content inside tables", severity: "critical", pts: -8 },
+    { text: "Content found in document header — contact info invisible to ATS", severity: "critical", pts: -6 },
+    { text: "Images or graphics detected — ATS reads zero content from images", severity: "critical", pts: -5 },
+    { text: "Summary section missing — high-weight section absent", severity: "high", pts: -4 },
+    { text: "Skills section missing — target 15–25 skills", severity: "high", pts: -4 },
+    { text: "Inconsistent date format — mix of MM/YYYY and Month YYYY detected", severity: "medium", pts: -3 },
+    { text: "Low skill count — 5 detected, target 15–25 for ATS keyword coverage", severity: "medium", pts: -2 },
+    { text: "Summary too short — aim for 3–5 sentences with top keywords", severity: "medium", pts: -1 },
+  ]
+};
+
+function gradeColor(grade) {
+  return { EXCELLENT: 'grade-excellent', GOOD: 'grade-good', PASS: 'grade-pass', FAIL: 'grade-fail' }[grade] || '';
+}
+
+function severityDot(s) {
+  return { critical: 'dot-critical', high: 'dot-high', medium: 'dot-medium' }[s] || 'dot-medium';
+}
+
+function barColor(score, max) {
+  const pct = score / max;
+  if (pct >= 0.85) return '#639922';
+  if (pct >= 0.65) return '#BA7517';
+  return '#E24B4A';
+}
+
+function renderDashboard(data) {
+  const totalColor = barColor(data.total_score, 100);
+  const fColor = barColor(data.breakdown.format, 40);
+  const sColor = barColor(data.breakdown.sections, 20);
+  const kColor = barColor(data.breakdown.keywords, 40);
+
+  const issuesBySeverity = { critical: [], high: [], medium: [] };
+  data.issues.forEach(i => (issuesBySeverity[i.severity] || issuesBySeverity.medium).push(i));
+
+  const contactFields = [
+    { key: 'Email', val: data.email },
+    { key: 'Phone', val: data.phone },
+    { key: 'LinkedIn', val: data.linkedin },
+    { key: 'GitHub', val: data.github },
+  ];
+
+  document.getElementById('dashboard').innerHTML = `
+    <div class="candidate-name">${data.name || 'Unknown Candidate'}</div>
+    <div class="candidate-email">${data.email || ''}</div>
+
+    <div class="score-row">
+      <div class="metric">
+        <div class="metric-label">ATS score</div>
+        <div class="metric-value" style="color:${totalColor}">${data.total_score}<span style="font-size:14px;font-weight:400;color:var(--color-text-secondary)">/100</span></div>
+        <div class="metric-sub ${gradeColor(data.grade)}">${data.grade}</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Issues found</div>
+        <div class="metric-value" style="color:#E24B4A">${data.issues.length}</div>
+        <div class="metric-sub" style="color:var(--color-text-secondary)">${issuesBySeverity.critical.length} critical</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Skills detected</div>
+        <div class="metric-value">${data.skills.length}</div>
+        <div class="metric-sub" style="color:var(--color-text-secondary)">target 15–25</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Sections found</div>
+        <div class="metric-value">${data.sections_found.length}</div>
+        <div class="metric-sub" style="color:var(--color-text-secondary)">of 5 required</div>
+      </div>
+    </div>
+
+    <hr class="divider" />
+
+    <div class="section-title">Score breakdown</div>
+    <div class="bar-wrap">
+      <div class="bar-row">
+        <div class="bar-name">Format</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(data.breakdown.format/40*100)}%;background:${fColor}"></div></div>
+        <div class="bar-score">${data.breakdown.format}/40</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-name">Sections</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(data.breakdown.sections/20*100)}%;background:${sColor}"></div></div>
+        <div class="bar-score">${data.breakdown.sections}/20</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-name">Keywords</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round(data.breakdown.keywords/40*100)}%;background:${kColor}"></div></div>
+        <div class="bar-score">${data.breakdown.keywords}/40</div>
+      </div>
+    </div>
+
+    <hr class="divider" />
+
+    <div class="section-title">Contact info parsed</div>
+    <div class="contact-grid">
+      ${contactFields.map(f => `
+        <div class="contact-item">
+          <div class="contact-key">${f.key}</div>
+          <div class="contact-val ${!f.val ? 'missing' : ''}">${f.val || 'Not found'}</div>
+        </div>
+      `).join('')}
+    </div>
+
+    <hr class="divider" />
+
+    <div class="section-title">ATS errors detected</div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot dot-critical"></div> Critical</div>
+      <div class="legend-item"><div class="legend-dot dot-high"></div> High</div>
+      <div class="legend-item"><div class="legend-dot dot-medium"></div> Medium</div>
+    </div>
+    <div class="issues-list">
+      ${data.issues.map(i => `
+        <div class="issue-item">
+          <div class="issue-dot ${severityDot(i.severity)}"></div>
+          <div>
+            <div class="issue-text">${i.text}</div>
+            <div class="issue-pts">${i.pts} pts</div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+
+    <hr class="divider" />
+
+    <div class="section-title">Skills detected</div>
+    <div class="skills-wrap">
+      ${data.skills.map(s => `<div class="skill-tag">${s}</div>`).join('')}
+      ${data.skills.length < 15 ? `<div class="skill-tag" style="border-color:#E24B4A;color:#E24B4A;">+${15 - data.skills.length} more needed</div>` : ''}
+    </div>
+  `;
+}
+
+function runDemo() {
+  document.getElementById('dashboard').innerHTML = '<div class="loading">Analyzing resume...</div>';
+  setTimeout(() => renderDashboard(SAMPLE_DATA), 800);
+}
+
+document.getElementById('uploadZone').addEventListener('dragover', e => {
+  e.preventDefault();
+  e.currentTarget.style.background = 'var(--color-background-secondary)';
+});
+document.getElementById('uploadZone').addEventListener('dragleave', e => {
+  e.currentTarget.style.background = '';
+});
+document.getElementById('uploadZone').addEventListener('drop', e => {
+  e.preventDefault();
+  e.currentTarget.style.background = '';
+  runDemo();
+});
+document.getElementById('fileInput').addEventListener('change', () => runDemo());
+</script>

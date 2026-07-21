@@ -1,0 +1,14 @@
+# .env — copy this to .env and fill in values
+# NEVER commit .env to git
+
+# Required
+MYC_API_KEY=generate-a-strong-random-key-here   # openssl rand -hex 32
+
+# Groq
+GROQ_API_KEY=your-groq-api-key-here
+
+# Optional overrides
+MAX_FILE_MB=5
+JOB_TTL_HOURS=48
+TMP_DIR=/tmp/ycm-ats
+ALLOWED_ORIGINS=https://marineYourCareer.com,https://app.marineYourCareer.com

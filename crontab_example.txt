@@ -1,0 +1,5 @@
+# Add to crontab: crontab -e
+# Runs nightly cleanup at 2am to delete expired jobs and free disk
+
+0 2 * * * curl -s -X POST http://localhost:8000/ats/cleanup \
+  -H "X-API-Key: YOUR_MYC_API_KEY" >> /var/log/ycm-cleanup.log 2>&1
