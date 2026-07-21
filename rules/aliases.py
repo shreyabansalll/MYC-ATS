@@ -44,7 +44,7 @@ CERT_ALIASES = {
     ],
     'CoC': [
         'coc', 'certificate of competency', 'competency certificate',
-        'mmd certificate', 'dg shipping', 'watchkeeping',
+        'mmd certificate', 'dg shipping',
         'ooow', 'oow', 'eoow', 'meo class',
     ],
     'BOSIET': ['bosiet', 'huet', 'opito', 'offshore survival'],

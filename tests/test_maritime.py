@@ -13,6 +13,21 @@ def test_cert_present_matches_alias():
     assert m.cert_present('GMDSS', 'no relevant certs here') is False
 
 
+def test_cert_present_coc_not_falsely_matched_by_job_duty_terms():
+    """
+    Regression test: 'watchkeeping' was previously a CoC alias, but it's a
+    routine job-duty term ("performed bridge watchkeeping duties") that
+    appears in most deck/engine officer resumes regardless of whether the
+    candidate actually holds a Certificate of Competency — a false-positive
+    risk for the system's stated eligibility gate. A resume that only
+    mentions watchkeeping duties, with no actual CoC evidence, must not
+    be credited with holding a CoC.
+    """
+    assert m.cert_present('CoC', 'performed bridge watchkeeping duties daily') is False
+    # Specific, unambiguous CoC evidence must still match.
+    assert m.cert_present('CoC', 'holds Certificate of Competency (CoC)') is True
+
+
 def test_detect_vessel_types_finds_known_types():
     assert m.detect_vessel_types('worked on chemical tanker and bulk carrier') == [
         'chemical tanker', 'bulk carrier',
