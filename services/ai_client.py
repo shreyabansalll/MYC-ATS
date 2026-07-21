@@ -306,6 +306,12 @@ REWRITING RULES — FOLLOW EXACTLY:
    If candidate holds a higher license than their sailing rank, work this
    in naturally rather than as a bolted-on clause, e.g. 'Third Engineer
    holding Second Engineer (MEO Class II) CoC...'.
+   Do NOT restate the candidate's name as the subject of more than one
+   sentence (e.g. never "Kishore possesses... Kishore has demonstrated...
+   As a skilled ETO, Kishore has..."). Standard resume convention either
+   drops the subject entirely or opens with the rank/title, e.g. 'Third
+   Officer with 5 years of sea service...' or 'Experienced Electro
+   Technical Officer with...' — use the name at most once, if at all.
 
 2. Experience bullets: Open each bullet with a strong, specific action
    verb, and vary the verb across bullets — do not open two bullets (in
