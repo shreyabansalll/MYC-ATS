@@ -38,6 +38,37 @@ def _as_list(value) -> list:
     return [value] if value else []
 
 
+def split_into_sentences(text: str) -> list:
+    """
+    Splits text into sentences on '.', '!', '?' — but treats a period
+    immediately following a single capital letter (e.g. 'M.T', 'M.V' —
+    standard maritime vessel-prefix abbreviations for Motor Tanker/Motor
+    Vessel) as not a sentence boundary. A naive split('.') here truncates
+    summaries mid-abbreviation: confirmed on real generated output where
+    'Sailed on M.T Example GRT 12345...' got cut to '...Sailed on M.T'
+    once the 3-sentence cap kicked in after only two real sentences.
+    """
+    if not text:
+        return []
+    text = text.replace('!', '.').replace('?', '.')
+    tokens = text.split('.')
+    sentences = []
+    current = ''
+    for i, tok in enumerate(tokens):
+        current += tok
+        if i == len(tokens) - 1:
+            break
+        last_word = current.split()[-1] if current.split() else ''
+        if len(last_word) == 1 and last_word.isupper():
+            current += '.'   # part of an abbreviation like "M." — don't split
+            continue
+        sentences.append(current.strip())
+        current = ''
+    if current.strip():
+        sentences.append(current.strip())
+    return [s for s in sentences if s]
+
+
 def enforce_length_limits(content: dict, rank: str) -> dict:
     rank_lower = rank.lower() if rank else ''
     is_junior = rank_lower in SINGLE_PAGE_RANKS
@@ -48,8 +79,7 @@ def enforce_length_limits(content: dict, rank: str) -> dict:
 
     # Summary: 3 sentences max always
     summary = content.get('summary', '')
-    sentences = summary.replace('!', '.').replace('?', '.').split('.')
-    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = split_into_sentences(summary)
     content['summary'] = '. '.join(sentences[:3]) + ('.' if sentences else '')
 
     # Experience: limit entries and bullets per entry

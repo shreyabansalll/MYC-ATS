@@ -153,6 +153,37 @@ _CERT_TABLE_NOISE = {
 }
 
 
+def split_into_sentences(text: str) -> list:
+    """
+    Splits text into sentences on '.', '!', '?' — but treats a period
+    immediately following a single capital letter (e.g. 'M.T', 'M.V' —
+    standard maritime vessel-prefix abbreviations) as not a sentence
+    boundary. A naive split('.') over-counts fragments on any summary
+    mentioning a vessel like 'M.T Example', which could let a summary
+    with fewer than 3 real sentences skip the minimum-quality fallback
+    below simply because the abbreviation inflated the fragment count.
+    """
+    if not text:
+        return []
+    text = text.replace('!', '.').replace('?', '.')
+    tokens = text.split('.')
+    sentences = []
+    current = ''
+    for i, tok in enumerate(tokens):
+        current += tok
+        if i == len(tokens) - 1:
+            break
+        last_word = current.split()[-1] if current.split() else ''
+        if len(last_word) == 1 and last_word.isupper():
+            current += '.'   # part of an abbreviation like "M." — don't split
+            continue
+        sentences.append(current.strip())
+        current = ''
+    if current.strip():
+        sentences.append(current.strip())
+    return [s for s in sentences if s]
+
+
 def _normalize_rank(rank) -> str:
     """Ensure rank is always a clean string regardless of what's passed in."""
     if isinstance(rank, str):
@@ -399,7 +430,7 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
 
     # Rule 1: Summary minimum 3 sentences
     summary = result.get('summary', '')
-    sentences = [s.strip() for s in summary.replace('!', '.').replace('?', '.').split('.') if s.strip()]
+    sentences = split_into_sentences(summary)
     if len(sentences) < 3:
         rank_title = RANK_TITLES.get(rank_lower, rank.title()) if rank else 'Seafarer'
         rank_key   = RANK_TO_JD.get(rank_lower, 'deck_officer')
