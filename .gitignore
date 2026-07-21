@@ -6,7 +6,7 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/outputs/
-data/prelabel_checkpoint.jsongit status
+data/prelabel_checkpoint.json
 data/myc_resume/
 data/myc_resume.zip
 data/resume_file_list.txt
