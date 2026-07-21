@@ -26,13 +26,25 @@ TWO_PAGE_RANKS = {
 # master, chief officer, chief engineer → 2 pages, more vessel entries allowed
 
 
+def _as_list(value) -> list:
+    """
+    Defensive coercion for LLM output that doesn't follow the expected
+    shape (e.g. a string instead of a list for skills/certifications/
+    education/languages) — applied consistently across all list-shaped
+    content fields rather than ad hoc per field.
+    """
+    if isinstance(value, list):
+        return value
+    return [value] if value else []
+
+
 def enforce_length_limits(content: dict, rank: str) -> dict:
     rank_lower = rank.lower() if rank else ''
     is_junior = rank_lower in SINGLE_PAGE_RANKS
-    # All ranks cap at 18 skills max — juniors at 15
+
+    # Skills: 15 for junior, 18 for senior
     max_skills = 15 if is_junior else 18
-    content['skills'] = content.get('skills', [])[:max_skills]
-    # ... rest unchanged
+    content['skills'] = _as_list(content.get('skills', []))[:max_skills]
 
     # Summary: 3 sentences max always
     summary = content.get('summary', '')
@@ -41,20 +53,16 @@ def enforce_length_limits(content: dict, rank: str) -> dict:
     content['summary'] = '. '.join(sentences[:3]) + ('.' if sentences else '')
 
     # Experience: limit entries and bullets per entry
-    experience = content.get('experience_bullets', [])
+    experience = _as_list(content.get('experience_bullets', []))
     max_entries = 3 if is_junior else 6
     experience = experience[:max_entries]
     for job in experience:
-        job['bullets'] = job.get('bullets', [])[:3]
+        if isinstance(job, dict):
+            job['bullets'] = job.get('bullets', [])[:3]
     content['experience_bullets'] = experience
 
-    # Skills: 15 for junior, 18 for senior
-    skills = content.get('skills', [])
-    max_skills = 15 if is_junior else 18
-    content['skills'] = skills[:max_skills]
-
     # Certifications: cap at 8 lines
-    content['certifications'] = content.get('certifications', [])[:8]
+    content['certifications'] = _as_list(content.get('certifications', []))[:8]
 
     return content
 
@@ -179,10 +187,12 @@ def generate_docx(content: dict, job_id: str = 'output') -> str:
         add_body_text(doc, content['summary'])
 
     # ── WORK EXPERIENCE (R21, R22) ────────────────────────────────────
-    experience = content.get('experience_bullets', [])
+    experience = _as_list(content.get('experience_bullets', []))
     if experience:
         add_section_heading(doc, 'Work Experience')
         for job in experience:
+            if not isinstance(job, dict):
+                continue
             role_line = f"{job.get('role', '')}  —  {job.get('company', '')}  |  {job.get('dates', '')}"
             add_body_text(doc, role_line, bold=True)
             for bullet in job.get('bullets', []):
@@ -190,34 +200,31 @@ def generate_docx(content: dict, job_id: str = 'output') -> str:
             doc.add_paragraph().paragraph_format.space_after = Pt(2)
 
     # ── SKILLS (R20) ──────────────────────────────────────────────────
-    skills = content.get('skills', [])
+    skills = _as_list(content.get('skills', []))
     if skills:
         add_section_heading(doc, 'Skills')
-        skills_text = '  •  '.join(skills)
+        skills_text = '  •  '.join(str(s) for s in skills)
         add_body_text(doc, skills_text)
 
     # ── CERTIFICATIONS (R23) ─────────────────────────────────────────
-    certifications = content.get('certifications', [])
+    certifications = _as_list(content.get('certifications', []))
     if certifications:
         add_section_heading(doc, 'Certifications')
         for cert in certifications:
-            add_body_text(doc, cert)
+            add_body_text(doc, str(cert))
 
     # ── EDUCATION ─────────────────────────────────────────────────────
-    education = content.get('education', [])
+    education = _as_list(content.get('education', []))
     if education:
         add_section_heading(doc, 'Education')
-        if isinstance(education, list):
-            for edu in education:
-                add_body_text(doc, edu)
-        else:
-            add_body_text(doc, str(education))
+        for edu in education:
+            add_body_text(doc, str(edu))
 
-    # After the EDUCATION block, add:
-
-# ── DOCUMENTS & LICENSE ───────────────────────────────────────────────
+    # ── DOCUMENTS & LICENSE ─────────────────────────────────────────────
     documents = content.get('documents', {})
-    if documents and any(documents.values()):
+    if not isinstance(documents, dict):
+        documents = {}
+    if any(documents.values()):
         add_section_heading(doc, 'Documents & License')
         if documents.get('coc'):
             add_body_text(doc, f"Certificate of Competency: {documents['coc']}")
@@ -229,10 +236,10 @@ def generate_docx(content: dict, job_id: str = 'output') -> str:
             add_body_text(doc, f"Passport: {documents['passport']}")
 
     # ── LANGUAGES ─────────────────────────────────────────────────────────
-    languages = content.get('languages', [])
+    languages = _as_list(content.get('languages', []))
     if languages:
         add_section_heading(doc, 'Languages')
-        add_body_text(doc, '  •  '.join(languages))
+        add_body_text(doc, '  •  '.join(str(l) for l in languages))
 
     # ── Save File ─────────────────────────────────────────────────────
     os.makedirs(OUTPUT_DIR, exist_ok=True)
