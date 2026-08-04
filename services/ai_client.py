@@ -26,12 +26,17 @@ def _build_groq_client():
     if proxy_url and proxy_url.startswith('socks5h://'):
         try:
             return Groq(api_key=GROQ_API_KEY, http_client=None)
-        except Exception:
+        except Exception as e:
+            log.error(
+                'Failed to construct Groq client behind socks5h proxy (%s): %s',
+                proxy_url, e, exc_info=True,
+            )
             return None
 
     try:
         return Groq(api_key=GROQ_API_KEY)
-    except Exception:
+    except Exception as e:
+        log.error('Failed to construct Groq client: %s', e, exc_info=True)
         return None
 
 
