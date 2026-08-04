@@ -16,7 +16,12 @@ def _words_to_text(words: list, x_min: float, x_max: float, y_tolerance: float =
     if not col_words:
         return ''
 
-    # Group by y-position (words within y_tolerance of each other = same line)
+    # Group by y-position (words within y_tolerance of each other = same line).
+    # Compares each word to the PREVIOUS word's y, not the line's first word —
+    # anchoring to the first word let small cumulative baseline drift across a
+    # long line (justified text, mixed bold/regular font metrics) silently
+    # split that line mid-sentence once drift exceeded y_tolerance from the
+    # anchor, even though each word was within tolerance of its neighbor.
     col_words.sort(key=lambda w: float(w['top']))
     lines = []
     current_line = [col_words[0]]
@@ -29,7 +34,7 @@ def _words_to_text(words: list, x_min: float, x_max: float, y_tolerance: float =
         else:
             lines.append(current_line)
             current_line = [word]
-            current_y = word_y
+        current_y = word_y
     lines.append(current_line)
 
     # Sort each line left-to-right and join

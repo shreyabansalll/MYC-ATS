@@ -93,3 +93,39 @@ def test_detect_gutter_split_handles_narrow_sidebar_layout():
     ]
     split = _detect_gutter_split(words, x0=0, x1=750)
     assert 640 < split < 685, f'Expected split inside the real (narrow-sidebar) gutter, got {split}'
+
+
+def test_words_to_text_does_not_fragment_a_line_on_cumulative_y_drift():
+    """
+    Regression test for a second, distinct bug found on the real Mrinal
+    Thapa PDF: _words_to_text()'s line-grouping compared every word to the
+    FIRST word of the current line, not the immediately preceding word.
+    On a long line, small cumulative y drift between words (justified
+    text, mixed bold/regular font metrics) can push a later word's 'top'
+    more than y_tolerance away from the line's first word even though each
+    word is within tolerance of its immediate neighbor -- incorrectly
+    splitting one physical line into several fragments mid-sentence.
+
+    Each word here drifts by 1.5pt from its immediate neighbor (well
+    within y_tolerance=3.0), but the last word drifts 6pt from the first
+    word -- enough to trigger the old anchor-to-first-word bug.
+    """
+    words = [
+        _word('with', 40, 75, 100.0), _word('a', 80, 90, 101.5),
+        _word('solid', 95, 135, 103.0), _word('foundation', 140, 230, 104.5),
+        _word('in', 235, 250, 106.0), _word('electrical', 255, 340, 107.5),
+    ]
+    text = _words_to_text(words, x_min=0, x_max=700)
+    assert text == 'with a solid foundation in electrical', (
+        f'Line was fragmented by cumulative drift, got: {text!r}'
+    )
+
+
+def test_words_to_text_still_splits_on_a_genuine_new_line():
+    """A real new line (large y jump) must still be split correctly after the drift fix."""
+    words = [
+        _word('First', 40, 90, 100.0), _word('line.', 95, 130, 100.0),
+        _word('Second', 40, 100, 114.0), _word('line.', 105, 140, 114.0),
+    ]
+    text = _words_to_text(words, x_min=0, x_max=700)
+    assert text == 'First line.\nSecond line.'
