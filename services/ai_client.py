@@ -1,6 +1,6 @@
 # services/ai_client.py
 import json
-import os
+import httpx
 import re
 import time
 import logging
@@ -18,20 +18,23 @@ if not GROQ_API_KEY:
     log.warning('"GROQ_API_KEY not set — AI rewrite will fail for every job"')
 
 def _build_groq_client():
-    """Create a Groq client without crashing when proxies or API config are problematic."""
+    """
+    Create a Groq client without crashing when ambient proxy config or API
+    setup is problematic.
+
+    Always constructs with an explicit httpx.Client(trust_env=False), so
+    HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (of any scheme) never affect this
+    client. This is a single-VPS deployment with no documented need to
+    route Groq's API calls through a proxy.
+    """
     if not GROQ_API_KEY:
         return None
 
-    proxy_url = os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY') or os.getenv('ALL_PROXY')
-    if proxy_url and proxy_url.startswith('socks5h://'):
-        try:
-            return Groq(api_key=GROQ_API_KEY, http_client=None)
-        except Exception as e:
-            log.error(
-                'Failed to construct Groq client behind socks5h proxy (%s): %s',
-                proxy_url, e, exc_info=True,
-            )
-            return None
+    try:
+        return Groq(api_key=GROQ_API_KEY, http_client=httpx.Client(trust_env=False))
+    except Exception as e:
+        log.error('Failed to construct Groq client: %s', e, exc_info=True)
+        return None
 
     try:
         return Groq(api_key=GROQ_API_KEY)
