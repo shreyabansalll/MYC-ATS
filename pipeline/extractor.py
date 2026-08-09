@@ -69,42 +69,83 @@ def _detect_gutter_split(words: list, x0: float, x1: float, min_gap: float = 15.
     against a detected true gutter can't fragment a line that never
     reaches into it, unlike a guessed ratio.
 
+    A single-column header row above the two-column body (name, phone,
+    email, DOB on one line) breaks that assumption: such a row isn't
+    confined to either column, so one of its words can happen to land
+    inside what is, further down the page, the true gutter — bridging
+    and destroying the gap when intervals are merged globally regardless
+    of row. Confirmed on a real resume: a lone date-of-birth
+    ("21/12/1999") on the header row extended 19pt into the real 24pt
+    gutter, collapsing it to 5pt (below min_gap), so no qualifying gap
+    was found at all and this function silently fell back to the page
+    midpoint — which sat to the LEFT of several genuine left-column
+    words' x0, misclassifying them into the right column (see
+    tests/test_extractor.py for the exact reproduction).
+
+    Guarding against this by unconditionally excluding words that straddle
+    the page's rough midpoint was tried and reverted: it also excludes
+    legitimate words in a genuinely wide (non-50/50) column — e.g. an
+    87%/13% layout has plenty of real left-column words straddling the
+    page's center — which regressed correctly-working detection on
+    asymmetric layouts. Instead, this only kicks in as a fallback: try
+    the plain global merge first (unchanged, so every previously-working
+    case behaves exactly as before); only if THAT finds no qualifying gap
+    at all — the specific failure mode a bridging header word causes — is
+    the same search retried with straddling words excluded. A genuine
+    column-confined word never straddles the page's center; only
+    header-row content wide enough to cross it can, so this second pass
+    only removes the kind of word that caused the first pass to fail.
+
     Returns the midpoint of the widest qualifying gap found in the
     plausible column-boundary region (10%-90% of page width — wide
     enough to cover narrow-sidebar templates where the right column is a
     small fraction of the page, while still excluding the page's own
-    margins). Returns the page midpoint if no clear gutter is found —
-    callers should treat that as a low-confidence fallback and keep the
-    guessed-ratio candidates in play alongside it.
+    margins). Returns the page midpoint if no clear gutter is found even
+    on the fallback pass — callers should treat that as a low-confidence
+    result and keep the guessed-ratio candidates in play alongside it.
     """
     if not words:
         return x0 + (x1 - x0) * 0.5
 
-    intervals = sorted(
-        ((float(w['x0']), float(w['x1'])) for w in words),
-        key=lambda iv: iv[0],
-    )
-    merged = [intervals[0]]
-    for s, e in intervals[1:]:
-        last_s, last_e = merged[-1]
-        if s <= last_e:
-            merged[-1] = (last_s, max(last_e, e))
-        else:
-            merged.append((s, e))
-
     region_lo = x0 + (x1 - x0) * 0.10
     region_hi = x0 + (x1 - x0) * 0.90
 
-    best_gap = 0.0
-    best_mid = None
-    for (_, e1), (s2, _) in zip(merged, merged[1:]):
-        gap = s2 - e1
-        mid = (e1 + s2) / 2
-        if gap >= min_gap and region_lo <= mid <= region_hi and gap > best_gap:
-            best_gap = gap
-            best_mid = mid
+    def _widest_gap(candidate_words):
+        intervals = sorted(
+            ((float(w['x0']), float(w['x1'])) for w in candidate_words),
+            key=lambda iv: iv[0],
+        )
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            last_s, last_e = merged[-1]
+            if s <= last_e:
+                merged[-1] = (last_s, max(last_e, e))
+            else:
+                merged.append((s, e))
 
-    return best_mid if best_mid is not None else x0 + (x1 - x0) * 0.5
+        best_gap, best_mid = 0.0, None
+        for (_, e1), (s2, _) in zip(merged, merged[1:]):
+            gap = s2 - e1
+            mid = (e1 + s2) / 2
+            if gap >= min_gap and region_lo <= mid <= region_hi and gap > best_gap:
+                best_gap, best_mid = gap, mid
+        return best_mid
+
+    result = _widest_gap(words)
+    if result is not None:
+        return result
+
+    rough_mid = x0 + (x1 - x0) * 0.5
+    non_straddling = [
+        w for w in words
+        if not (float(w['x0']) < rough_mid < float(w['x1']))
+    ]
+    if non_straddling:
+        result = _widest_gap(non_straddling)
+        if result is not None:
+            return result
+
+    return x0 + (x1 - x0) * 0.5
 
 
 def _clean_text(text: str) -> str:

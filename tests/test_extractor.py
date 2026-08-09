@@ -14,11 +14,28 @@
 # pdfplumber itself — only pipeline/extractor.py's pure helper functions
 # are under test here.
 
-from pipeline.extractor import _detect_gutter_split, _words_to_text
+import os
+
+from pipeline.extractor import _detect_gutter_split, _words_to_text, _clean_text
 
 
 def _word(text, x0, x1, top):
     return {'text': text, 'x0': x0, 'x1': x1, 'top': top}
+
+
+def _load_real_words(fixture_name):
+    """
+    Loads a tab-separated (top, x0, x1, text) word dump captured from a
+    real resume PDF via pdfplumber's page.extract_words(), for tests that
+    need real ground-truth coordinates rather than synthetic ones.
+    """
+    path = os.path.join(os.path.dirname(__file__), 'fixtures', fixture_name)
+    words = []
+    with open(path) as f:
+        for line in f:
+            top, x0, x1, text = line.rstrip('\n').split('\t')
+            words.append(_word(text, float(x0), float(x1), float(top)))
+    return words
 
 
 def test_detect_gutter_split_finds_real_gutter_between_columns():
@@ -129,3 +146,48 @@ def test_words_to_text_still_splits_on_a_genuine_new_line():
     ]
     text = _words_to_text(words, x_min=0, x_max=700)
     assert text == 'First line.\nSecond line.'
+
+
+def test_full_real_page_reconstructs_summary_and_courses_correctly():
+    """
+    End-to-end integration test against the complete, real 411-word
+    page-1 coordinate dump from Mrinal Thapa's actual resume PDF (see
+    tests/fixtures/mrinal_thapa_page1_words.tsv) — not a hand-built
+    synthetic scenario. Exercises the real _detect_gutter_split() +
+    _words_to_text() pipeline exactly as extract_pdf() calls it.
+
+    Before the header-row fix: the DOB on the header row collapsed the
+    real gutter, the detected split fell back to the page midpoint
+    (306.0), and every left-column word ending at the true column edge
+    (x1=337.3) — "in", "and", "system", "hands-", "to", "industry", etc.
+    — leaked into the Courses section as scattered fragments.
+    """
+    words = _load_real_words('mrinal_thapa_page1_words.tsv')
+    x0_page, x1_page = 0.0, 612.0
+
+    split = _detect_gutter_split(words, x0_page, x1_page)
+    assert 337.3 < split < 361.4, f'Expected split inside the real gutter, got {split}'
+
+    left_text = _clean_text(_words_to_text(words, x0_page, split))
+    right_text = _clean_text(_words_to_text(words, split, x1_page + 1))
+
+    # The full Summary paragraph must survive intact, no dropped/relocated words.
+    flat_summary = left_text.replace('\n', ' ')
+    assert 'with a solid foundation in electrical engineering' in flat_summary
+    assert 'power distribution, and troubleshooting' in flat_summary
+    assert 'engineering tools for system design' in flat_summary
+    assert 'strong problem-solving abilities' in flat_summary
+    assert 'expertise through hands- on training' in flat_summary or \
+           'expertise through hands-on training' in flat_summary
+    assert 'adhering to industry standards' in flat_summary
+
+    # None of those words leaked into the right column.
+    for stray in ['foundation in\n', 'and\ntroubleshoot']:
+        assert stray not in right_text
+    assert 'COURSES' in right_text
+    assert 'SUMMARY' not in right_text
+
+    # Courses entries reconstruct as coherent blocks, not scattered garbage.
+    assert 'Advanced Fire Fighting' in right_text
+    assert 'TOLANI MARITIME INSTITUTE' in right_text
+    assert '20100566212400120' in right_text
