@@ -17,6 +17,7 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 sqlalchemy==2.0.35
 pydantic==2.9.2
+slowapi==0.1.9
 
 # Security & monitoring
 cryptography==43.0.1

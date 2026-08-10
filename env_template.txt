@@ -4,6 +4,11 @@
 # Required
 MYC_API_KEY=generate-a-strong-random-key-here   # openssl rand -hex 32
 
+# Recommended — separate key for GET /ats/admin/metrics, so the
+# client-facing key embedded in MYC's app doesn't also grant access to
+# internal operational metrics. Falls back to MYC_API_KEY if unset.
+MYC_ADMIN_KEY=generate-a-different-strong-random-key-here   # openssl rand -hex 32
+
 # Groq
 GROQ_API_KEY=your-groq-api-key-here
 

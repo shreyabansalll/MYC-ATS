@@ -29,6 +29,9 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, event
 from sqlalchemy.orm import DeclarativeBase, Session
 
@@ -93,6 +96,7 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────
 
 API_KEY          = os.getenv('MYC_API_KEY', '')
+ADMIN_API_KEY    = os.getenv('MYC_ADMIN_KEY', '')
 MAX_FILE_MB      = int(os.getenv('MAX_FILE_MB', '5'))
 MAX_FILE_BYTES   = MAX_FILE_MB * 1024 * 1024
 ALLOWED_EXTS     = {'pdf', 'docx'}
@@ -105,6 +109,16 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 if not API_KEY:
     log.warning('"MYC_API_KEY not set — all requests will be rejected"')
+
+if not ADMIN_API_KEY:
+    # Not a hard requirement — /ats/admin/metrics falls back to MYC_API_KEY
+    # below so this doesn't lock out deployments that haven't set it up
+    # yet, but that means the client-facing key (the one embedded in
+    # MYC's app, more exposed than a pure backend secret) also grants
+    # access to internal operational metrics (job counts, score deltas,
+    # Groq failure rates) unless this is set.
+    log.warning('"MYC_ADMIN_KEY not set — /ats/admin/metrics falls back to MYC_API_KEY, '
+                'the same key client requests use. Set MYC_ADMIN_KEY to a distinct value."')
 
 # ── Database ──────────────────────────────────────────────────────────
 
@@ -224,6 +238,24 @@ async def require_api_key(key: Optional[str] = Depends(_api_key_header)):
         raise HTTPException(403, 'Invalid or missing API key')
     return key
 
+
+async def require_admin_key(key: Optional[str] = Depends(_api_key_header)):
+    """
+    Separate from require_api_key so the client-facing key (embedded in
+    MYC's app) doesn't also grant access to internal operational metrics.
+    Falls back to MYC_API_KEY if MYC_ADMIN_KEY isn't set — see the
+    startup warning above — so this degrades to the old (shared-key)
+    behavior rather than locking out a deployment that hasn't set the
+    new variable, rather than a hard failure.
+    """
+    expected = ADMIN_API_KEY or API_KEY
+    if not expected:
+        raise HTTPException(503, 'Service not configured — MYC_API_KEY missing')
+    if not key or key != expected:
+        log.warning('"Rejected admin request with invalid API key"')
+        raise HTTPException(403, 'Invalid or missing API key')
+    return key
+
 # ── App ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -240,6 +272,18 @@ app.add_middleware(
     allow_methods=['GET', 'POST'],
     allow_headers=['X-API-Key', 'Content-Type'],
 )
+
+# ── Rate limiting ─────────────────────────────────────────────────────
+# Per-IP, in-memory (default slowapi backend) — resets on process
+# restart and isn't shared across `--workers N`, same acceptable
+# single-VPS tradeoff as the in-memory _Metrics counters above. 10/minute
+# is a starting value for a resume-upload endpoint (uploads take real
+# processing time; this guards against abuse, not normal single-user
+# traffic) — not tuned against real usage, adjust once real traffic
+# patterns are known.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Validators ────────────────────────────────────────────────────────
 
@@ -544,7 +588,9 @@ def root(request: Request):
     summary='Upload resume and start ATS optimisation',
     dependencies=[Depends(require_api_key)],
 )
+@limiter.limit('10/minute')
 async def submit(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description='PDF or DOCX resume'),
     job_description: str = Form(default='', description='Target job description (optional but improves keyword scoring)'),
@@ -791,7 +837,7 @@ def cleanup():
 @app.get(
     '/ats/admin/metrics',
     summary='Aggregate pipeline metrics — jobs, score deltas, Groq health, stage durations',
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin_key)],
 )
 def admin_metrics():
     """
