@@ -114,6 +114,19 @@ MARITIME_JDS = {
     """,
 }
 
+# Keys the rewrite JSON schema (see build_rewrite_prompt's RETURN ONLY
+# this JSON block) always requires — used to detect a response that
+# parsed successfully as JSON but was actually cut off mid-generation
+# (hit max_tokens) at a point that happened to land on an earlier
+# closing brace. That produces syntactically valid but INCOMPLETE JSON,
+# silently missing every field after the truncation point — a real
+# content-loss mechanism that a bare json.loads() success can't catch on
+# its own, since it isn't a parse error.
+REQUIRED_REWRITE_KEYS = {
+    'summary', 'experience_bullets', 'skills',
+    'certifications', 'education', 'documents', 'languages',
+}
+
 RANK_TO_JD = {
     'master':                    'deck_officer',
     'chief officer':             'chief_officer',
@@ -228,6 +241,14 @@ def sanitise_section(text: str, max_chars: int = 800) -> str:
     Cleans garbled column-extracted text before sending to Groq.
     Removes certificate table cell dumps (Pass/Fail/date rows),
     short orphan lines from two-column PDF splitting.
+
+    Truncation (when the cleaned text exceeds max_chars) cuts at the last
+    complete " | "-joined line that fits, not a blind character slice —
+    a raw [:max_chars] cut can land mid-word or mid-entry, and for the
+    experience section specifically this was confirmed to silently drop
+    an entire role's vessel/GRT/date details before the LLM ever saw
+    them (not a rewrite-quality issue — the source data itself never
+    reached the prompt).
     """
     if not text or text.strip() in ('', 'NOT PROVIDED'):
         return 'NOT PROVIDED'
@@ -242,8 +263,24 @@ def sanitise_section(text: str, max_chars: int = 800) -> str:
         if len(stripped) < 4:
             continue
         cleaned.append(stripped)
+
     result = ' | '.join(cleaned)
-    return result[:max_chars] if len(result) > max_chars else result
+    if len(result) <= max_chars:
+        return result
+
+    # Keep whole " | "-joined lines up to the budget, from the start
+    # (earliest-listed content — typically the most recent role, per
+    # standard reverse-chronological resume convention) rather than
+    # cutting the joined string at an arbitrary character.
+    kept = []
+    running_len = 0
+    for line in cleaned:
+        added_len = len(line) + (3 if kept else 0)  # +3 for ' | ' separator
+        if running_len + added_len > max_chars:
+            break
+        kept.append(line)
+        running_len += added_len
+    return ' | '.join(kept) if kept else result[:max_chars]
 
 
 def build_rewrite_prompt(parsed: dict, issues: list, job_description: str,
@@ -272,7 +309,14 @@ def build_rewrite_prompt(parsed: dict, issues: list, job_description: str,
     # Decide whether to use parsed sections or raw text fallback.
     # Raw fallback triggers when experience or summary content is thin —
     # this happens on heavily garbled two-column resumes (e.g. Harshal More ETO).
-    experience_clean = sanitise_section(sections.get('experience', ''), 1500)
+    # 1500 chars was confirmed too tight for a real multi-role service
+    # record (4-5 roles with vessel names/GRT/dates easily exceeds it),
+    # silently dropping older roles' vessel-specific details before the
+    # LLM ever saw them. llama-3.3-70b-versatile's real context window
+    # (128k tokens on Groq) has enormous headroom above this; raised to
+    # give real seafarer service records room without materially
+    # affecting prompt size for the common case.
+    experience_clean = sanitise_section(sections.get('experience', ''), 4000)
     summary_clean    = sanitise_section(sections.get('summary', ''))
 
     use_raw_fallback = (
@@ -321,6 +365,23 @@ TARGET JOB DESCRIPTION:
 {job_description}
 
 REWRITING RULES — FOLLOW EXACTLY:
+0. GROUNDING — applies to every sentence in the Summary and every bullet
+   in Experience: each one must be traceable to a specific fact already
+   present in the source data below (a vessel name, GRT, cert name,
+   duty, date, number, or equipment brand). If a sentence would be
+   equally true of any other candidate at this rank, it is too generic
+   — rewrite it around an actual fact from the source, or cut it.
+   Never use these filler phrases regardless of how common they are in
+   real resumes, unless the source gives specific evidence for the exact
+   claim (not just the general idea): "dedicated professional", "proven
+   track record", "team player", "detail-oriented", "results-driven",
+   "highly motivated", "excellent communication skills", "quick
+   learner", "hard worker", "passionate about", "strong work ethic".
+   The source resume text may itself contain phrases like these (real
+   source resumes often do) — copying them into the rewrite doesn't
+   satisfy this rule; replace them with something specific to this
+   candidate's actual experience, or omit them.
+
 1. Summary: EXACTLY 3 sentences, written naturally in confident, direct
    professional prose — not a fill-in-the-blank template restated the same
    way for every candidate. Cover, across the three sentences: (a) rank,
@@ -389,9 +450,15 @@ REWRITING RULES — FOLLOW EXACTLY:
    Wrong: GRT 29733 when source says GRT 199631
    Wrong: cert year 2020 when source shows specific expiry dates
 
-3. Skills: 15-18 items using exact terminology from job description.
-   Include full form AND acronym: 'Standards of Training (STCW)'.
-   If fewer than 15 in source, use minimum skills list above.
+3. Skills: 15-18 items. Prioritize the candidate's OWN detected skills
+   and equipment/duties evident from their actual experience — the job
+   description below is a generic rank-level template (not written for
+   this specific candidate), so use its terminology only to phrase or
+   supplement the candidate's real skills for ATS matching, not as the
+   primary source of what skills to list. Include full form AND
+   acronym: 'Standards of Training (STCW)'. If fewer than 15 emerge from
+   the candidate's own source data, use the minimum skills list above to
+   round out the count.
 
 4. Certifications: '[Full Name (ACRONYM)] | [Issuing Authority] | [Year]'. Max 8.
    Use the ACTUAL issuing authority from source (e.g. DG Shipping, MMD Mumbai).
@@ -627,7 +694,15 @@ def _call_groq_with_retry(prompt: str):
                     {'role': 'user', 'content': prompt},
                 ],
                 temperature=0.3,
-                max_tokens=3000,
+                # 3000 was tight for a full JSON payload covering up to 6
+                # experience entries (3 bullets each), 18 skills, 8
+                # certifications, education, documents, and languages —
+                # a response cut off mid-generation can still parse as
+                # valid JSON if the truncation point happens to land on
+                # an earlier closing brace, silently dropping every field
+                # after it (see the required-keys check below, which
+                # catches this instead of relying on max_tokens alone).
+                max_tokens=6000,
             )
             return response, retries_used
         except GROQ_TRANSIENT_ERRORS as e:
@@ -641,10 +716,17 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
     rank   = _normalize_rank(rank)
     prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
 
-    # Trim experience section if prompt is too long for Groq context
-    if len(prompt) > 6000:
+    # Trim experience section if prompt is too long for Groq context.
+    # 6000 chars (~1500 tokens) was confirmed drastically over-cautious
+    # for llama-3.3-70b-versatile's real 128k-token context on Groq —
+    # raised so this almost never triggers for a real resume. When it
+    # still does (a genuinely extreme source), truncate with
+    # sanitise_section's boundary-safe cut (whole lines, not mid-word)
+    # instead of a raw [:1000] character slice, which could cut off an
+    # entire role's vessel/GRT/date details mid-entry.
+    if len(prompt) > 20000:
         sections = parsed.get('sections', {})
-        sections['experience'] = sections.get('experience', '')[:1000]
+        sections = {**sections, 'experience': sanitise_section(sections.get('experience', ''), 2500)}
         parsed = {**parsed, 'sections': sections}
         prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank)
 
@@ -674,6 +756,19 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                 raw_text = raw_text[start:end + 1]
 
             result = json.loads(raw_text)
+
+            missing_keys = REQUIRED_REWRITE_KEYS - result.keys()
+            if missing_keys:
+                if attempt == 2:
+                    return {
+                        'error':        'INCOMPLETE_RESPONSE',
+                        'detail':       f'Response parsed as valid JSON but was missing required '
+                                        f'fields (likely truncated mid-generation): {sorted(missing_keys)}',
+                        'raw_response': raw_text[:500],
+                        '_groq_retry_count': total_retries,
+                    }
+                continue
+
             result = enforce_minimum_quality(result, rank)
             if not result.get('rank'):
                 result['rank'] = rank

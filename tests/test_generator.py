@@ -69,3 +69,68 @@ def test_enforce_length_limits_no_longer_truncates_mid_abbreviation():
     result = enforce_length_limits(content, 'third officer')
     assert not result['summary'].rstrip().endswith('M.'), 'Still truncating mid-abbreviation'
     assert 'GRT 199631' in result['summary'], 'Lost the final clause'
+
+
+def test_enforce_length_limits_enforces_overall_word_budget_for_junior_rank():
+    """
+    Regression test: enforce_length_limits previously only capped
+    per-field counts (skills count, bullets-per-entry) with no check on
+    total rendered word count -- a junior-rank resume with the maximum
+    allowed entries/bullets/skills, each individually long, could still
+    overflow well past a single page. Confirms a deliberately oversized
+    junior-rank resume gets trimmed down to the single-page word budget.
+    """
+    from pipeline.generator import enforce_length_limits, WORD_LIMIT_SINGLE_PAGE, _count_words
+
+    # 60-word bullets: still over the 600-word budget even after the
+    # existing per-field caps (skills->15, certs->8, entries->3,
+    # bullets->3 each) run first -- those caps alone don't bound total
+    # word count, only item counts, which is exactly the gap this test
+    # targets -- while leaving enough margin that the word-budget floors
+    # (skills>=10, certs>=4, bullets>=2/entry) can actually reach budget.
+    long_bullet = ' '.join(['word'] * 60)
+    content = {
+        'rank': 'deck cadet',
+        'summary': ' '.join(['word'] * 60) + '.',
+        'skills': [f'Skill {i}' for i in range(20)],
+        'certifications': [f'Certification Number {i} Full Name (ACR) | Issuer | 2024' for i in range(10)],
+        'experience_bullets': [
+            {'role': 'Deck Cadet', 'company': 'Example Shipping', 'dates': '01/2022 - 01/2023',
+             'bullets': [long_bullet, long_bullet, long_bullet]},
+            {'role': 'Deck Cadet', 'company': 'Second Shipping', 'dates': '01/2021 - 12/2021',
+             'bullets': [long_bullet, long_bullet, long_bullet]},
+            {'role': 'Deck Cadet', 'company': 'Third Shipping', 'dates': '01/2020 - 12/2020',
+             'bullets': [long_bullet, long_bullet, long_bullet]},
+        ],
+    }
+
+    result = enforce_length_limits(content, 'deck cadet')
+
+    assert _count_words(result) <= WORD_LIMIT_SINGLE_PAGE, (
+        f'Expected total word count <= {WORD_LIMIT_SINGLE_PAGE}, got {_count_words(result)}'
+    )
+    # Every experience ENTRY must survive -- only bullets-per-entry may shrink,
+    # per Rule 2 ("Include ALL vessel entries from source — do not drop any").
+    assert len(result['experience_bullets']) == 3
+    for job in result['experience_bullets']:
+        assert len(job['bullets']) >= 2, 'Bullets should never be trimmed below the 2-bullet floor'
+
+
+def test_enforce_length_limits_leaves_already_short_content_untouched():
+    """A resume already well within budget must not be trimmed at all by the word-budget pass."""
+    from pipeline.generator import enforce_length_limits
+
+    content = {
+        'rank': 'third officer',
+        'summary': 'A short summary.',
+        'skills': ['STCW', 'ECDIS'],
+        'certifications': ['CoC | DG Shipping | 2023'],
+        'experience_bullets': [
+            {'role': 'Third Officer', 'company': 'Example Shipping', 'dates': '01/2022 - 01/2023',
+             'bullets': ['A short bullet.', 'Another short bullet.']},
+        ],
+    }
+    result = enforce_length_limits(content, 'third officer')
+    assert result['skills'] == ['STCW', 'ECDIS']
+    assert result['certifications'] == ['CoC | DG Shipping | 2023']
+    assert len(result['experience_bullets'][0]['bullets']) == 2

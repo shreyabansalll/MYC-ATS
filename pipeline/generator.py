@@ -25,6 +25,18 @@ TWO_PAGE_RANKS = {
 }
 # master, chief officer, chief engineer → 2 pages, more vessel entries allowed
 
+# Overall rendered word-count targets, on top of the per-field caps below.
+# Per-field caps alone (skills count, bullets-per-entry) can't catch a
+# resume that overflows its page budget because individual bullets are
+# long, not numerous — confirmed on real generated output. ~500-600
+# words is a reasonable single 11pt page with 1" margins (matching the
+# existing single-page/two-page rank split above); two pages roughly
+# doubles that. These are reasoned estimates, not tuned against the
+# validation set — flag for review if real DOCX output still overflows
+# its target page count after this.
+WORD_LIMIT_SINGLE_PAGE = 600
+WORD_LIMIT_TWO_PAGE    = 1150
+
 
 def _as_list(value) -> list:
     """
@@ -69,6 +81,31 @@ def split_into_sentences(text: str) -> list:
     return [s for s in sentences if s]
 
 
+def _count_words(content: dict) -> int:
+    """
+    Approximate rendered word count across every section generate_docx()
+    actually writes to the page — summary, skills, certifications,
+    education, languages, and every role's title/company/bullets.
+    """
+    total = len(str(content.get('summary', '')).split())
+    for skill in _as_list(content.get('skills', [])):
+        total += len(str(skill).split())
+    for cert in _as_list(content.get('certifications', [])):
+        total += len(str(cert).split())
+    for edu in _as_list(content.get('education', [])):
+        total += len(str(edu).split())
+    for lang in _as_list(content.get('languages', [])):
+        total += len(str(lang).split())
+    for job in _as_list(content.get('experience_bullets', [])):
+        if not isinstance(job, dict):
+            continue
+        total += len(str(job.get('role', '')).split())
+        total += len(str(job.get('company', '')).split())
+        for bullet in job.get('bullets', []):
+            total += len(str(bullet).split())
+    return total
+
+
 def enforce_length_limits(content: dict, rank: str) -> dict:
     rank_lower = rank.lower() if rank else ''
     is_junior = rank_lower in SINGLE_PAGE_RANKS
@@ -93,6 +130,32 @@ def enforce_length_limits(content: dict, rank: str) -> dict:
 
     # Certifications: cap at 8 lines
     content['certifications'] = _as_list(content.get('certifications', []))[:8]
+
+    # Overall page-length enforcement (total word count), not just the
+    # per-field caps above — those alone don't catch a resume that
+    # overflows because individual bullets/skills are long rather than
+    # numerous. Trims the least fact-critical content first (skills, then
+    # certifications) and only reduces bullets-per-entry as a last
+    # resort, with a floor of 2 bullets/entry — never drops an entire
+    # experience entry, since every vessel/role entry from source must
+    # still appear (see services/ai_client.py Rule 2: "Include ALL vessel
+    # entries from source — do not drop any").
+    word_limit = WORD_LIMIT_SINGLE_PAGE if is_junior else WORD_LIMIT_TWO_PAGE
+
+    while _count_words(content) > word_limit and len(content['skills']) > 10:
+        content['skills'] = content['skills'][:-1]
+
+    while _count_words(content) > word_limit and len(content['certifications']) > 4:
+        content['certifications'] = content['certifications'][:-1]
+
+    while _count_words(content) > word_limit and any(
+        isinstance(job, dict) and len(job.get('bullets', [])) > 2
+        for job in content['experience_bullets']
+    ):
+        for job in content['experience_bullets']:
+            if isinstance(job, dict) and len(job.get('bullets', [])) > 2:
+                job['bullets'] = job['bullets'][:-1]
+                break
 
     return content
 
