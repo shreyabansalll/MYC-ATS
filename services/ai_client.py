@@ -759,6 +759,38 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
 
             missing_keys = REQUIRED_REWRITE_KEYS - result.keys()
             if missing_keys:
+                # TEMPORARY DEBUG LOGGING -- diagnosing a real INCOMPLETE_RESPONSE
+                # failure (Mrinal Thapa resume, post-720ef4b) where every field but
+                # contact info was missing, not just one or two -- looks like severe
+                # early truncation rather than the schema-drift case this check was
+                # built to catch. Logs the full raw response plus Groq's own
+                # finish_reason/token-usage so the real cause (hit max_tokens vs. the
+                # model genuinely stopping early) can be confirmed from real data
+                # before attempting a fix. Remove once diagnosed.
+                finish_reason = None
+                try:
+                    finish_reason = response.choices[0].finish_reason
+                except Exception:
+                    pass
+                usage_info = {}
+                try:
+                    usage = response.usage
+                    usage_info = {
+                        'prompt_tokens':     getattr(usage, 'prompt_tokens', None),
+                        'completion_tokens': getattr(usage, 'completion_tokens', None),
+                        'total_tokens':      getattr(usage, 'total_tokens', None),
+                    }
+                except Exception:
+                    pass
+                log.warning(json.dumps({
+                    'event':             'incomplete_response_debug',
+                    'attempt':           attempt,
+                    'finish_reason':     finish_reason,
+                    **usage_info,
+                    'missing_keys':      sorted(missing_keys),
+                    'raw_response_len':  len(raw_text),
+                    'raw_response':      raw_text,
+                }))
                 if attempt == 2:
                     return {
                         'error':        'INCOMPLETE_RESPONSE',
