@@ -1,12 +1,9 @@
 # pipeline/full_batch_processor.py
-# Stage 1-6 batch validator — unlike pipeline/batch_processor.py (which
-# only exercises Stages 1-4: extract/parse/score, fully deterministic,
-# no Groq calls), this runs the REAL AI rewrite + DOCX generation for
-# every candidate, then programmatically checks the actual generated
-# output for the specific defect classes found by manual review this
-# session (missing rank header, empty certifications/education/
-# languages when source has real data, empty Sea Service Record when
-# source has a real table, obviously truncated experience content).
+# Stage 1-5 rewrite-output validator — unlike pipeline/batch_processor.py
+# (which only exercises Stages 1-4: extract/parse/score, fully
+# deterministic, no LLM calls), this runs the real AI rewrite for each
+# candidate and checks the returned rewrite data. It does not generate or
+# validate DOCX files.
 #
 # This does not replace manual review — it turns "someone happened to
 # read this candidate's resume by hand" into a repeatable check that can
@@ -73,7 +70,7 @@ def check_candidate(path: str) -> dict:
             # experience_bullets came back hard-empty regardless of
             # source content (api.py's fallback). This harness only
             # exercises rewrite_resume() directly (not api.py's
-            # fallback wrapper), so a Groq failure here is reported as
+            # fallback wrapper), so an LLM failure here is reported as
             # its own check rather than silently masked by that fallback.
             result['error'] = f"rewrite failed: {rewritten.get('error')} — {rewritten.get('detail', '')[:200]}"
             return result
@@ -129,10 +126,7 @@ def main():
         else:
             failed = [k for k, v in r['checks'].items() if not v]
             print(f'      {"PASS" if not failed else "FAIL: " + ", ".join(failed)}')
-        # Real, confirmed account-level constraint (see config.py's
-        # GROQ_MODEL comment): an 8000 TPM cap on this billing tier.
-        # Spacing real, sequential calls out reduces (does not
-        # eliminate) how often a candidate hits it and falls back.
+        # Space real provider calls to reduce rate-limit contention.
         time.sleep(3)
 
     errored = [r for r in results if r.get('error')]

@@ -11,11 +11,14 @@ logging.getLogger('pdfminer').setLevel(logging.ERROR)
 
 from pipeline.extractor import extract_text, extract_photo
 from pipeline.parser import parse_resume
-from pipeline.scorer import score_resume
-from pipeline.maritime import maritime_score
 from services.ai_client import rewrite_resume
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
+from services.two_layer import (
+    maritime_stub_for_profile,
+    score_layers,
+    score_layers_after_rewrite,
+)
 
 
 def run_pipeline(file_path: str, job_description: str = '') -> dict:
@@ -42,38 +45,50 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     print(f'      ✓  Email   : {parsed["contact"]["email"]}')
     print(f'      ✓  Skills  : {len(parsed["skills"])} found')
 
-    # ── Stage 3: ATS Score ───────────────────────────────────────────
-    print('\n[3/6] ATS scoring...')
-    ats = score_resume(extracted, parsed, job_description)
-    print(f'      ✓  ATS Score: {ats["total_score"]}/100 — {ats["grade"]}')
-    print(f'         Breakdown: Format:{ats["breakdown"]["format"]}  '
-          f'Sections:{ats["breakdown"]["sections"]}  '
-          f'Keywords:{ats["breakdown"]["keywords"]}')
-
-    # ── Stage 4: Maritime Score ──────────────────────────────────────
-    print('\n[4/6] Maritime scoring...')
-    maritime = maritime_score(extracted['raw_text'], parsed, pdf_path=file_path)
-    print(f'      ✓  Maritime : {maritime["maritime_score"]} — {maritime["maritime_grade"]}')
-    print(f'         Rank     : {maritime["rank_detected"]}')
-    print(f'         Sea      : {maritime["sea_months"]} months')
-    print(f'         Certs    : {maritime["cert_coverage"]}')
+    # ── Stage 3: Two-layer ATS scoring ────────────────────────────────
+    print('\n[3/6] Scoring resume...')
+    layers_before = score_layers(
+        extracted,
+        parsed,
+        job_description=job_description,
+        pdf_path=file_path,
+        ext=ext,
+    )
+    ats = layers_before['generic']
+    maritime = layers_before['maritime']
+    overlay = layers_before['overlay']
+    tailored_jd = layers_before['job_description']
+    print(f'      ✓  Generic ATS: {ats["total_score"]}/100 — {ats["grade"]}')
+    print(f'         Breakdown: Parse:{ats["breakdown"]["parse_check"]}  '
+          f'Content:{ats["breakdown"]["content"]}')
+    if maritime:
+        print(f'      ✓  Maritime   : {maritime["maritime_score"]} — {maritime["maritime_grade"]}')
+        print(f'         Rank       : {maritime["rank_detected"]}')
+        print(f'         Sea        : {maritime["sea_months"]} months')
+        print(f'         Certs      : {maritime["cert_coverage"]}')
 
     # Typed domain object — canonical candidate record for this job.
     # Downstream stages (rewrite, generate) read from this rather than
     # the loose parsed/maritime dicts at the scoring/rewriting boundary.
-    candidate_profile = build_candidate_profile(parsed, maritime)
+    candidate_profile = build_candidate_profile(
+        parsed,
+        maritime if maritime is not None else maritime_stub_for_profile(parsed),
+    )
+    rank = candidate_profile.rank_detected if overlay else (parsed.get('rank') or '')
 
     # ── Stage 5: AI Rewrite ──────────────────────────────────────────
-    print('\n[5/6] Rewriting resume (Groq)...')
-    all_issues = ats['issues'] + maritime['issues']
+    print('\n[5/6] Rewriting resume (Claude)...')
+    maritime_issues = maritime['issues'] if maritime else []
+    all_issues = ats['issues'] + maritime_issues
 
     rewritten = rewrite_resume(
         parsed=parsed,
         issues=all_issues,
-        job_description=job_description,
-        rank=candidate_profile.rank_detected,
+        job_description=tailored_jd,
+        rank=rank,
         license_rank=candidate_profile.license_rank,
         sea_months=candidate_profile.sea_months,
+        generic_mode=not overlay,
     )
 
     if 'error' in rewritten:
@@ -83,22 +98,22 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
             'error': 'Rewriter failed',
             'stage': 'ai_rewrite',
             'ats_before': ats['total_score'],
-            'maritime': maritime['maritime_score'],
+            'maritime': maritime['maritime_score'] if maritime else None,
             'detail': rewritten
         }
 
     # Inject fields rewriter doesn't carry
     rewritten['name']         = candidate_profile.name
     rewritten['contact']      = candidate_profile.contact.model_dump()
-    rewritten['rank']         = candidate_profile.rank_detected
-    rewritten['sea_months']   = maritime['sea_months']
-    rewritten['vessel_types'] = maritime['vessel_types']
+    rewritten['rank']         = rank
+    rewritten['sea_months']   = candidate_profile.sea_months
+    rewritten['vessel_types'] = candidate_profile.vessel_types
 
     print(f'      ✓  Rewrite complete')
     print(f'         Issues to fix: {len(rewritten.get("issues_fixed", []))}')
 
     # ── Stage 6: Generate DOCX ───────────────────────────────────────
-    # Two variants from the same rewrite (no duplicate Groq call): a
+    # Two variants from the same rewrite (no duplicate Claude call): a
     # photo-free default for automated/bulk ATS upload channels (existing
     # filename/behavior, unchanged), and a photo-included variant for
     # direct human/recruiter-facing submission. Photo extraction is
@@ -123,10 +138,15 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     # Re-score to verify improvement
     extracted2 = extract_text(docx_path, 'docx')
     parsed2    = parse_resume(extracted2['raw_text'])
-    ats2       = score_resume(extracted2, parsed2, job_description)
-    # No PDF to read for the regenerated DOCX — maritime_score() falls back
-    # to text-based sea-months extraction from parsed2's sections.
-    maritime2  = maritime_score(extracted2['raw_text'], parsed2)
+    layers_after = score_layers_after_rewrite(
+        rewritten,
+        extracted2,
+        parsed2,
+        job_description=tailored_jd,
+        overlay=overlay,
+    )
+    ats2 = layers_after['generic']
+    maritime2 = layers_after['maritime']
 
     score_before = ats['total_score']
     score_after  = ats2['total_score']
@@ -137,8 +157,9 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     print(f'  │  ATS Score before      : {score_before:3d}/100 {ats["grade"]:<10}│')
     print(f'  │  ATS Score after       : {score_after:3d}/100 {ats2["grade"]:<10}│')
     print(f'  │  Improvement           : {improvement:+4d} pts               │')
-    print(f'  │  Maritime Score before : {maritime["maritime_score"]:3d} {maritime["maritime_grade"]:<10}    │')
-    print(f'  │  Maritime Score after  : {maritime2["maritime_score"]:3d} {maritime2["maritime_grade"]:<10}    │')
+    if maritime and maritime2:
+        print(f'  │  Maritime Score before : {maritime["maritime_score"]:3d} {maritime["maritime_grade"]:<10}    │')
+        print(f'  │  Maritime Score after  : {maritime2["maritime_score"]:3d} {maritime2["maritime_grade"]:<10}    │')
     print(f'  └─────────────────────────────────────────┘')
 
     # ── Final Report ─────────────────────────────────────────────────
@@ -146,7 +167,7 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         'candidate': {
             'name':    candidate_profile.name,
             'contact': candidate_profile.contact.model_dump(),
-            'rank':    candidate_profile.rank_detected,
+            'rank':    rank,
             'skills':  candidate_profile.skills,
         },
         'scores': {
@@ -155,19 +176,19 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
             'improvement':     improvement,
             'grade_before':    ats['grade'],
             'grade_after':     ats2['grade'],
-            'maritime_before':       maritime['maritime_score'],
-            'maritime_grade_before': maritime['maritime_grade'],
-            'maritime_after':        maritime2['maritime_score'],
-            'maritime_grade_after':  maritime2['maritime_grade'],
+            'maritime_before':       maritime['maritime_score'] if maritime else None,
+            'maritime_grade_before': maritime['maritime_grade'] if maritime else None,
+            'maritime_after':        maritime2['maritime_score'] if maritime2 else None,
+            'maritime_grade_after':  maritime2['maritime_grade'] if maritime2 else None,
             # Back-compat aliases — historically pointed at the pre-rewrite value
-            'maritime':        maritime['maritime_score'],
-            'maritime_grade':  maritime['maritime_grade'],
+            'maritime':        maritime['maritime_score'] if maritime else None,
+            'maritime_grade':  maritime['maritime_grade'] if maritime else None,
         },
         'maritime': {
-            'sea_months':    maritime['sea_months'],
-            'vessel_types':  maritime['vessel_types'],
-            'cert_coverage': maritime['cert_coverage'],
-            'missing_certs': maritime['missing_certs'],
+            'sea_months':    maritime['sea_months'] if maritime else 0,
+            'vessel_types':  maritime['vessel_types'] if maritime else [],
+            'cert_coverage': maritime['cert_coverage'] if maritime else None,
+            'missing_certs': maritime['missing_certs'] if maritime else [],
         },
         'output': {
             'docx_path':       docx_path,

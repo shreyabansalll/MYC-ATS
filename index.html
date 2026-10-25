@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Resume Scoring API — Testing Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0e14;
+    --surface: #111621;
+    --surface-2: #161c2a;
+    --border: #1f2738;
+    --border-strong: #2a3447;
+    --text: #e6eaf2;
+    --text-dim: #8b95a8;
+    --text-mute: #5b6577;
+    --primary: #4f9eff;
+    --primary-hover: #3a8ae8;
+    --primary-soft: rgba(79, 158, 255, 0.12);
+    --success: #34d399;
+    --warning: #fbbf24;
+    --critical: #f87171;
+    --info: #60a5fa;
+    --radius: 10px;
+    --radius-sm: 7px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .app {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  header.top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 28px;
+    margin-bottom: 28px;
+    border-bottom: 1px solid var(--border);
+  }
+  header.top .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header.top .logo {
+    width: 36px; height: 36px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, var(--primary), #6a5cff);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: white; font-size: 16px;
+  }
+  header.top h1 {
+    font-size: 17px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  header.top .sub {
+    font-size: 12px; color: var(--text-mute); margin-top: 2px;
+  }
+  header.top .endpoint {
+    font-size: 12px; color: var(--text-dim);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    padding: 6px 10px; border-radius: var(--radius-sm);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px;
+  }
+  .card h2 {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 16px;
+  }
+
+  /* Drop zone */
+  .dropzone {
+    border: 1.5px dashed var(--border-strong);
+    border-radius: var(--radius);
+    padding: 28px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.18s ease;
+    background: var(--surface-2);
+  }
+  .dropzone:hover, .dropzone.focus {
+    border-color: var(--primary);
+    background: var(--primary-soft);
+  }
+  .dropzone.drag {
+    border-color: var(--primary);
+    background: var(--primary-soft);
+    transform: scale(1.01);
+  }
+  .dropzone .dz-icon {
+    width: 38px; height: 38px;
+    margin: 0 auto 10px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-dim);
+  }
+  .dropzone .dz-title {
+    font-size: 13px; font-weight: 500; color: var(--text);
+  }
+  .dropzone .dz-hint {
+    font-size: 11px; color: var(--text-mute); margin-top: 4px;
+  }
+
+  .file-pill {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .file-pill .fi {
+    width: 30px; height: 30px; flex-shrink: 0;
+    border-radius: 7px;
+    background: var(--primary-soft);
+    color: var(--primary);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700;
+  }
+  .file-pill .fn {
+    flex: 1; min-width: 0;
+    font-size: 13px; font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .file-pill .fs {
+    font-size: 11px; color: var(--text-mute);
+    font-variant-numeric: tabular-nums;
+  }
+  .file-pill .fx {
+    cursor: pointer; color: var(--text-mute);
+    width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 5px; transition: all 0.15s;
+  }
+  .file-pill .fx:hover { color: var(--critical); background: rgba(248,113,113,0.1); }
+
+  /* Form */
+  .field { margin-top: 18px; }
+  label.lbl {
+    display: block;
+    font-size: 12px; font-weight: 500;
+    color: var(--text-dim);
+    margin-bottom: 7px;
+  }
+  select, input[type="text"] {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    font-family: inherit; font-size: 13px;
+    transition: border-color 0.15s;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+  select:focus, input:focus {
+    outline: none;
+    border-color: var(--primary);
+  }
+  select {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b95a8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 32px;
+  }
+
+  .actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 22px;
+  }
+  button.btn {
+    padding: 11px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    font-family: inherit; font-size: 13px; font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  button.btn:disabled {
+    opacity: 0.4; cursor: not-allowed;
+  }
+  .btn-score {
+    background: var(--surface-2);
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+  .btn-score:hover:not(:disabled) {
+    border-color: var(--primary);
+    background: var(--primary-soft);
+    color: var(--primary);
+  }
+  .btn-rewrite {
+    background: var(--primary);
+    color: white;
+  }
+  .btn-rewrite:hover:not(:disabled) {
+    background: var(--primary-hover);
+  }
+
+  .spinner {
+    width: 14px; height: 14px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Results */
+  .results-empty {
+    color: var(--text-mute);
+    text-align: center;
+    padding: 60px 20px;
+    font-size: 13px;
+  }
+  .results-empty .re-icon {
+    width: 48px; height: 48px;
+    margin: 0 auto 14px;
+    border-radius: 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-mute);
+  }
+
+  .score-hero {
+    display: flex; align-items: baseline; gap: 14px;
+    padding-bottom: 22px;
+    margin-bottom: 22px;
+    border-bottom: 1px solid var(--border);
+  }
+  .score-hero .big {
+    font-size: 64px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+  }
+  .score-hero .big .unit {
+    font-size: 22px; color: var(--text-mute); font-weight: 500;
+  }
+  .score-hero .label {
+    font-size: 12px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  .score-hero .verdict {
+    margin-left: auto;
+    font-size: 12px; font-weight: 600;
+    padding: 5px 10px; border-radius: 20px;
+  }
+  .v-good { background: rgba(52,211,153,0.15); color: var(--success); }
+  .v-mid  { background: rgba(251,191,36,0.15); color: var(--warning); }
+  .v-bad  { background: rgba(248,113,113,0.15); color: var(--critical); }
+
+  .score-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 22px;
+  }
+  .score-tile {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 16px;
+  }
+  .score-tile .st-label {
+    font-size: 11px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+  .score-tile .st-val {
+    font-size: 28px; font-weight: 700; line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .score-tile .st-bar {
+    height: 5px; border-radius: 3px;
+    background: var(--border-strong);
+    margin-top: 12px; overflow: hidden;
+  }
+  .score-tile .st-bar .fill {
+    height: 100%; border-radius: 3px;
+    transition: width 0.6s ease;
+  }
+  .tile-ats .fill { background: var(--primary); }
+  .tile-mar .fill { background: var(--success); }
+
+  /* Before / After for rewrite */
+  .ba-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 22px;
+  }
+  .ba-tile {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 16px;
+  }
+  .ba-tile.after { border-color: rgba(52,211,153,0.4); }
+  .ba-tile .bt-label {
+    font-size: 11px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+  .ba-tile .bt-val {
+    font-size: 32px; font-weight: 700; line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .ba-tile.after .bt-val { color: var(--success); }
+  .ba-delta {
+    font-size: 12px; font-weight: 600;
+    margin-top: 6px;
+  }
+  .ba-delta.up { color: var(--success); }
+  .ba-delta.down { color: var(--critical); }
+
+  .download-bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 16px;
+    background: rgba(52,211,153,0.08);
+    border: 1px solid rgba(52,211,153,0.3);
+    border-radius: var(--radius-sm);
+    margin-bottom: 22px;
+  }
+  .download-bar .dl-text {
+    flex: 1; font-size: 13px;
+  }
+  .download-bar .dl-text strong { font-weight: 600; }
+  .download-bar .dl-text .dl-sub { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+  .btn-download {
+    background: var(--success);
+    color: #07140e;
+    padding: 9px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 12px; font-weight: 700;
+    border: none; cursor: pointer;
+    display: flex; align-items: center; gap: 7px;
+    transition: filter 0.15s;
+  }
+  .btn-download:hover { filter: brightness(1.08); }
+
+  /* Progress */
+  .progress-wrap {
+    margin-bottom: 22px;
+  }
+  .progress-head {
+    display: flex; justify-content: space-between;
+    font-size: 12px; margin-bottom: 8px;
+  }
+  .progress-head .ph-status { color: var(--text); font-weight: 500; }
+  .progress-head .ph-pct { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .progress-track {
+    height: 8px; border-radius: 4px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary), #6a5cff);
+    border-radius: 4px;
+    transition: width 0.4s ease;
+    width: 0%;
+  }
+  .progress-fill.indeterminate {
+    width: 30% !important;
+    animation: indet 1.2s ease-in-out infinite;
+  }
+  @keyframes indet {
+    0% { margin-left: -30%; }
+    50% { margin-left: 50%; }
+    100% { margin-left: 100%; }
+  }
+
+  /* Issues */
+  .issues-head {
+    font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .issues-head .count {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    padding: 1px 8px; border-radius: 10px;
+    font-size: 11px; color: var(--text-dim);
+  }
+  .issue {
+    display: flex; gap: 12px;
+    padding: 12px 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 8px;
+  }
+  .issue:last-child { margin-bottom: 0; }
+  .badge {
+    flex-shrink: 0;
+    font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 3px 8px; border-radius: 4px;
+    align-self: flex-start;
+    margin-top: 1px;
+  }
+  .b-critical { background: rgba(248,113,113,0.15); color: var(--critical); }
+  .b-warning  { background: rgba(251,191,36,0.15); color: var(--warning); }
+  .b-suggestion { background: rgba(96,165,250,0.15); color: var(--info); }
+  .issue .it-body { flex: 1; min-width: 0; }
+  .issue .it-msg {
+    font-size: 13px; color: var(--text);
+    line-height: 1.5;
+  }
+  .issue .it-meta {
+    font-size: 11px; color: var(--text-mute);
+    margin-top: 3px;
+  }
+
+  /* Toast / errors */
+  .toast {
+    position: fixed; bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface);
+    border: 1px solid var(--critical);
+    color: var(--text);
+    padding: 12px 18px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    z-index: 100;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.2s, transform 0.2s;
+  }
+  .toast.show {
+    opacity: 1; pointer-events: auto;
+    transform: translateX(-50%) translateY(-4px);
+  }
+
+  .section-title {
+    font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 22px 0 12px;
+  }
+
+  .pulse-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--primary);
+    display: inline-block;
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+</style>
+  <meta property="og:image" content="https://bolt.new/static/og_default.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://bolt.new/static/og_default.png">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <div class="logo">RS</div>
+      <div>
+        <h1>Resume Scoring API</h1>
+        <div class="sub">Internal testing dashboard</div>
+      </div>
+    </div>
+    <div class="endpoint" id="endpointLabel">http://localhost:8000</div>
+  </header>
+
+  <div class="grid">
+    <!-- Left: input -->
+    <section class="card" id="inputCard">
+      <h2>Input</h2>
+
+      <div class="dropzone" id="dropzone">
+        <div class="dz-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </div>
+        <div class="dz-title">Drop resume here or click to browse</div>
+        <div class="dz-hint">PDF or DOCX · max 10MB</div>
+        <input type="file" id="fileInput" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden />
+      </div>
+
+      <div id="filePillWrap" style="display:none;">
+        <div class="file-pill">
+          <div class="fi" id="fpExt">PDF</div>
+          <div style="flex:1; min-width:0;">
+            <div class="fn" id="fpName">filename.pdf</div>
+            <div class="fs" id="fpSize">0 KB</div>
+          </div>
+          <div class="fx" id="fpRemove" title="Remove">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="lbl" for="trackSelect">Career track (optional)</label>
+        <select id="trackSelect">
+          <option value="">Generic ATS only</option>
+          <option value="deck_officer">Deck Officer</option>
+          <option value="marine_engineer">Marine Engineer</option>
+          <option value="eto">Electro-Technical Officer (ETO)</option>
+          <option value="gp_rating">GP Rating</option>
+          <option value="cruise_hospitality">Cruise Hospitality</option>
+        </select>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-score" id="btnScore" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Score Only
+        </button>
+        <button class="btn btn-rewrite" id="btnRewrite" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          Full Rewrite
+        </button>
+      </div>
+    </section>
+
+    <!-- Right: results -->
+    <section class="card" id="resultsCard">
+      <h2>Results</h2>
+      <div id="resultsBody">
+        <div class="results-empty">
+          <div class="re-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          </div>
+          Upload a resume and run a score or rewrite to see results.
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const BASE_URL = 'http://localhost:8000';
+const POLL_INTERVAL = 3000;
+const MAX_FILE = 10 * 1024 * 1024;
+
+let currentFile = null;
+let pollTimer = null;
+let downloadUrl = null;
+
+const $ = (id) => document.getElementById(id);
+const dropzone = $('dropzone');
+const fileInput = $('fileInput');
+const btnScore = $('btnScore');
+const btnRewrite = $('btnRewrite');
+const resultsBody = $('resultsBody');
+const toast = $('toast');
+
+$('endpointLabel').textContent = BASE_URL;
+
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3500);
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/1024/1024).toFixed(2) + ' MB';
+}
+
+function setFile(file) {
+  if (!file) return;
+  const name = file.name.toLowerCase();
+  const isPdf = name.endsWith('.pdf') || file.type === 'application/pdf';
+  const isDocx = name.endsWith('.docx') || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (!isPdf && !isDocx) {
+    showToast('Only PDF and DOCX files are allowed.');
+    return;
+  }
+  if (file.size > MAX_FILE) {
+    showToast('File exceeds 10MB limit.');
+    return;
+  }
+  currentFile = file;
+  $('fpName').textContent = file.name;
+  $('fpSize').textContent = formatSize(file.size);
+  $('fpExt').textContent = isPdf ? 'PDF' : 'DOCX';
+  $('filePillWrap').style.display = 'block';
+  btnScore.disabled = false;
+  btnRewrite.disabled = false;
+}
+
+function clearFile() {
+  currentFile = null;
+  fileInput.value = '';
+  $('filePillWrap').style.display = 'none';
+  btnScore.disabled = true;
+  btnRewrite.disabled = true;
+}
+
+dropzone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => setFile(e.target.files[0]));
+$('fpRemove').addEventListener('click', clearFile);
+
+['dragenter','dragover'].forEach(ev =>
+  dropzone.addEventListener(ev, (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropzone.classList.add('drag');
+  })
+);
+['dragleave','drop'].forEach(ev =>
+  dropzone.addEventListener(ev, (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropzone.classList.remove('drag');
+  })
+);
+dropzone.addEventListener('drop', (e) => {
+  const f = e.dataTransfer.files[0];
+  if (f) setFile(f);
+});
+
+function buildForm(track) {
+  const fd = new FormData();
+  fd.append('file', currentFile);
+  if (track) fd.append('career_track', track);
+  return fd;
+}
+
+function getTrack() {
+  return $('trackSelect').value;
+}
+
+function setBusy(btn, busy, label) {
+  if (busy) {
+    btn.disabled = true;
+    btn.dataset.orig = btn.innerHTML;
+    btn.innerHTML = '<span class="spinner"></span> ' + (label || 'Working…');
+  } else {
+    btn.innerHTML = btn.dataset.orig;
+    // re-evaluate overall disabled state
+    btn.disabled = !currentFile || pollTimer !== null;
+  }
+}
+
+function verdictClass(score) {
+  if (score >= 75) return 'v-good';
+  if (score >= 50) return 'v-mid';
+  return 'v-bad';
+}
+function verdictText(score) {
+  if (score >= 75) return 'Strong';
+  if (score >= 50) return 'Needs work';
+  return 'Weak';
+}
+
+function severityBadge(sev) {
+  const s = (sev || '').toLowerCase();
+  if (s === 'critical' || s === 'error' || s === 'high') return 'b-critical';
+  if (s === 'warning' || s === 'medium' || s === 'moderate') return 'b-warning';
+  return 'b-suggestion';
+}
+function severityLabel(sev) {
+  const s = (sev || '').toLowerCase();
+  if (s === 'critical' || s === 'error' || s === 'high') return 'Critical';
+  if (s === 'warning' || s === 'medium' || s === 'moderate') return 'Warning';
+  return 'Suggestion';
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function renderScore(data) {
+  const overall = Number(data.overall_score ?? data.score ?? 0);
+  const ats = Number(data.ats_score ?? 0);
+  const mar = Number(data.maritime_score ?? 0);
+  const issues = Array.isArray(data.issues) ? data.issues : [];
+
+  const issuesHtml = issues.length ? issues.map(it => {
+    const sev = it.severity || it.level || 'suggestion';
+    const msg = it.message || it.issue || it.description || '';
+    const meta = [it.category, it.section, it.location].filter(Boolean).join(' · ');
+    return `<div class="issue">
+      <span class="badge ${severityBadge(sev)}">${severityLabel(sev)}</span>
+      <div class="it-body">
+        <div class="it-msg">${escapeHtml(msg)}</div>
+        ${meta ? `<div class="it-meta">${escapeHtml(meta)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('') : '<div class="issue"><div class="it-body"><div class="it-msg" style="color:var(--text-dim);">No issues detected.</div></div></div>';
+
+  resultsBody.innerHTML = `
+    <div class="score-hero">
+      <div>
+        <div class="big">${overall}<span class="unit">/100</span></div>
+      </div>
+      <div>
+        <div class="label">Overall score</div>
+      </div>
+      <div class="verdict ${verdictClass(overall)}">${verdictText(overall)}</div>
+    </div>
+
+    <div class="score-pair">
+      <div class="score-tile tile-ats">
+        <div class="st-label">ATS Score</div>
+        <div class="st-val">${ats}</div>
+        <div class="st-bar"><div class="fill" style="width:${Math.min(100,ats)}%"></div></div>
+      </div>
+      <div class="score-tile tile-mar">
+        <div class="st-label">Maritime Score</div>
+        <div class="st-val">${mar}</div>
+        <div class="st-bar"><div class="fill" style="width:${Math.min(100,mar)}%"></div></div>
+      </div>
+    </div>
+
+    <div class="issues-head">Issues <span class="count">${issues.length}</span></div>
+    <div id="issuesList">${issuesHtml}</div>
+  `;
+}
+
+function renderRewriteProgress(statusText, pct, indeterminate) {
+  const pctText = indeterminate ? '—' : (pct != null ? pct + '%' : '0%');
+  const fillClass = indeterminate ? 'progress-fill indeterminate' : 'progress-fill';
+  resultsBody.innerHTML = `
+    <div class="progress-wrap">
+      <div class="progress-head">
+        <span class="ph-status"><span class="pulse-dot"></span>&nbsp; ${escapeHtml(statusText || 'Processing…')}</span>
+        <span class="ph-pct">${pctText}</span>
+      </div>
+      <div class="progress-track">
+        <div class="${fillClass}" style="${indeterminate ? '' : 'width:'+(pct||0)+'%'}"></div>
+      </div>
+    </div>
+    <div class="results-empty" style="padding:30px 20px;">
+      Rewriting your resume. This usually takes a minute or two.
+    </div>
+  `;
+}
+
+function renderRewriteDone(data) {
+  const before = Number(data.before_score ?? data.original_score ?? 0);
+  const after = Number(data.after_score ?? data.rewritten_score ?? data.new_score ?? 0);
+  const delta = after - before;
+  const issues = Array.isArray(data.issues) ? data.issues : [];
+
+  const issuesHtml = issues.length ? issues.map(it => {
+    const sev = it.severity || it.level || 'suggestion';
+    const msg = it.message || it.issue || it.description || '';
+    const meta = [it.category, it.section, it.location].filter(Boolean).join(' · ');
+    return `<div class="issue">
+      <span class="badge ${severityBadge(sev)}">${severityLabel(sev)}</span>
+      <div class="it-body">
+        <div class="it-msg">${escapeHtml(msg)}</div>
+        ${meta ? `<div class="it-meta">${escapeHtml(meta)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('') : '';
+
+  const dlUrl = data.download_url || data.rewritten_url || data.file_url || null;
+  let dlAbs = null;
+  if (dlUrl) {
+    dlAbs = dlUrl.startsWith('http') ? dlUrl : (BASE_URL.replace(/\/$/,'') + '/' + dlUrl.replace(/^\//,''));
+  }
+  downloadUrl = dlAbs;
+
+  const deltaText = (delta > 0 ? '+' : '') + delta;
+  const deltaClass = delta > 0 ? 'up' : (delta < 0 ? 'down' : '');
+
+  resultsBody.innerHTML = `
+    <div class="section-title">Rewrite complete</div>
+
+    <div class="ba-pair">
+      <div class="ba-tile before">
+        <div class="bt-label">Before</div>
+        <div class="bt-val">${before}</div>
+      </div>
+      <div class="ba-tile after">
+        <div class="bt-label">After</div>
+        <div class="bt-val">${after}</div>
+        <div class="ba-delta ${deltaClass}">${deltaText} pts</div>
+      </div>
+    </div>
+
+    ${dlAbs ? `
+    <div class="download-bar">
+      <div class="dl-text">
+        <strong>Rewritten resume ready</strong>
+        <div class="dl-sub">Click to download the optimized file</div>
+      </div>
+      <button class="btn-download" id="btnDownload">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download
+      </button>
+    </div>` : ''}
+
+    ${issues.length ? `
+      <div class="issues-head">Issues addressed <span class="count">${issues.length}</span></div>
+      <div id="issuesList">${issuesHtml}</div>
+    ` : ''}
+  `;
+
+  const dlBtn = document.getElementById('btnDownload');
+  if (dlBtn) dlBtn.addEventListener('click', () => {
+    if (downloadUrl) window.open(downloadUrl, '_blank');
+  });
+}
+
+function renderError(msg) {
+  resultsBody.innerHTML = `
+    <div class="results-empty">
+      <div class="re-icon" style="border-color:rgba(248,113,113,0.4); color:var(--critical);">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      </div>
+      <div style="color:var(--critical); margin-bottom:6px;">Request failed</div>
+      <div style="color:var(--text-dim); font-size:12px;">${escapeHtml(msg)}</div>
+    </div>
+  `;
+}
+
+async function doScore() {
+  if (!currentFile) return;
+  setBusy(btnScore, true, 'Scoring…');
+  btnRewrite.disabled = true;
+  try {
+    const res = await fetch(`${BASE_URL}/ats/score`, {
+      method: 'POST',
+      body: buildForm(getTrack())
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? ' — ' + txt.slice(0,200) : ''}`);
+    }
+    const data = await res.json();
+    renderScore(data);
+  } catch (err) {
+    renderError(err.message || 'Network error');
+    showToast('Scoring failed: ' + (err.message || 'network error'));
+  } finally {
+    setBusy(btnScore, false);
+    btnRewrite.disabled = !currentFile;
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  btnScore.disabled = !currentFile;
+  btnRewrite.disabled = !currentFile;
+}
+
+async function doRewrite() {
+  if (!currentFile) return;
+  setBusy(btnRewrite, true, 'Submitting…');
+  btnScore.disabled = true;
+  try {
+    const res = await fetch(`${BASE_URL}/ats/submit`, {
+      method: 'POST',
+      body: buildForm(getTrack())
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? ' — ' + txt.slice(0,200) : ''}`);
+    }
+    const data = await res.json();
+    const jobId = data.job_id || data.id || data.jobId;
+    if (!jobId) throw new Error('No job_id returned from /ats/submit');
+    setBusy(btnRewrite, true, 'Rewriting…');
+    renderRewriteProgress('Submitted, waiting for progress…', 0, true);
+    startPolling(jobId);
+  } catch (err) {
+    renderError(err.message || 'Network error');
+    showToast('Rewrite failed: ' + (err.message || 'network error'));
+    setBusy(btnRewrite, false);
+    btnScore.disabled = !currentFile;
+  }
+}
+
+function startPolling(jobId) {
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`${BASE_URL}/ats/status/${jobId}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const data = await res.json();
+      const status = (data.status || '').toLowerCase();
+      const pct = data.progress != null ? Number(data.progress) : null;
+
+      if (status === 'completed' || status === 'done' || status === 'success') {
+        stopPolling();
+        setBusy(btnRewrite, false);
+        renderRewriteDone(data);
+      } else if (status === 'failed' || status === 'error') {
+        stopPolling();
+        setBusy(btnRewrite, false);
+        renderError(data.error || data.message || 'Rewrite job failed');
+        showToast('Rewrite job failed');
+      } else {
+        const label = data.message || data.stage || (status === 'pending' ? 'Queued…' : 'Processing…');
+        const indet = (pct == null || isNaN(pct));
+        renderRewriteProgress(label, indet ? null : Math.max(0, Math.min(100, pct)), indet);
+      }
+    } catch (err) {
+      stopPolling();
+      setBusy(btnRewrite, false);
+      renderError(err.message || 'Polling failed');
+      showToast('Status polling failed');
+    }
+  }, POLL_INTERVAL);
+}
+
+btnScore.addEventListener('click', doScore);
+btnRewrite.addEventListener('click', doRewrite);
+</script>
+</body>
+</html>

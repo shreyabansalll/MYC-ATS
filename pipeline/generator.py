@@ -78,7 +78,7 @@ def _job_field(job: dict, key: str) -> str:
     Reads a scalar experience_bullets field (role/company/dates) coerced
     to a plain string. Real crash fixed: add_sea_service_section's
     duplicate-row check uses (dates, company, headline) as a set key,
-    which raises TypeError: unhashable type on a real Groq response
+    which raises TypeError: unhashable type on a real LLM response
     where one of these fields came back as a list instead of a string
     (schema drift, same category as the dict-shaped certification
     entries _stringify_cert already guards against) -- confirmed on a

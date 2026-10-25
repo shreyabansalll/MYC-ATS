@@ -43,11 +43,17 @@ import sentry_sdk
 from config import OUTPUT_DIR
 from pipeline.extractor import extract_text, extract_photo
 from pipeline.parser import parse_resume
-from pipeline.scorer import score_resume
-from pipeline.maritime import maritime_score
 from services.ai_client import rewrite_resume
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
+from generic_ats.pdf_classic import generate_classic_pdf
+from services.two_layer import (
+    maritime_stub_for_profile,
+    rewrite_quality_from_improvement,
+    score_layers,
+    score_layers_after_rewrite,
+    should_retry_rewrite,
+)
 
 # ── Logging — structured JSON, NO PII ────────────────────────────────
 
@@ -121,13 +127,13 @@ if not ADMIN_API_KEY:
     # yet, but that means the client-facing key (the one embedded in
     # MYC's app, more exposed than a pure backend secret) also grants
     # access to internal operational metrics (job counts, score deltas,
-    # Groq failure rates) unless this is set.
+    # Claude failure rates) unless this is set.
     log.warning('"MYC_ADMIN_KEY not set — /ats/admin/metrics falls back to MYC_API_KEY, '
                 'the same key client requests use. Set MYC_ADMIN_KEY to a distinct value."')
 
 # ── Error tracking (Sentry) ──────────────────────────────────────────
 # Optional — same "warn, don't crash at import" pattern as MYC_API_KEY/
-# GROQ_API_KEY above. Without SENTRY_DSN set, the service runs exactly
+# ANTHROPIC_API_KEY above. Without SENTRY_DSN set, the service runs exactly
 # as before this was added (sentry_sdk.init() is simply never called,
 # so every sentry_sdk.capture_exception() call below is a no-op).
 
@@ -202,8 +208,11 @@ class Job(Base):
     maritime_grade_after  = Column(String(20), nullable=True)
     improvement           = Column(Integer, nullable=True)
 
+    rewrite_quality       = Column(String(20), nullable=True)
+
     # Output paths — relative, not absolute (portable)
     output_docx           = Column(String(500), nullable=True)
+    output_pdf            = Column(String(500), nullable=True)
 
     # JSON fields
     issues_json           = Column(Text, nullable=True)
@@ -279,7 +288,7 @@ def update_job(db: Session, job_id: str, **kwargs):
 
 # ── In-memory observability counters ────────────────────────────────────
 # Score deltas and job counts live in the Job table already — these cover
-# what doesn't: per-stage durations and Groq retry/failure counts. Reset on
+# what doesn't: per-stage durations and Claude retry/failure counts. Reset on
 # process restart, and NOT shared across `--workers N` (each worker is a
 # separate process) — acceptable for a single-client, single-VPS deployment;
 # revisit only if that stops being true (see architecture doc trigger table).
@@ -287,21 +296,21 @@ def update_job(db: Session, job_id: str, **kwargs):
 class _Metrics:
     def __init__(self):
         self._lock = threading.Lock()
-        self.groq_calls          = 0
-        self.groq_retries_total  = 0
-        self.groq_failures       = 0
-        self.stage_durations     = defaultdict(list)   # stage label -> [seconds, ...]
+        self.claude_calls         = 0
+        self.claude_retries_total = 0
+        self.claude_failures      = 0
+        self.stage_durations      = defaultdict(list)   # stage label -> [seconds, ...]
 
     def record_stage(self, label: str, seconds: float):
         with self._lock:
             self.stage_durations[label].append(seconds)
 
-    def record_groq_attempt(self, retries: int, failed: bool):
+    def record_llm_attempt(self, retries: int, failed: bool):
         with self._lock:
-            self.groq_calls += 1
-            self.groq_retries_total += retries
+            self.claude_calls += 1
+            self.claude_retries_total += retries
             if failed:
-                self.groq_failures += 1
+                self.claude_failures += 1
 
 
 _metrics = _Metrics()
@@ -372,7 +381,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # be actively PROCESSING at once. A burst near the rate-limit ceiling,
 # or several different IPs submitting close together (each individually
 # well under 10/minute), could still queue an unbounded number of CPU/
-# memory-heavy jobs (spaCy NLP, PDF parsing, a live Groq HTTP call) onto
+# memory-heavy jobs (spaCy NLP, PDF parsing, a live Claude HTTP call) onto
 # BackgroundTasks' shared thread pool at the same time — real risk of
 # resource exhaustion on a single small VPS, which is the literal shape
 # of "don't want the system to crash if multiple people upload
@@ -404,7 +413,7 @@ def _try_acquire_job_slot(job_id: str, file_hash: str) -> bool:
     doubling, which is low-stakes for a single-shared-API-key client and
     already documented as an accepted tradeoff, this one directly
     undermines its own stated purpose — protecting one small VPS's
-    CPU/memory from a burst of concurrent spaCy/Groq-heavy jobs). Backing
+    CPU/memory from a burst of concurrent spaCy/Claude-heavy jobs). Backing
     the check with jobs.db instead of process memory makes the limit a
     property of the one database every worker process already shares.
 
@@ -505,12 +514,12 @@ def _check_duplicate(db: Session, file_hash: str) -> Optional[str]:
 
 def _build_fallback_experience_bullets(parsed: dict, rank: str) -> list:
     """
-    Real bug fixed: the Groq-outage fallback below used to hardcode
+    Real bug fixed: the LLM-outage fallback below used to hardcode
     'experience_bullets': [] unconditionally -- despite issues_fixed
     claiming "original content preserved" -- silently producing a
     completely EMPTY Sea Service Record / Work Experience section
-    whenever the AI rewrite fails for ANY reason (Groq outage, a real
-    account-level TPM rate limit, auth failure), not just a total,
+    whenever the AI rewrite fails for ANY reason (LLM outage, a real
+    account-level rate limit, auth failure), not just a total,
     obvious outage. Confirmed on a real candidate (Ashish Kumar) whose
     rewrite failed on a real, live 413 TPM rate-limit error: the
     generated resume had zero experience rows despite a real, correctly
@@ -702,6 +711,62 @@ def _extract_with_timeout(file_path: str, ext: str) -> dict:
         'is_ocr':            False,
     }
 
+def _rewrite_or_fallback(
+    parsed, all_issues, tailored_jd, rank, candidate_profile,
+    target_cruise_line, overlay, strict=False,
+):
+    rewritten = rewrite_resume(
+        parsed=parsed,
+        issues=all_issues,
+        job_description=tailored_jd,
+        rank=rank,
+        license_rank=candidate_profile.license_rank,
+        sea_months=candidate_profile.sea_months,
+        target_cruise_line=target_cruise_line if overlay else '',
+        strict=strict,
+        generic_mode=not overlay,
+    )
+    retries = rewritten.pop('_llm_retry_count', 0) if isinstance(rewritten, dict) else 0
+    failed = isinstance(rewritten, dict) and 'error' in rewritten
+    if failed:
+        log.warning(f'"rewrite_error":"{rewritten.get("error")}"')
+        rewritten = {
+            'summary': parsed.get('sections', {}).get('summary', ''),
+            'experience_bullets': _build_fallback_experience_bullets(parsed, rank),
+            'skills': parsed.get('skills', []),
+            'certifications': [],
+            'education': [],
+            'documents': {},
+            'languages': [],
+            'technical_expertise': [],
+            'issues_fixed': [AI_REWRITE_FALLBACK_ISSUE],
+            'rank': rank,
+        }
+    return rewritten, failed, retries
+
+
+AI_REWRITE_FALLBACK_ISSUE = 'AI rewrite unavailable — original content preserved'
+
+
+def _inject_identity(rewritten, candidate_profile, rank, maritime_before):
+    rewritten['name'] = candidate_profile.name
+    rewritten['contact'] = candidate_profile.contact.model_dump()
+    rewritten['rank'] = rank
+    rewritten['sea_months'] = (maritime_before or {}).get('sea_months')
+    rewritten['vessel_types'] = (maritime_before or {}).get('vessel_types', [])
+
+
+def _write_ats_outputs(rewritten, job_id, out_dir):
+    generate_docx(copy.deepcopy(rewritten), job_id=job_id)
+    default_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume.docx')
+    docx_path = os.path.join(out_dir, f'{job_id}_ats.docx')
+    if os.path.exists(default_path):
+        shutil.move(default_path, docx_path)
+    pdf_path = os.path.join(out_dir, f'{job_id}_ats.pdf')
+    generate_classic_pdf(rewritten, pdf_path)
+    return docx_path, pdf_path
+
+
 # ── Background pipeline ───────────────────────────────────────────────
 
 def run_pipeline(
@@ -711,6 +776,7 @@ def run_pipeline(
     job_description: str,
     target_rank: str,
     target_cruise_line: str = '',
+    career_track: str = '',
 ):
     """
     Full pipeline. Runs in BackgroundTasks thread.
@@ -769,90 +835,57 @@ def run_pipeline(
         parsed = parse_resume(extracted['raw_text'])
         parsed['raw_text'] = extracted['raw_text']   # needed for raw fallback in rewriter
 
-        # ── 3. Score (before) ─────────────────────────────────────────
+        # ── 3. Score (before) — Layer 1 always; Layer 2 if overlay on ─
         stage('Scoring original resume', 35)
-        ats_before      = score_resume(extracted, parsed, job_description)
-        maritime_before = maritime_score(extracted['raw_text'], parsed, pdf_path=file_path)
-
-        # Typed domain object — canonical candidate record for this job.
-        # Downstream stages (rewrite, generate) read from this rather than
-        # the loose parsed/maritime dicts at the scoring/rewriting boundary.
-        candidate_profile = build_candidate_profile(parsed, maritime_before)
-
-        # ── 4. AI Rewrite ─────────────────────────────────────────────
-        stage('Rewriting for ATS optimisation', 50)
-        rank       = target_rank or candidate_profile.rank_detected
-        # Scrubbed here (not just at log time) since this list is persisted
-        # to issues_json and returned via /ats/result — a PDF/DOCX read
-        # error occasionally embeds raw file content in str(e).
-        all_issues = [redact_pii(i) for i in ats_before['issues'] + maritime_before['issues']]
-
-        rewritten = rewrite_resume(
-            parsed=parsed,
-            issues=all_issues,
+        layers_before = score_layers(
+            extracted, parsed,
             job_description=job_description,
-            rank=rank,
-            license_rank=candidate_profile.license_rank,
-            sea_months=candidate_profile.sea_months,
+            career_track=career_track,
+            target_rank=target_rank,
             target_cruise_line=target_cruise_line,
+            pdf_path=file_path,
+            ext=ext,
+        )
+        ats_before = layers_before['generic']
+        maritime_before = layers_before['maritime']
+        overlay = layers_before['overlay']
+        tailored_jd = layers_before['job_description']
+
+        candidate_profile = build_candidate_profile(
+            parsed,
+            maritime_before if maritime_before is not None else maritime_stub_for_profile(parsed),
         )
 
-        groq_retry_count = rewritten.pop('_groq_retry_count', 0)
-        groq_failed      = 'error' in rewritten
-        _metrics.record_groq_attempt(retries=groq_retry_count, failed=groq_failed)
-        log.info(f'"job_id":"{job_id}","groq_retry_count":{groq_retry_count},"groq_failed":{str(groq_failed).lower()}')
+        # ── 4. AI Rewrite (Claude) ────────────────────────────────────
+        stage('Rewriting for ATS optimisation', 50)
+        rank = target_rank or candidate_profile.rank_detected
+        maritime_issues = maritime_before['issues'] if maritime_before else []
+        all_issues = [redact_pii(i) for i in ats_before['issues'] + maritime_issues]
 
-        # If rewrite failed, use safe fallback (don't crash)
-        if 'error' in rewritten:
-            log.warning(f'"job_id":"{job_id}","rewrite_error":"{rewritten["error"]}"')
-            rewritten = {
-                'summary':          parsed['sections'].get('summary', ''),
-                'experience_bullets': _build_fallback_experience_bullets(parsed, rank),
-                'skills':           parsed.get('skills', []),
-                'certifications':   [],
-                'education':        [],
-                'documents':        {},
-                'languages':        [],
-                'technical_expertise': [],
-                'issues_fixed':     [f'AI rewrite unavailable — original content preserved'],
-                'rank':             rank,
-            }
+        rewritten, rewrite_failed, llm_retries = _rewrite_or_fallback(
+            parsed, all_issues, tailored_jd, rank, candidate_profile,
+            target_cruise_line, overlay, strict=False,
+        )
+        _metrics.record_llm_attempt(retries=llm_retries, failed=rewrite_failed)
+        log.info(
+            f'"job_id":"{job_id}","llm_retry_count":{llm_retries},'
+            f'"llm_failed":{str(rewrite_failed).lower()},"overlay":{str(overlay).lower()}'
+        )
 
-        # Validate output quality
         quality_warnings = _validate_rewrite_output(rewritten, extracted['raw_text'])
         if quality_warnings:
             log.warning(f'"job_id":"{job_id}","quality_warnings":{json.dumps(quality_warnings)}')
 
-        # Inject contact/name back (rewriter doesn't carry these)
-        rewritten['name']         = candidate_profile.name
-        rewritten['contact']      = candidate_profile.contact.model_dump()
-        rewritten['rank']         = rank
-        rewritten['sea_months']   = maritime_before.get('sea_months')
-        rewritten['vessel_types'] = maritime_before.get('vessel_types', [])
+        _inject_identity(rewritten, candidate_profile, rank, maritime_before)
 
-        # ── 5. Generate DOCX ──────────────────────────────────────────
-        # Two variants from the same rewrite (no duplicate Groq call): the
-        # photo-free default below remains the file /ats/download/{job_id}
-        # serves — same filename/behavior as before this change, so the
-        # existing API contract is untouched. The photo-included variant
-        # (for direct human/recruiter-facing submission, per Priority 2)
-        # is generated alongside it into the same job folder but isn't
-        # wired to a public download route yet — that's a separate,
-        # flagged product decision (new endpoint naming, TTL/cleanup
-        # wiring, DB schema for a second file path), not silently added
-        # here. generate_docx() mutates its content dict in place
-        # (enforce_length_limits trims nested lists/dicts), so each call
-        # gets its own deep copy rather than sharing rewritten directly.
+        # ── 5. Generate DOCX + classic single-column PDF ──────────────
+        # /ats/download/{job_id} still serves the photo-free DOCX (existing
+        # contract). PDF is additive. Photo DOCX stays in the job folder
+        # without a public route (same product decision as before).
         stage('Generating ATS-clean DOCX', 65)
-        out_dir   = os.path.join(OUTPUT_DIR, job_id)
+        out_dir = os.path.join(OUTPUT_DIR, job_id)
         os.makedirs(out_dir, exist_ok=True)
-        docx_path = os.path.join(out_dir, f'{job_id}_ats.docx')
-
-        generate_docx(copy.deepcopy(rewritten), job_id=job_id)
-        # generate_docx saves to OUTPUT_DIR/{job_id}_ats_resume.docx — move to job folder
-        default_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume.docx')
-        if os.path.exists(default_path):
-            shutil.move(default_path, docx_path)
+        docx_path, pdf_path = _write_ats_outputs(rewritten, job_id, out_dir)
 
         photo_bytes = extract_photo(file_path) if ext == 'pdf' else None
         if photo_bytes:
@@ -864,25 +897,65 @@ def run_pipeline(
             if os.path.exists(photo_default_path):
                 shutil.move(photo_default_path, os.path.join(out_dir, f'{job_id}_ats_photo.docx'))
 
-        # ── 6. Re-score ───────────────────────────────────────────────
+        # ── 6. Re-score; retry once if generic ATS gained < 15 pts ────
         stage('Verifying improvement', 80)
         extracted2 = extract_text(docx_path, 'docx')
-        parsed2    = parse_resume(extracted2['raw_text'])
-        ats_after  = score_resume(extracted2, parsed2, job_description)
-        # No PDF to read for the regenerated DOCX — maritime_score() falls
-        # back to text-based sea-months extraction from parsed2's sections.
-        maritime_after = maritime_score(extracted2['raw_text'], parsed2)
-
+        parsed2 = parse_resume(extracted2['raw_text'])
+        layers_after = score_layers_after_rewrite(
+            rewritten, extracted2, parsed2,
+            job_description=tailored_jd,
+            career_track=career_track,
+            target_rank=rank,
+            target_cruise_line=target_cruise_line,
+            overlay=overlay,
+        )
+        ats_after = layers_after['generic']
+        maritime_after = layers_after['maritime']
         improvement = ats_after['total_score'] - ats_before['total_score']
+
+        if should_retry_rewrite(improvement, rewrite_failed):
+            stage('Retrying rewrite with stricter prompt', 72)
+            retry_rewritten, retry_failed, retry_retries = _rewrite_or_fallback(
+                parsed, all_issues, tailored_jd, rank, candidate_profile,
+                target_cruise_line, overlay, strict=True,
+            )
+            _metrics.record_llm_attempt(retries=retry_retries, failed=retry_failed)
+            if not retry_failed:
+                _inject_identity(retry_rewritten, candidate_profile, rank, maritime_before)
+                retry_docx, retry_pdf = _write_ats_outputs(retry_rewritten, job_id, out_dir)
+                extracted_r = extract_text(retry_docx, 'docx')
+                parsed_r = parse_resume(extracted_r['raw_text'])
+                layers_retry = score_layers_after_rewrite(
+                    retry_rewritten, extracted_r, parsed_r,
+                    job_description=tailored_jd,
+                    career_track=career_track,
+                    target_rank=rank,
+                    overlay=overlay,
+                )
+                retry_improvement = (
+                    layers_retry['generic']['total_score'] - ats_before['total_score']
+                )
+                if layers_retry['generic']['total_score'] > ats_after['total_score']:
+                    rewritten, docx_path, pdf_path = retry_rewritten, retry_docx, retry_pdf
+                    ats_after, maritime_after = layers_retry['generic'], layers_retry['maritime']
+                    improvement = retry_improvement
+                    extracted2, parsed2 = extracted_r, parsed_r
+
+        quality = rewrite_quality_from_improvement(improvement)
         log.info(
             f'"job_id":"{job_id}",'
             f'"score_before":{ats_before["total_score"]},'
             f'"score_after":{ats_after["total_score"]},'
-            f'"improvement":{improvement}'
+            f'"improvement":{improvement},'
+            f'"rewrite_quality":"{quality}"'
         )
 
         # ── 7. Save ───────────────────────────────────────────────────
         stage('Saving results', 95)
+        maritime_score_before = maritime_before['maritime_score'] if maritime_before else None
+        maritime_grade_before = maritime_before['maritime_grade'] if maritime_before else None
+        maritime_score_after = maritime_after['maritime_score'] if maritime_after else None
+        maritime_grade_after = maritime_after['maritime_grade'] if maritime_after else None
         update_job(
             db, job_id,
             status='done',
@@ -895,21 +968,23 @@ def run_pipeline(
             ats_grade_before=ats_before['grade'],
             ats_score_after=ats_after['total_score'],
             ats_grade_after=ats_after['grade'],
-            maritime_score_before=maritime_before['maritime_score'],
-            maritime_grade_before=maritime_before['maritime_grade'],
-            maritime_score_after=maritime_after['maritime_score'],
-            maritime_grade_after=maritime_after['maritime_grade'],
+            maritime_score_before=maritime_score_before,
+            maritime_grade_before=maritime_grade_before,
+            maritime_score_after=maritime_score_after,
+            maritime_grade_after=maritime_grade_after,
             improvement=improvement,
+            rewrite_quality=quality,
 
             output_docx=docx_path,
+            output_pdf=pdf_path,
 
             rank_detected=rank,
-            sea_months=maritime_before.get('sea_months'),
-            cert_coverage=maritime_before.get('cert_coverage'),
+            sea_months=(maritime_before or {}).get('sea_months'),
+            cert_coverage=(maritime_before or {}).get('cert_coverage'),
 
             issues_json=json.dumps(all_issues),
-            recommendations_json=json.dumps(maritime_before.get('recommendations', [])),
-            missing_certs_json=json.dumps(maritime_before.get('missing_certs', [])),
+            recommendations_json=json.dumps((maritime_before or {}).get('recommendations', [])),
+            missing_certs_json=json.dumps((maritime_before or {}).get('missing_certs', [])),
             issues_fixed_json=json.dumps(rewritten.get('issues_fixed', [])),
             keyword_data_json=json.dumps(ats_before.get('keyword_data', {})),
         )
@@ -1002,6 +1077,15 @@ async def submit(
             'list of recognized lines.'
         ),
     ),
+    career_track: str = Form(
+        default='',
+        description=(
+            'Optional. If absent and a maritime rank is detected, Layer 2 (maritime) still '
+            'runs so existing MYC uploads keep maritime scores. Pass "generic" to force '
+            'Layer 1 only. Pass a rank/track (e.g. chief_officer, eto) to run both layers '
+            'and tailor against that maritime JD template.'
+        ),
+    ),
 ):
     """
     Accepts PDF or DOCX resume. Returns job_id immediately.
@@ -1067,7 +1151,8 @@ async def submit(
     log.info(f'"job_id":"{job_id}","ext":"{ext}","size_kb":{len(contents)//1024}')
 
     background_tasks.add_task(
-        run_pipeline, job_id, tmp_path, ext, job_description, target_rank, target_cruise_line
+        run_pipeline, job_id, tmp_path, ext, job_description, target_rank,
+        target_cruise_line, career_track,
     )
 
     return {'job_id': job_id, 'status': 'queued'}
@@ -1075,7 +1160,7 @@ async def submit(
 
 @app.post(
     '/ats/score',
-    summary='Score a resume — ATS + maritime only, no AI rewrite, no Groq dependency',
+    summary='Score a resume — generic ATS always; maritime overlay when career_track/rank applies. No AI rewrite.',
     dependencies=[Depends(require_api_key)],
 )
 @limiter.limit('10/minute')
@@ -1083,12 +1168,15 @@ async def score(
     request: Request,
     file: UploadFile = File(..., description='PDF or DOCX resume'),
     job_description: str = Form(default='', description='Target job description (optional but improves keyword scoring)'),
+    target_rank: str = Form(default='', description='Override rank detection (optional)'),
+    target_cruise_line: str = Form(default='', description='Optional cruise line for overlay activation'),
+    career_track: str = Form(default='', description='Optional. generic = Layer 1 only; maritime rank/track = both layers'),
 ):
     """
     Runs Stages 1-4 only (extract -> parse -> ATS score -> maritime
     score) -- the same underlying functions run_pipeline() calls for its
     "before" scores, just invoked directly and returned synchronously.
-    No BackgroundTasks/job_id/polling: there's no Groq call to wait on,
+    No BackgroundTasks/job_id/polling: there's no LLM call to wait on,
     so this responds in the same request, typically in a couple of
     seconds. Does not persist a Job row or generate a DOCX -- this is a
     read-only scoring operation, not a submission.
@@ -1122,34 +1210,45 @@ async def score(
         parsed = parse_resume(extracted['raw_text'])
         parsed['raw_text'] = extracted['raw_text']
 
-        ats_result       = score_resume(extracted, parsed, job_description)
-        maritime_result  = maritime_score(extracted['raw_text'], parsed, pdf_path=tmp_path)
-        candidate_profile = build_candidate_profile(parsed, maritime_result)
+        layers = score_layers(
+            extracted, parsed,
+            job_description=job_description,
+            career_track=career_track,
+            target_rank=target_rank,
+            target_cruise_line=target_cruise_line,
+            pdf_path=tmp_path,
+            ext=ext,
+        )
+        ats_result = layers['generic']
+        maritime_result = layers['maritime']
+        candidate_profile = build_candidate_profile(
+            parsed,
+            maritime_result if maritime_result is not None else maritime_stub_for_profile(parsed),
+        )
 
-        # Same redaction discipline as run_pipeline's all_issues -- a
-        # PDF/DOCX read error occasionally embeds raw file content, and
-        # this response isn't exempt from the same privacy guarantee
-        # just because nothing gets persisted to the DB.
-        issues = [redact_pii(i) for i in ats_result['issues'] + maritime_result['issues']]
+        maritime_issues = maritime_result['issues'] if maritime_result else []
+        issues = [redact_pii(i) for i in ats_result['issues'] + maritime_issues]
 
         log.info(
             f'"endpoint":"/ats/score","ats_score":{ats_result["total_score"]},'
-            f'"maritime_score":{maritime_result["maritime_score"]}'
+            f'"maritime_score":{(maritime_result or {}).get("maritime_score")},'
+            f'"overlay":{str(layers["overlay"]).lower()}'
         )
 
         return {
             'name':            candidate_profile.name,
             'ats_score':       ats_result['total_score'],
             'ats_grade':       ats_result['grade'],
-            'maritime_score':  maritime_result['maritime_score'],
-            'maritime_grade':  maritime_result['maritime_grade'],
+            'maritime_score':  (maritime_result or {}).get('maritime_score'),
+            'maritime_grade':  (maritime_result or {}).get('maritime_grade'),
+            'overlay_active':  layers['overlay'],
             'rank_detected':   candidate_profile.rank_detected,
             'sea_months':      candidate_profile.sea_months,
-            'cert_coverage':   maritime_result.get('cert_coverage'),
-            'vessel_types':    maritime_result.get('vessel_types', []),
+            'cert_coverage':   (maritime_result or {}).get('cert_coverage'),
+            'vessel_types':    (maritime_result or {}).get('vessel_types', []),
             'issues':          issues,
-            'recommendations': maritime_result.get('recommendations', []),
-            'missing_certs':   maritime_result.get('missing_certs', []),
+            'recommendations': (maritime_result or {}).get('recommendations', []),
+            'missing_certs':   (maritime_result or {}).get('missing_certs', []),
             'keyword_data':    ats_result.get('keyword_data', {}),
         }
     except HTTPException:
@@ -1223,8 +1322,16 @@ def result(job_id: str):
         except Exception:
             return []
 
+    issues_fixed = _load(job.issues_fixed_json)
+    ai_rewrite = AI_REWRITE_FALLBACK_ISSUE not in issues_fixed
     return {
         'job_id':               job.job_id,
+        'ai_rewrite':           ai_rewrite,
+        'note': (
+            None if ai_rewrite else
+            'Anthropic rewrite was unavailable (missing/invalid API key or provider error); '
+            'original resume content was preserved.'
+        ),
 
         # Scores
         'score_before':         job.ats_score_before,
@@ -1232,6 +1339,7 @@ def result(job_id: str):
         'score_after':          job.ats_score_after,
         'grade_after':          job.ats_grade_after,
         'improvement':          job.improvement,
+        'rewrite_quality':      job.rewrite_quality,
         'maritime_score_before': job.maritime_score_before,
         'maritime_grade_before': job.maritime_grade_before,
         'maritime_score_after':  job.maritime_score_after,
@@ -1249,11 +1357,12 @@ def result(job_id: str):
         'issues':               _load(job.issues_json),
         'recommendations':      _load(job.recommendations_json),
         'missing_certs':        _load(job.missing_certs_json),
-        'issues_fixed':         _load(job.issues_fixed_json),
+        'issues_fixed':         issues_fixed,
         'keyword_data':         _load(job.keyword_data_json),
 
-        # Download
+        # Download — DOCX remains the existing contract; PDF is additive
         'download_url':         f'/ats/download/{job_id}',
+        'download_url_pdf':     f'/ats/download/{job_id}?format=pdf',
         'completed_at':         job.completed_at.isoformat() if job.completed_at else None,
         'expires_at':           job.expires_at.isoformat()   if job.expires_at   else None,
     }
@@ -1264,8 +1373,8 @@ def result(job_id: str):
     summary='Download the optimised DOCX resume',
     dependencies=[Depends(require_api_key)],
 )
-def download(job_id: str):
-    """Returns the ATS-optimised DOCX as a file download."""
+def download(job_id: str, format: str = 'docx'):
+    """Returns the ATS-optimised DOCX by default. Pass format=pdf for the classic single-column PDF."""
     db  = get_db()
     job = db.get(Job, job_id)
     db.close()
@@ -1274,12 +1383,24 @@ def download(job_id: str):
         raise HTTPException(404, 'Job not found')
     if job.status != 'done':
         raise HTTPException(400, f'Job not complete — status: {job.status}')
-    if not job.output_docx or not os.path.exists(job.output_docx):
-        raise HTTPException(410, 'Output file expired or not found')
 
-    # Check TTL
     if job.expires_at and datetime.utcnow() > job.expires_at:
         raise HTTPException(410, 'Result has expired — please resubmit')
+
+    want_pdf = (format or 'docx').lower() == 'pdf'
+    if want_pdf:
+        path = job.output_pdf
+        if not path or not os.path.exists(path):
+            raise HTTPException(410, 'PDF output expired or not found')
+        return FileResponse(
+            path=path,
+            media_type='application/pdf',
+            filename=f'MYC_ATS_Resume_{job_id[:8]}.pdf',
+            headers={'Content-Disposition': f'attachment; filename="MYC_ATS_Resume_{job_id[:8]}.pdf"'},
+        )
+
+    if not job.output_docx or not os.path.exists(job.output_docx):
+        raise HTTPException(410, 'Output file expired or not found')
 
     return FileResponse(
         path=job.output_docx,
@@ -1353,13 +1474,13 @@ def cleanup():
 
 @app.get(
     '/ats/admin/metrics',
-    summary='Aggregate pipeline metrics — jobs, score deltas, Groq health, stage durations',
+    summary='Aggregate pipeline metrics — jobs, score deltas, Claude health, stage durations',
     dependencies=[Depends(require_admin_key)],
 )
 def admin_metrics():
     """
     Jobs-processed and score-delta stats come from the Job table (durable).
-    Groq retry/failure counts and stage durations come from in-memory
+    Claude retry/failure counts and stage durations come from in-memory
     counters (reset on restart, per-worker-process — see note in response).
     """
     db = get_db()
@@ -1385,9 +1506,9 @@ def admin_metrics():
         if j.maritime_score_after is not None and j.maritime_score_before is not None
     ]
 
-    groq_calls = _metrics.groq_calls
-    groq_failure_rate = (
-        round(_metrics.groq_failures / groq_calls, 4) if groq_calls else None
+    claude_calls = _metrics.claude_calls
+    claude_failure_rate = (
+        round(_metrics.claude_failures / claude_calls, 4) if claude_calls else None
     )
     avg_stage_durations = {
         label: round(sum(durations) / len(durations), 2)
@@ -1400,13 +1521,13 @@ def admin_metrics():
         'jobs_failed':              failed_jobs,
         'avg_ats_score_delta':      _avg(ats_deltas),
         'avg_maritime_score_delta': _avg(maritime_deltas),
-        'groq_calls':               groq_calls,
-        'groq_retries_total':       _metrics.groq_retries_total,
-        'groq_failures_total':      _metrics.groq_failures,
-        'groq_failure_rate':        groq_failure_rate,
+        'claude_calls':             claude_calls,
+        'claude_retries_total':     _metrics.claude_retries_total,
+        'claude_failures_total':    _metrics.claude_failures,
+        'claude_failure_rate':      claude_failure_rate,
         'avg_stage_durations_seconds': avg_stage_durations,
         'note': (
-            'groq_* and stage-duration figures are in-memory counters for '
+            'claude_* and stage-duration figures are in-memory counters for '
             'this worker process only — they reset on restart and are not '
             'aggregated across `--workers N`. jobs_*/score-delta figures '
             'come from the Job table and are accurate process-wide.'
@@ -1441,23 +1562,25 @@ def health():
 
 @app.get('/health/deep', summary='Deep health check', dependencies=[Depends(require_api_key)])
 def health_deep():
-    """Checks Groq connectivity and disk. Use for monitoring alerts."""
+    """Checks Claude connectivity and disk. Use for monitoring alerts."""
     checks = {}
 
-    # Groq connectivity
     try:
-        from groq import Groq
-        from config import GROQ_API_KEY, GROQ_MODEL
-        client = Groq(api_key=GROQ_API_KEY)
-        client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{'role': 'user', 'content': 'ping'}],
-            max_tokens=1,
-            timeout=5,
+        import anthropic
+        import httpx
+        from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+        ping = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+            http_client=httpx.Client(trust_env=False, timeout=5.0),
         )
-        checks['groq'] = 'ok'
+        ping.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1,
+            messages=[{'role': 'user', 'content': 'ping'}],
+        )
+        checks['claude'] = 'ok'
     except Exception as e:
-        checks['groq'] = f'error: {str(e)[:50]}'
+        checks['claude'] = f'error: {str(e)[:50]}'
 
     # DB
     try:

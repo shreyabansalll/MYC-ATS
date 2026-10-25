@@ -4,76 +4,63 @@ import httpx
 import re
 import time
 import logging
-from groq import Groq, APIConnectionError, APITimeoutError, RateLimitError, APIStatusError
-from config import GROQ_API_KEY, GROQ_MODEL
+from types import SimpleNamespace
+
+import anthropic
+from anthropic import (
+    APIConnectionError, APITimeoutError, APIStatusError,
+    AuthenticationError, RateLimitError, InternalServerError,
+)
+from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from generic_ats.prompts import (
+    CRITICAL_TRUTHFULNESS_RULES, GENERIC_IMPROVE_PROMPT, STRICT_RETRY_ADDENDUM,
+)
+from generic_ats.keywords import extract_job_keywords
+from generic_ats.writing_quality import post_process_rewrite_result, sanitize_prompt_input
 from rules.cruise_line_keywords import (
     CRUISE_LINE_KEYWORDS, UNIVERSAL_CRUISE_KEYWORDS, resolve_cruise_line,
 )
 
 log = logging.getLogger(__name__)
 
-if not GROQ_API_KEY:
-    # Same "warn, don't crash at import" pattern api.py uses for
-    # MYC_API_KEY — every rewrite_resume() call will fail at the Groq
-    # call (caught and handled via the existing AI-rewrite-unavailable
-    # fallback), but this makes a missing key visible at startup in the
-    # logs rather than only showing up as job-level Groq failures.
-    log.warning('"GROQ_API_KEY not set — AI rewrite will fail for every job"')
+if not ANTHROPIC_API_KEY:
+    log.warning('"ANTHROPIC_API_KEY not set — AI rewrite will fail for every job"')
 
-def _build_groq_client():
+def _build_claude_client():
     """
-    Create a Groq client without crashing when ambient proxy config or API
-    setup is problematic.
+    Create an Anthropic client without crashing when ambient proxy config
+    or API setup is problematic.
 
     Always constructs with an explicit httpx.Client(trust_env=False), so
-    HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (of any scheme) never affect this
-    client. This is a single-VPS deployment with no documented need to
-    route Groq's API calls through a proxy.
+    HTTP_PROXY/HTTPS_PROXY/ALL_PROXY never affect this client.
     """
-    if not GROQ_API_KEY:
+    if not ANTHROPIC_API_KEY:
         return None
 
     try:
-        return Groq(api_key=GROQ_API_KEY, http_client=httpx.Client(trust_env=False))
+        return anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+            http_client=httpx.Client(trust_env=False),
+        )
     except Exception as e:
-        log.error('Failed to construct Groq client: %s', e, exc_info=True)
-        return None
-
-    try:
-        return Groq(api_key=GROQ_API_KEY)
-    except Exception as e:
-        log.error('Failed to construct Groq client: %s', e, exc_info=True)
+        log.error('Failed to construct Claude client: %s', e, exc_info=True)
         return None
 
 
-client = _build_groq_client()
+client = _build_claude_client()
 
-# Transient failures worth retrying — timeouts, connection drops, rate limits.
-# Non-transient errors (auth, bad request, etc.) propagate immediately since
-# retrying them would just waste time before failing the same way.
-GROQ_TRANSIENT_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError)
-GROQ_RETRY_BACKOFF_SECONDS = (1, 2, 4)
+LLM_TRANSIENT_ERRORS = (
+    APIConnectionError, APITimeoutError, RateLimitError, InternalServerError,
+)
+LLM_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
 
-def _is_tpm_rate_limit_error(e: Exception) -> bool:
-    """
-    Real gap confirmed by direct testing against this account's actual
-    Groq tier: a tokens-per-minute cap breach comes back as HTTP 413 with
-    body {"error": {"code": "rate_limit_exceeded", ...}} — NOT as
-    groq.RateLimitError (that class is reserved for HTTP 429). Confirmed
-    via isinstance() on a real raised exception: type is plain
-    groq.APIStatusError, so it silently bypassed GROQ_TRANSIENT_ERRORS
-    entirely and would have failed every job non-transiently the moment
-    this (low, 8000 TPM, on-demand tier) limit was hit — even though
-    waiting out the rolling one-minute window and retrying would likely
-    succeed. Checked by status_code + the response body's specific error
-    code, not by status_code alone, since 413 could in principle mean a
-    genuinely oversized/malformed request that retrying wouldn't fix.
-    """
-    if not isinstance(e, APIStatusError) or e.status_code != 413:
+def _is_retryable_status(e: Exception) -> bool:
+    if isinstance(e, AuthenticationError):
         return False
-    body = getattr(e, 'body', None) or {}
-    return isinstance(body, dict) and body.get('error', {}).get('code') == 'rate_limit_exceeded'
+    if not isinstance(e, APIStatusError):
+        return False
+    return e.status_code in (408, 409, 429, 500, 502, 503, 529)
 
 # Permanent by design, not a stopgap — seafarers submit one resume to many
 # manning agencies/vessels rather than tailoring per posting, so there is no
@@ -151,7 +138,7 @@ REQUIRED_REWRITE_KEYS = {
     'certifications', 'education', 'documents', 'languages',
 }
 
-# Field-name drift seen twice now in real Groq responses despite the
+# Field-name drift seen in real LLM responses despite the
 # prompt's explicit schema: the model renames a required key to a
 # synonym/camelCase variant instead of using the schema's exact name.
 # Keyed by the drifted name actually observed, mapped to the real key.
@@ -164,7 +151,7 @@ _REWRITE_KEY_ALIASES = {
 # for the job title (ambiguous with the candidate's own top-level rank),
 # 'responsibilities' instead of 'bullets', and separate startDate/endDate
 # instead of a single 'dates' string. 'job_title'/'key_responsibilities'
-# confirmed on real GROQ_MODEL (qwen/qwen3.6-27b) output.
+# confirmed on real LLM model output.
 _EXPERIENCE_ENTRY_KEY_ALIASES = {
     'rank':               'role',
     'job_title':          'role',
@@ -172,9 +159,9 @@ _EXPERIENCE_ENTRY_KEY_ALIASES = {
     'key_responsibilities': 'bullets',
 }
 
-# Real drift confirmed switching GROQ_MODEL to qwen/qwen3.6-27b: unlike
-# the prior model's occasional single-key wrapper drift, qwen routinely
-# invents its own entirely different top-level key names for the SAME
+# Real drift observed with various models: unlike
+# occasional single-key wrapper drift, models can routinely
+# invent their own entirely different top-level key names for the SAME
 # required field -- and not even a stable one call to call ("skills" has
 # come back as "core_competencies", "technical_skills", AND
 # "technical_skills_and_competencies" across otherwise-identical real
@@ -200,11 +187,10 @@ _FUZZY_TOP_LEVEL_KEY_PATTERNS = [
 # finish_reason confirms it wasn't cut off mid-generation, default them
 # instead of failing the whole rewrite over two cosmetic sections.
 #
-# 'education' joined this set switching GROQ_MODEL to qwen/qwen3.6-27b:
-# confirmed on real, repeated calls (3/3 retry attempts for the same
-# candidate, all finish_reason == 'stop', i.e. NOT truncated) that this
-# model simply omits "education" from its own JSON far more often than
-# the prior model did -- treating that omission as a truncation signal
+# 'education' joined this set when testing varying model outputs:
+# confirmed on real, repeated calls (retry attempts for the same
+# candidate, with finish_reason == 'stop', i.e. NOT truncated) that some
+# models simply omit "education" from their JSON -- treating that omission as a truncation signal
 # (education's original, deliberate design) now means real jobs exhaust
 # every retry and fall back to "AI rewrite unavailable" over a single
 # missing but genuinely non-critical field. generate_docx() already
@@ -388,7 +374,7 @@ def _normalize_experience_entry(entry):
 
     if 'dates' not in entry and ('startDate' in entry or 'endDate' in entry):
         entry['dates'] = f"{entry.get('startDate', '')} - {entry.get('endDate', '')}".strip(' -')
-    # snake_case variant confirmed on real qwen/qwen3.6-27b output -- a
+    # snake_case variant confirmed in a legacy model response -- a
     # bare 'start_date' with no end date/'Present' marker at all in some
     # responses (an ongoing role), not just a differently-cased key name.
     if 'dates' not in entry and ('start_date' in entry or 'end_date' in entry):
@@ -422,7 +408,7 @@ def _normalize_experience_entry(entry):
             grt_part = f' (GRT {vessel_grt})' if vessel_grt else ''
             bullets.insert(0, f'Served aboard {vessel_name}{grt_part}.')
 
-    # Plural variant confirmed on real qwen/qwen3.6-27b output: a
+    # Plural variant confirmed in a legacy model response: a
     # separate list of vessel names, with NONE of them actually
     # mentioned anywhere in "key_responsibilities"/"bullets" -- real,
     # confirmed content loss otherwise, since Rule 2 (VESSEL DETAILS
@@ -458,10 +444,10 @@ def _fuzzy_match_top_level_keys(result: dict) -> dict:
     _FUZZY_TOP_LEVEL_KEY_PATTERNS, when the real required key is still
     absent. Runs before the wrapper-unwrap/exact-alias steps.
 
-    Confirmed necessary switching GROQ_MODEL to qwen/qwen3.6-27b: unlike
-    the prior model's drift (an exact, stable set of alternate names,
-    which _REWRITE_KEY_ALIASES already covers), qwen's alternate names
-    for the SAME field vary call to call ("skills" observed as
+    Confirmed necessary when handling real-world LLM variations: unlike
+    an exact, stable set of alternate names
+    (which _REWRITE_KEY_ALIASES covers), models' alternate names
+    for the SAME field can vary call to call ("skills" observed as
     "core_competencies", "technical_skills", and
     "technical_skills_and_competencies" across otherwise-identical real
     requests for different candidates) -- no fixed alias table can track
@@ -553,7 +539,7 @@ def _normalize_rewrite_result(result, finish_reason) -> dict:
         # the first downstream .get() call on it -- confirmed as a real,
         # not just theoretical, risk: enforce_minimum_quality's
         # has_real_exp check crashed with exactly "'str' object has no
-        # attribute 'get'" on real GROQ_MODEL (qwen/qwen3.6-27b) output
+        # attribute 'get'" on unnormalized LLM output
         # before that specific check was guarded. Converts a bare string
         # into a minimal real entry (empty role/company/dates, the
         # string itself as its one bullet) rather than dropping it --
@@ -599,7 +585,7 @@ def _normalize_rewrite_result(result, finish_reason) -> dict:
 # Documents that have a dedicated slot in the "documents" dict (Rule 6).
 # A cert-like line mentioning one of these unambiguously belongs there,
 # not in "certifications" -- confirmed as a real, visible quality
-# problem on rendered output: Groq regularly returns passport/CDC/INDOS
+# problem on rendered output: LLMs regularly return passport/CDC/INDOS
 # as {"type": ..., "number": ...} entries inside "certifications" (see
 # _stringify_cert) despite Rule 4 explicitly saying not to, and a
 # recruiter scanning "Certifications" for STCW/GMDSS-type items sees
@@ -894,10 +880,8 @@ def enforce_education_completeness(result: dict, parsed: dict) -> dict:
     Same deterministic restore-don't-invent safety net as
     enforce_cert_completeness/enforce_language_completeness, applied to
     "education" -- see _DEFAULTABLE_REWRITE_KEYS's comment for why
-    "education" needed this after switching GROQ_MODEL to
-    qwen/qwen3.6-27b (confirmed on real output: the model omits this
-    field far more often than the prior model did, not because of
-    truncation).
+    "education" needed this (confirmed on real output: some models omit this
+    field even when not truncated).
     """
     education_section = parsed.get('sections', {}).get('education', '') if isinstance(parsed, dict) else ''
     if not education_section or not education_section.strip():
@@ -932,8 +916,7 @@ def enforce_language_completeness(result: dict, parsed: dict) -> dict:
     """
     Same deterministic restore-don't-invent safety net as
     enforce_cert_completeness, applied to "languages" -- confirmed
-    necessary switching GROQ_MODEL to qwen/qwen3.6-27b: real qwen
-    responses routinely omit "languages" from the JSON entirely (not
+    necessary as some LLM responses omit "languages" from the JSON entirely (not
     malformed, just never produced for candidates whose source resume
     DOES list languages), which _DEFAULTABLE_REWRITE_KEYS silently covers
     with an empty list -- correct for a genuinely languages-less resume,
@@ -1117,7 +1100,7 @@ def _normalize_rank(rank) -> str:
 
 def sanitise_section(text: str, max_chars: int = 800) -> str:
     """
-    Cleans garbled column-extracted text before sending to Groq.
+    Cleans garbled column-extracted text before sending to Claude.
     Removes certificate table cell dumps (Pass/Fail/date rows),
     short orphan lines from two-column PDF splitting.
 
@@ -1164,7 +1147,7 @@ def sanitise_section(text: str, max_chars: int = 800) -> str:
 
 def build_rewrite_prompt(parsed: dict, issues: list, job_description: str,
                          rank: str = '', license_rank: str = '', sea_months: int = 0,
-                         target_cruise_line: str = '') -> str:
+                         target_cruise_line: str = '', strict: bool = False) -> str:
 
     rank = _normalize_rank(rank)
 
@@ -1228,10 +1211,9 @@ real experience genuinely supports the phrasing):
     # 1500 chars was confirmed too tight for a real multi-role service
     # record (4-5 roles with vessel names/GRT/dates easily exceeds it),
     # silently dropping older roles' vessel-specific details before the
-    # LLM ever saw them. llama-3.3-70b-versatile's real context window
-    # (128k tokens on Groq) has enormous headroom above this; raised to
-    # give real seafarer service records room without materially
-    # affecting prompt size for the common case.
+    # LLM ever saw them. Claude's large context window (200k tokens)
+    # has enormous headroom above this; raised to give real seafarer
+    # service records room without materially affecting latency.
     experience_clean = sanitise_section(sections.get('experience', ''), 4000)
     summary_clean    = sanitise_section(sections.get('summary', ''))
 
@@ -1281,6 +1263,8 @@ ATS ISSUES TO FIX:
 TARGET JOB DESCRIPTION:
 {job_description}
 {cruise_line_block}
+{CRITICAL_TRUTHFULNESS_RULES}
+{STRICT_RETRY_ADDENDUM if strict else ''}
 REWRITING RULES — FOLLOW EXACTLY:
 0. GROUNDING — applies to every sentence in the Summary and every bullet
    in Experience: each one must be traceable to a specific fact already
@@ -1507,8 +1491,8 @@ RETURN ONLY this JSON — start with {{ end with }} — no other text:
     return prompt
 
 
-def enforce_minimum_quality(result: dict, rank: str) -> dict:
-    """Safety net: patches Groq output that didn't follow minimum quality rules."""
+def enforce_minimum_quality(result: dict, rank: str, generic_mode: bool = False) -> dict:
+    """Safety net: patches LLM output that didn't follow minimum quality rules."""
     if not isinstance(rank, str):
         rank = ''
     result_rank = result.get('rank', '')
@@ -1541,7 +1525,7 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
             deduped_skills.append(skill)
     skills = deduped_skills
     result['skills'] = skills
-    if len(skills) < 15:
+    if not generic_mode and len(skills) < 15:
         min_skills = MIN_SKILLS_BY_RANK.get(rank_lower, [])
         existing_lower = {s.lower() for s in skills}
         for skill in min_skills:
@@ -1552,7 +1536,7 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
     # Rule 1: Summary minimum 3 sentences
     summary = result.get('summary', '')
     sentences = split_into_sentences(summary)
-    if len(sentences) < 3:
+    if not generic_mode and len(sentences) < 3:
         rank_title = RANK_TITLES.get(rank_lower, rank.title()) if rank else 'Seafarer'
         rank_key   = RANK_TO_JD.get(rank_lower, 'deck_officer')
         fallbacks = {
@@ -1626,23 +1610,19 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
         result['certifications'] = fixed_certs
 
     # Rule 2: Experience fallback — ONLY if experience_bullets is truly empty
-    # Do NOT fire if Groq returned entries with empty fields (Abhijit case)
+    # Do NOT fire if the LLM returned entries with empty fields (Abhijit case)
     exp = result.get('experience_bullets', [])
     # Check if any entry has real company/dates (not fallback placeholders).
-    # Real crash fixed, confirmed on real GROQ_MODEL (qwen/qwen3.6-27b)
-    # output ("'str' object has no attribute 'get'"): unlike the similar
-    # isinstance(e, dict) guard below (added for the Mrinal Thapa
-    # role-backfill fix), this check had no guard against an
+    # Real crash fixed: the has_real_exp check had no guard against an
     # experience_bullets entry that arrived as a plain string instead of
-    # a dict -- a real shape qwen's greater schema instability makes far
-    # more likely to actually occur than it was with the prior model.
+    # a dict. Guard against non-dict entries.
     has_real_exp = any(
         isinstance(e, dict)
         and e.get('company', '') not in ('', 'See service record', 'Manning Agency')
         and e.get('dates', '') not in ('', 'See service record')
         for e in exp
     )
-    if not exp or not has_real_exp:
+    if not generic_mode and (not exp or not has_real_exp):
         # Only fire if truly no content — Abhijit has real source, so don't overwrite
         # with generic. Instead, leave empty and let scorer flag it for manual review.
         # Only use generic fallback if experience was genuinely empty in source
@@ -1683,86 +1663,100 @@ def enforce_minimum_quality(result: dict, rank: str) -> dict:
     # almost always their most recent/current role.
     for e in exp:
         if isinstance(e, dict) and not str(e.get('role', '')).strip():
-            e['role'] = RANK_TITLES.get(rank_lower, rank.title()) if rank else 'Seafarer'
+            e['role'] = RANK_TITLES.get(rank_lower, rank.title()) if rank else ('Professional' if generic_mode else 'Seafarer')
 
     return result
 
 
-def _call_groq_with_retry(prompt: str):
-    """
-    Calls the Groq chat completion endpoint, retrying transient failures
-    (timeouts, rate limits, connection errors) with exponential backoff
-    (1s / 2s / 4s). Exhausts all retries before propagating the last error.
+def _claude_text(response) -> str:
+    parts = []
+    for block in getattr(response, 'content', None) or []:
+        text = getattr(block, 'text', None)
+        if text:
+            parts.append(text)
+    return ''.join(parts)
 
-    Returns (response, retries_used) — retries_used is 0 on a first-try
-    success, so callers can track Groq retry counts per job.
+
+def _as_openai_shaped_response(response):
+    """Keep rewrite_resume's finish_reason / usage reads on a stable shape."""
+    text = _claude_text(response)
+    stop = getattr(response, 'stop_reason', None)
+    finish = 'length' if stop == 'max_tokens' else stop
+    usage = getattr(response, 'usage', None)
+    prompt_tokens = getattr(usage, 'input_tokens', None) if usage else None
+    completion_tokens = getattr(usage, 'output_tokens', None) if usage else None
+    total = None
+    if prompt_tokens is not None or completion_tokens is not None:
+        total = (prompt_tokens or 0) + (completion_tokens or 0)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=text),
+            finish_reason=finish,
+        )],
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total,
+        ),
+    )
+
+
+def build_generic_rewrite_prompt(parsed: dict, issues: list, job_description: str,
+                                 strict: bool = False) -> str:
+    from generic_ats.keywords import GENERIC_PROFESSIONAL_JD
+    jd = sanitize_prompt_input((job_description or '').strip() or GENERIC_PROFESSIONAL_JD.strip())
+    kw = extract_job_keywords(jd)
+    raw = parsed.get('raw_text') or ''
+    if not raw:
+        sections = parsed.get('sections') or {}
+        raw = '\n'.join(f'{k}: {v}' for k, v in sections.items() if v)
+    return GENERIC_IMPROVE_PROMPT.format(
+        truthfulness=CRITICAL_TRUTHFULNESS_RULES,
+        strict_block=STRICT_RETRY_ADDENDUM if strict else '',
+        job_description=jd,
+        job_keywords=', '.join(kw.get('keywords') or []),
+        original_resume=sanitise_section(raw, 4000),
+    )
+
+
+def _call_claude_with_retry(prompt: str, *, generic_mode: bool = False):
+    """
+    Calls Claude Messages API, retrying transient failures (timeouts,
+    rate limits, connection errors) with exponential backoff (1s / 2s / 4s).
+
+    Returns (openai-shaped response, retries_used).
     """
     if client is None:
-        raise RuntimeError('GROQ client unavailable')
+        raise RuntimeError('Claude client unavailable')
+
+    system = (
+        'You ALWAYS respond with valid JSON only. '
+        'No markdown. No explanation. No text before or after the JSON. '
+        'Copy names, companies, dates, vessel names, GRT, and document numbers '
+        'EXACTLY as given in the source — never approximate or invent them. '
+        'Never invent qualifications, sea service, or certificates. '
+        'Your response must start with { and end with }.'
+    )
+    if not generic_mode:
+        system = 'You are a maritime resume writer. ' + system
 
     last_exc = None
-    for retries_used, delay in enumerate((0,) + GROQ_RETRY_BACKOFF_SECONDS):
+    for retries_used, delay in enumerate((0,) + LLM_RETRY_BACKOFF_SECONDS):
         if delay:
             time.sleep(delay)
         try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        'role': 'system',
-                        'content': (
-                            'You are a maritime resume writer. '
-                            'You ALWAYS respond with valid JSON only. '
-                            'No markdown. No explanation. No text before or after the JSON. '
-                            'Copy vessel names, GRT, companies, dates, and document numbers '
-                            'EXACTLY as given in the source — never approximate or invent them. '
-                            'Your response must start with { and end with }.'
-                        ),
-                    },
-                    {'role': 'user', 'content': prompt},
-                ],
+            raw_response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=8192,
                 temperature=0.3,
-                # 3000 was tight for a full JSON payload covering up to 6
-                # experience entries (3 bullets each), 18 skills, 8
-                # certifications, education, documents, and languages —
-                # a response cut off mid-generation can still parse as
-                # valid JSON if the truncation point happens to land on
-                # an earlier closing brace, silently dropping every field
-                # after it (see the required-keys check below, which
-                # catches this instead of relying on max_tokens alone).
-                # Tuned against this account's real, confirmed 8000 TPM
-                # cap, not raised freely: reasoning_tokens compete with
-                # the actual JSON for the same completion_tokens budget
-                # under GROQ_MODEL's current reasoning model (confirmed on
-                # real calls: 3500-4200 reasoning tokens out of a typical
-                # response), so max_tokens has to leave room for BOTH.
-                # 5500 is a real, tested compromise, not a guess: a small
-                # single-role resume's prompt (~450-500 tokens in testing)
-                # fits comfortably (5500 + 500 ≈ 6000, under 8000), but a
-                # busier real resume's prompt alone (confirmed on a real
-                # 6-role, 25-skill candidate: ~4900 tokens) already leaves
-                # no headroom under 8000 no matter what max_tokens is set
-                # to -- that candidate's rewrite call will keep failing on
-                # this billing tier regardless of this number, which is
-                # exactly why the TPM-retry (see _is_tpm_rate_limit_error)
-                # and the non-empty Groq-outage fallback (see
-                # _build_fallback_experience_bullets in api.py) both exist
-                # as the real safety net for that case, not a max_tokens
-                # value alone.
-                max_tokens=5500,
-                # Confirmed via direct testing: this stops the model's
-                # reasoning trace from being interleaved into .content as
-                # literal <think>...</think> text (reasoning still happens
-                # and is still billed, just tracked separately, the same
-                # way it already was for other reasoning models) — removes
-                # the need for any separate think-tag-stripping step here.
-                response_format={'type': 'json_object'},
+                system=system,
+                messages=[{'role': 'user', 'content': prompt}],
             )
-            return response, retries_used
-        except GROQ_TRANSIENT_ERRORS as e:
+            return _as_openai_shaped_response(raw_response), retries_used
+        except LLM_TRANSIENT_ERRORS as e:
             last_exc = e
         except APIStatusError as e:
-            if not _is_tpm_rate_limit_error(e):
+            if not _is_retryable_status(e):
                 raise
             last_exc = e
     raise last_exc
@@ -1770,39 +1764,41 @@ def _call_groq_with_retry(prompt: str):
 
 def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                    rank: str = '', license_rank: str = '', sea_months: int = 0,
-                   target_cruise_line: str = '') -> dict:
+                   target_cruise_line: str = '', strict: bool = False,
+                   generic_mode: bool = False) -> dict:
 
-    rank   = _normalize_rank(rank)
-    prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank, sea_months,
-                                   target_cruise_line)
+    rank = _normalize_rank(rank)
+    if generic_mode:
+        prompt = build_generic_rewrite_prompt(parsed, issues, job_description, strict=strict)
+    else:
+        prompt = build_rewrite_prompt(
+            parsed, issues, job_description, rank, license_rank, sea_months,
+            target_cruise_line, strict=strict,
+        )
 
-    # Trim experience section if prompt is too long for Groq context.
-    # 6000 chars (~1500 tokens) was confirmed drastically over-cautious
-    # for llama-3.3-70b-versatile's real 128k-token context on Groq —
-    # raised so this almost never triggers for a real resume. When it
-    # still does (a genuinely extreme source), truncate with
-    # sanitise_section's boundary-safe cut (whole lines, not mid-word)
-    # instead of a raw [:1000] character slice, which could cut off an
-    # entire role's vessel/GRT/date details mid-entry.
     if len(prompt) > 20000:
         sections = parsed.get('sections', {})
         sections = {**sections, 'experience': sanitise_section(sections.get('experience', ''), 2500)}
         parsed = {**parsed, 'sections': sections}
-        prompt = build_rewrite_prompt(parsed, issues, job_description, rank, license_rank, sea_months,
-                                       target_cruise_line)
+        if generic_mode:
+            prompt = build_generic_rewrite_prompt(parsed, issues, job_description, strict=strict)
+        else:
+            prompt = build_rewrite_prompt(
+                parsed, issues, job_description, rank, license_rank, sea_months,
+                target_cruise_line, strict=strict,
+            )
 
     raw_text      = ''
     total_retries = 0
     for attempt in range(3):
         try:
-            response, retries_used = _call_groq_with_retry(prompt)
+            response, retries_used = _call_claude_with_retry(prompt, generic_mode=generic_mode)
             total_retries += retries_used
 
             raw_text = response.choices[0].message.content.strip()
             if not raw_text:
                 continue
 
-            # Strip markdown fences if model adds them despite instructions
             if raw_text.startswith('```'):
                 parts    = raw_text.split('```')
                 raw_text = parts[1] if len(parts) > 1 else raw_text
@@ -1810,7 +1806,6 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                     raw_text = raw_text[4:]
             raw_text = raw_text.strip()
 
-            # Extract JSON boundaries — handles any preamble text
             start = raw_text.find('{')
             end   = raw_text.rfind('}')
             if start != -1 and end != -1 and end > start:
@@ -1818,14 +1813,6 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
 
             result = json.loads(raw_text)
 
-            # Diagnosed via a real failure (Mrinal Thapa resume, post-720ef4b):
-            # finish_reason == "stop" with completion_tokens well under
-            # max_tokens confirmed this wasn't truncation -- the model
-            # completed normally but nested the whole payload under an
-            # invented wrapper key ("candidate") with renamed/reshaped
-            # fields. _normalize_rewrite_result() recovers from that before
-            # the required-keys check below runs, so a genuinely complete
-            # response isn't misreported as incomplete.
             finish_reason = None
             try:
                 finish_reason = response.choices[0].finish_reason
@@ -1836,12 +1823,6 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
 
             missing_keys = REQUIRED_REWRITE_KEYS - result.keys()
             if missing_keys:
-                # Logs finish_reason/token usage (not the raw response body --
-                # that's candidate PII, and main.py's CLI path has no
-                # PiiFilter to redact it the way api.py's logging does) to
-                # tell a real mid-generation cutoff (finish_reason=='length')
-                # apart from a schema-drift case normalization didn't fully
-                # recover from.
                 usage_info = {}
                 try:
                     usage = response.usage
@@ -1866,17 +1847,18 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                         'detail':       f'Response parsed as valid JSON but was missing required '
                                         f'fields (likely truncated mid-generation): {sorted(missing_keys)}',
                         'raw_response': raw_text[:500],
-                        '_groq_retry_count': total_retries,
+                        '_llm_retry_count': total_retries,
                     }
                 continue
 
-            result = enforce_minimum_quality(result, rank)
+            result = enforce_minimum_quality(result, rank, generic_mode=generic_mode)
             result = enforce_cert_completeness(result, parsed)
             result = enforce_education_completeness(result, parsed)
             result = enforce_language_completeness(result, parsed)
+            result = post_process_rewrite_result(result)
             if not result.get('rank'):
                 result['rank'] = rank
-            result['_groq_retry_count'] = total_retries
+            result['_llm_retry_count'] = total_retries
             return result
 
         except json.JSONDecodeError:
@@ -1885,15 +1867,15 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                     'error':        'JSON_PARSE_FAILED',
                     'raw_response': raw_text[:500],
                     'detail':       f'Failed after 3 attempts. Last: {raw_text[:200]}',
-                    '_groq_retry_count': total_retries,
+                    '_llm_retry_count': total_retries,
                 }
             continue
 
         except Exception as e:
-            return {'error': 'API_CALL_FAILED', 'detail': str(e), '_groq_retry_count': total_retries}
+            return {'error': 'API_CALL_FAILED', 'detail': str(e), '_llm_retry_count': total_retries}
 
     return {
         'error':  'JSON_PARSE_FAILED',
         'detail': 'Empty response after 3 retries',
-        '_groq_retry_count': total_retries,
+        '_llm_retry_count': total_retries,
     }

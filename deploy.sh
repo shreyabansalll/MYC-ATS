@@ -86,19 +86,14 @@ if grep -q "generate-a-different-strong-random-key" .env; then
     exit 1
 fi
 
-# GROQ_API_KEY left as env_template.txt's literal placeholder is a WARN,
-# not a hard exit -- unlike MYC_API_KEY/MYC_ADMIN_KEY, a missing/placeholder
-# Groq key doesn't crash the app (api.py starts fine; every Stage 5 AI
-# rewrite call just fails and falls back to "original content preserved"
-# per config.py's own warn-don't-crash pattern). Real, deliberate use
-# case as of POST /ats/score: this service can be deployed and used for
-# scoring-only with no working Groq key at all -- don't block that.
-if grep -q "your-groq-api-key-here" .env; then
-    echo "WARNING: GROQ_API_KEY is still set to its placeholder value in .env"
+# ANTHROPIC_API_KEY left as env_template.txt's literal placeholder is a
+# warning, not a hard exit: the service still starts and scoring-only
+# requests work, but resume rewrites need a real Anthropic key.
+if grep -q "your-anthropic-api-key-here" .env; then
+    echo "WARNING: ANTHROPIC_API_KEY is still set to its placeholder value in .env"
     echo "         The service will start and /ats/score will work fine, but"
-    echo "         every /ats/submit AI rewrite will fail and fall back to"
-    echo "         unmodified original content. Set a real key before relying"
-    echo "         on the rewrite feature."
+    echo "         AI rewrite/tailoring requests need a real Anthropic key."
+    echo "         Set one before relying on the rewrite feature."
 fi
 
 # 3. Create required directories

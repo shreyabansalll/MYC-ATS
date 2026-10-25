@@ -269,7 +269,7 @@ def test_add_sea_service_section_omits_itself_when_no_experience():
 
 def test_add_sea_service_section_does_not_crash_on_list_valued_fields():
     """
-    Real crash fixed, confirmed on a real live Groq response: 'company'
+    Real crash fixed, confirmed on a real live model response: 'company'
     (or 'dates'/'role') came back as a list instead of a string --
     schema drift, the same category _stringify_cert already guards
     against for certifications. The duplicate-row check built a
@@ -296,7 +296,7 @@ def test_add_sea_service_section_does_not_crash_on_list_valued_fields():
 
 def test_add_sea_service_section_omits_dangling_separator_for_blank_company():
     """
-    Real bug fixed, confirmed on a real live Groq response (Ankur
+    Real bug fixed, confirmed on a real live model response (Ankur
     Shrivastava): 'company' came back as an empty string for every role,
     and the old f-string unconditionally included it, rendering
     "2018-01-01 - 2020-12-31   —   Second Engineer   —   " with a

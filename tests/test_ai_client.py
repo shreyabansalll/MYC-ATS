@@ -1,7 +1,7 @@
 # tests/test_ai_client.py
 # Regression tests for services/ai_client.py::enforce_minimum_quality() —
-# the deterministic minimum-quality patch applied after every Groq rewrite.
-# Not full ai_client.py coverage (that needs a live/mocked Groq client);
+# the deterministic minimum-quality patch applied after every Claude rewrite.
+# Not full ai_client.py coverage (that needs a live/mocked Anthropic client);
 # this covers the pure post-processing function.
 
 import importlib
@@ -19,24 +19,24 @@ from services.ai_client import (
 
 def test_ai_client_socks5h_proxy_env_builds_a_real_client(monkeypatch):
     """
-    Regression test for a flawed version of this test: config.GROQ_API_KEY
+    Regression test for a flawed version of this test: config.ANTHROPIC_API_KEY
     is read from os.environ exactly once, at config's first import, and
     cached on the module object. services/ai_client.py does
-    `from config import GROQ_API_KEY` — a one-time attribute copy, not a
+    `from config import ANTHROPIC_API_KEY` — a one-time attribute copy, not a
     live env read. Mutating os.environ (via monkeypatch.setenv/delenv) has
     NO effect on that cached value, so a version of this test that deleted
-    GROQ_API_KEY from the environment never actually changed
-    config.GROQ_API_KEY — it was already falsy from config's first import
-    in this test process, meaning _build_groq_client()'s first
-    `if not GROQ_API_KEY: return None` fired unconditionally and the
+    ANTHROPIC_API_KEY from the environment never actually changed
+    config.ANTHROPIC_API_KEY — it was already falsy from config's first import
+    in this test process, meaning _build_claude_client()'s first
+    `if not ANTHROPIC_API_KEY: return None` fired unconditionally and the
     socks5h branch below it was structurally unreachable, regardless of
-    what this test did. The fix: patch config.GROQ_API_KEY directly (the
-    actual value ai_client.py's `from config import GROQ_API_KEY` re-reads
+    what this test did. The fix: patch config.ANTHROPIC_API_KEY directly (the
+    actual value ai_client.py's `from config import ANTHROPIC_API_KEY` re-reads
     on module re-import), and assert something that can actually fail —
     `client is not None` — not the previous `hasattr(module, 'client')`,
     which is trivially true whether client is a real object or None.
     """
-    monkeypatch.setattr(config, 'GROQ_API_KEY', 'fake-test-key-for-proxy-test')
+    monkeypatch.setattr(config, 'ANTHROPIC_API_KEY', 'fake-test-key-for-proxy-test')
     monkeypatch.setenv('HTTP_PROXY', 'socks5h://localhost:54937')
     monkeypatch.setenv('HTTPS_PROXY', 'socks5h://localhost:54937')
 
@@ -44,28 +44,28 @@ def test_ai_client_socks5h_proxy_env_builds_a_real_client(monkeypatch):
     module = importlib.import_module('services.ai_client')
 
     assert module.client is not None, (
-        'Expected the socks5h proxy branch to actually construct a Groq '
+        'Expected the socks5h proxy branch to actually construct a Claude '
         'client with a present API key — if this fails, the proxy-safe '
         'construction path is not actually working in this environment.'
     )
 
 
-def test_ai_client_build_groq_client_logs_error_on_construction_failure(monkeypatch, caplog):
+def test_ai_client_build_claude_client_logs_error_on_construction_failure(monkeypatch, caplog):
     """
-    _build_groq_client() previously swallowed the real exception with a
+    _build_claude_client() previously swallowed the real exception with a
     bare `except Exception: return None`, so a genuine construction
     failure (bad proxy config, missing SDK dependency, etc.) was
-    invisible until it surfaced later as a generic 'GROQ client
+    invisible until it surfaced later as a generic 'Claude client
     unavailable' RuntimeError with no root cause. Confirms the failure is
     now logged with the actual exception before returning None.
     """
-    import groq as groq_module
+    import anthropic as anthropic_module
 
     def _raise(*args, **kwargs):
         raise RuntimeError('boom: simulated construction failure')
 
-    monkeypatch.setattr(groq_module, 'Groq', _raise)
-    monkeypatch.setattr(config, 'GROQ_API_KEY', 'fake-test-key-for-error-logging-test')
+    monkeypatch.setattr(anthropic_module, 'Anthropic', _raise)
+    monkeypatch.setattr(config, 'ANTHROPIC_API_KEY', 'fake-test-key-for-error-logging-test')
     monkeypatch.delenv('HTTP_PROXY', raising=False)
     monkeypatch.delenv('HTTPS_PROXY', raising=False)
     monkeypatch.delenv('ALL_PROXY', raising=False)
@@ -75,12 +75,35 @@ def test_ai_client_build_groq_client_logs_error_on_construction_failure(monkeypa
         module = importlib.import_module('services.ai_client')
 
     assert module.client is None, 'Construction failure must still degrade gracefully to None'
-    assert any('Failed to construct Groq client' in r.message for r in caplog.records), (
+    assert any('Failed to construct Claude client' in r.message for r in caplog.records), (
         f'Expected the construction failure to be logged, got: {[r.message for r in caplog.records]}'
     )
     assert any('boom: simulated construction failure' in r.message for r in caplog.records), (
         'Expected the actual exception message to appear in the log, not just a generic notice'
     )
+
+
+def test_claude_request_uses_configured_model(monkeypatch):
+    from types import SimpleNamespace
+    import services.ai_client as ai_client
+
+    calls = {}
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            calls.update(kwargs)
+            return SimpleNamespace(
+                content=[SimpleNamespace(text="{}")],
+                stop_reason="end_turn",
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    monkeypatch.setattr(ai_client, "client", SimpleNamespace(messages=FakeMessages()))
+
+    ai_client._call_claude_with_retry("test prompt")
+
+    assert config.CLAUDE_MODEL == "claude-haiku-5-5"
+    assert calls["model"] == config.CLAUDE_MODEL
 
 
 def test_enforce_minimum_quality_deduplicates_skills_case_insensitively():
@@ -168,7 +191,7 @@ def test_enforce_minimum_quality_backfills_role_across_mixed_entries():
 
 def test_enforce_minimum_quality_does_not_crash_on_a_plain_string_experience_entry():
     """
-    Real crash fixed, confirmed on real GROQ_MODEL (qwen/qwen3.6-27b)
+    Real crash fixed, confirmed on a legacy model response
     output in a randomized 18-candidate sample batch run (3/18 hit this
     exact crash): the has_real_exp check called e.get('company', ...)
     on every item in experience_bullets with no isinstance(e, dict)
@@ -208,7 +231,7 @@ def test_normalize_rewrite_result_converts_a_plain_string_experience_entry_to_a_
 
 def test_normalize_experience_entry_folds_in_vessels_given_as_a_separate_list():
     """
-    Real, confirmed content-loss bug on real GROQ_MODEL (qwen/qwen3.6-27b)
+    Real, confirmed content-loss bug on a legacy model response
     output: vessel names given as a separate list field (Rule 2, VESSEL
     DETAILS MANDATORY, requires them INSIDE the bullets) instead never
     made it into the rendered Work Experience section, since
@@ -368,7 +391,7 @@ def test_resolve_cruise_line_handles_common_spellings_and_abbreviations():
 
 def test_rewrite_resume_retries_then_reports_incomplete_json_distinctly(monkeypatch):
     """
-    Regression test: a Groq response cut off mid-generation (hitting
+    Regression test: a Claude response cut off mid-generation (hitting
     max_tokens) can still parse as valid JSON if the truncation point
     happens to land on an earlier closing brace -- silently missing every
     field after that point (education, documents, languages, etc.) with
@@ -380,33 +403,9 @@ def test_rewrite_resume_retries_then_reports_incomplete_json_distinctly(monkeypa
     import services.ai_client as ai_client_module
 
     incomplete_json = json.dumps({'summary': 'A summary.', 'rank': 'third officer'})
-
     call_count = {'n': 0}
 
-    class _FakeMessage:
-        def __init__(self, content):
-            self.content = content
-
-    class _FakeChoice:
-        def __init__(self, content):
-            self.message = _FakeMessage(content)
-
-    class _FakeResponse:
-        def __init__(self, content):
-            self.choices = [_FakeChoice(content)]
-
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            call_count['n'] += 1
-            return _FakeResponse(incomplete_json)
-
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeClient:
-        chat = _FakeChat()
-
-    monkeypatch.setattr(ai_client_module, 'client', _FakeClient())
+    monkeypatch.setattr(ai_client_module, 'client', _make_fake_client(incomplete_json, call_count))
 
     result = ai_client_module.rewrite_resume(
         parsed={'sections': {}, 'contact': {}, 'skills': [], 'raw_text': '', 'name': 'Test'},
@@ -415,6 +414,56 @@ def test_rewrite_resume_retries_then_reports_incomplete_json_distinctly(monkeypa
     )
     assert result.get('error') == 'INCOMPLETE_RESPONSE', f'Expected INCOMPLETE_RESPONSE, got: {result}'
     assert call_count['n'] == 3, f'Expected 3 retry attempts, got {call_count["n"]}'
+
+
+def _make_fake_client(response_json: str, call_counter: dict | None = None):
+    class _FakeBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class _FakeChoice:
+        def __init__(self, content):
+            self.message = _FakeMessage(content)
+            self.finish_reason = 'stop'
+
+    class _FakeUsage:
+        prompt_tokens = 899
+        completion_tokens = 962
+        total_tokens = 1861
+        input_tokens = 899
+        output_tokens = 962
+
+    class _FakeResponse:
+        def __init__(self, content):
+            self.choices = [_FakeChoice(content)]
+            self.content = [_FakeBlock(content)]
+            self.stop_reason = 'stop'
+            self.usage = _FakeUsage()
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            if call_counter is not None:
+                call_counter['n'] += 1
+            return _FakeResponse(response_json)
+
+    class _FakeChat:
+        completions = _FakeCompletions()
+
+    class _FakeMessages:
+        def create(self, **kwargs):
+            if call_counter is not None:
+                call_counter['n'] += 1
+            return _FakeResponse(response_json)
+
+    class _FakeClient:
+        chat = _FakeChat()
+        messages = _FakeMessages()
+
+    return _FakeClient()
 
 
 def test_rewrite_resume_succeeds_when_json_has_all_required_keys(monkeypatch):
@@ -432,29 +481,7 @@ def test_rewrite_resume_succeeds_when_json_has_all_required_keys(monkeypatch):
         'education': [], 'documents': {}, 'languages': [],
     })
 
-    class _FakeMessage:
-        def __init__(self, content):
-            self.content = content
-
-    class _FakeChoice:
-        def __init__(self, content):
-            self.message = _FakeMessage(content)
-
-    class _FakeResponse:
-        def __init__(self, content):
-            self.choices = [_FakeChoice(content)]
-
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            return _FakeResponse(complete_json)
-
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeClient:
-        chat = _FakeChat()
-
-    monkeypatch.setattr(ai_client_module, 'client', _FakeClient())
+    monkeypatch.setattr(ai_client_module, 'client', _make_fake_client(complete_json))
 
     result = ai_client_module.rewrite_resume(
         parsed={'sections': {}, 'contact': {}, 'skills': [], 'raw_text': '', 'name': 'Test'},
@@ -590,7 +617,7 @@ def test_normalize_rewrite_result_keeps_bare_acronym_pair_when_number_unconfirme
 
 def test_normalize_rewrite_result_recovers_from_real_partial_wrapper_drift():
     """
-    Real bug fixed, confirmed on a real live Groq response (Jimmy
+    Real bug fixed, confirmed on a real live model response (Jimmy
     Fernandes): only SOME fields (here, "skills") were nested under an
     invented "candidate" wrapper key, while "summary"/"experience"/
     "education"/"certifications" were already top-level siblings in the
@@ -643,9 +670,9 @@ def test_rewrite_resume_recovers_from_real_wrapper_and_field_name_drift(monkeypa
     """
     Regression test for a real production failure (job debug log, a real
     candidate resume -- name/email/phone/document numbers below are
-    scrubbed, but the JSON *shape* is exactly what Groq returned).
+    scrubbed, but the JSON *shape* matches the mocked provider response).
     finish_reason was "stop" with completion_tokens (962) far under
-    max_tokens (6000) -- confirmed via Groq's own response fields, not a
+    max_tokens (6000) -- confirmed via the provider's response fields, not a
     guess, that this was never truncation.
 
     The model nested the entire payload under an invented "candidate"
@@ -741,38 +768,7 @@ def test_rewrite_resume_recovers_from_real_wrapper_and_field_name_drift(monkeypa
     })
 
     call_count = {'n': 0}
-
-    class _FakeMessage:
-        def __init__(self, content):
-            self.content = content
-
-    class _FakeChoice:
-        def __init__(self, content):
-            self.message = _FakeMessage(content)
-            self.finish_reason = 'stop'
-
-    class _FakeUsage:
-        prompt_tokens     = 899
-        completion_tokens = 962
-        total_tokens      = 1861
-
-    class _FakeResponse:
-        def __init__(self, content):
-            self.choices = [_FakeChoice(content)]
-            self.usage   = _FakeUsage()
-
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            call_count['n'] += 1
-            return _FakeResponse(real_shaped_response)
-
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeClient:
-        chat = _FakeChat()
-
-    monkeypatch.setattr(ai_client_module, 'client', _FakeClient())
+    monkeypatch.setattr(ai_client_module, 'client', _make_fake_client(real_shaped_response, call_count))
 
     result = ai_client_module.rewrite_resume(
         parsed={'sections': {}, 'contact': {}, 'skills': [], 'raw_text': '', 'name': 'Test Candidate'},
@@ -782,7 +778,7 @@ def test_rewrite_resume_recovers_from_real_wrapper_and_field_name_drift(monkeypa
 
     assert 'error' not in result, f'Expected the unwrapped/normalized response to succeed, got: {result}'
     assert call_count['n'] == 1, (
-        f'Expected the first Groq response to be recovered and accepted -- no retries needed. '
+        f'Expected the first Claude response to be recovered and accepted -- no retries needed. '
         f'Got {call_count["n"]} attempts.'
     )
 
@@ -963,7 +959,7 @@ def test_enforce_education_completeness_restores_dropped_source_entries():
     """
     Real, confirmed gap: 'education' was previously NOT in
     _DEFAULTABLE_REWRITE_KEYS, so a response missing it entirely (a real,
-    repeated behavior of GROQ_MODEL qwen/qwen3.6-27b -- confirmed
+    repeated behavior in legacy model responses -- confirmed
     finish_reason == 'stop', i.e. NOT truncated, on 3/3 real retry
     attempts for the same candidate) was treated as a truncation signal,
     exhausting every retry and losing the ENTIRE rewrite over one
@@ -990,7 +986,7 @@ def test_enforce_education_completeness_restores_dropped_source_entries():
 def test_enforce_language_completeness_restores_dropped_source_entries_but_not_noise():
     """
     Real, confirmed gap, same class as education above: 'languages' was
-    routinely omitted from real qwen/qwen3.6-27b output even when the
+    routinely omitted from real model output even when the
     source resume genuinely listed languages. Also confirms this
     function deliberately does NOT use _looks_like_real_source_line
     (unlike certifications/education): a bare one-word line like
@@ -1127,7 +1123,7 @@ def test_rewrite_resume_full_pipeline_restores_dropped_certs(monkeypatch):
     """
     Integration test: enforce_cert_completeness runs inside rewrite_resume()
     itself (after enforce_minimum_quality), using the same real 10-item
-    cert/document source data, via a mocked Groq response that drops 2 of
+    cert/document source data, via a mocked Claude response that drops 2 of
     them -- confirms the safety net fires as part of the real call path,
     not just as a standalone unit.
     """
@@ -1149,30 +1145,7 @@ def test_rewrite_resume_full_pipeline_restores_dropped_certs(monkeypatch):
         'languages': [],
     })
 
-    class _FakeMessage:
-        def __init__(self, content):
-            self.content = content
-
-    class _FakeChoice:
-        def __init__(self, content):
-            self.message = _FakeMessage(content)
-            self.finish_reason = 'stop'
-
-    class _FakeResponse:
-        def __init__(self, content):
-            self.choices = [_FakeChoice(content)]
-
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            return _FakeResponse(incomplete_json)
-
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeClient:
-        chat = _FakeChat()
-
-    monkeypatch.setattr(ai_client_module, 'client', _FakeClient())
+    monkeypatch.setattr(ai_client_module, 'client', _make_fake_client(incomplete_json))
 
     result = ai_client_module.rewrite_resume(
         parsed={**_SOURCE_PARSED, 'contact': {}, 'skills': [], 'raw_text': '', 'name': 'Test'},

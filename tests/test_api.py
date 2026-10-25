@@ -7,7 +7,7 @@
 # sqlite3.OperationalError on every real request) — and (2) nothing
 # previously bounded how many resumes could be processing at once.
 #
-# Not chasing full endpoint coverage here (that would need mocking Groq,
+# Not chasing full endpoint coverage here (that would need mocking Claude,
 # spaCy, and the whole pipeline) — these two are pure, isolated, and were
 # the actual bugs found.
 
@@ -400,20 +400,17 @@ def test_run_pipeline_error_message_distinguishes_extraction_failure_reason(tmp_
     )
 
 
-def test_run_pipeline_falls_back_gracefully_on_total_groq_outage(monkeypatch):
+def test_run_pipeline_falls_back_gracefully_on_total_claude_outage(monkeypatch):
     """
-    Deliberate exception-handling audit item: simulates a total Groq
-    outage (invalid API key -> every call fails with a non-transient auth
-    error, which _call_groq_with_retry correctly does NOT retry). Per
-    CLAUDE.md's documented behavior, the job must still complete
-    ('done', not 'failed') with the original content preserved, not hang
-    or crash the whole job over an AI-provider outage.
+    Simulates a total Claude outage (client is None). The job must still
+    complete ('done', not 'failed') with the original content preserved.
     """
     import uuid
     import api
     import services.ai_client as ai_client
 
-    monkeypatch.setattr(ai_client, 'GROQ_API_KEY', 'gsk_invalid_fake_key_for_outage_test')
+    monkeypatch.setattr(ai_client, 'ANTHROPIC_API_KEY', 'sk-invalid-fake-key-for-outage-test')
+    monkeypatch.setattr(ai_client, 'client', None)
 
     real_resume = None
     for candidate in [
@@ -432,7 +429,7 @@ def test_run_pipeline_falls_back_gracefully_on_total_groq_outage(monkeypatch):
     shutil.copy(real_resume, tmp_path_str)
 
     db = api.get_db()
-    db.add(api.Job(job_id=job_id, file_hash=f'test-groq-outage-{job_id}'))
+    db.add(api.Job(job_id=job_id, file_hash=f'test-claude-outage-{job_id}'))
     db.commit()
     db.close()
 
@@ -442,7 +439,7 @@ def test_run_pipeline_falls_back_gracefully_on_total_groq_outage(monkeypatch):
     job = db.get(api.Job, job_id)
     db.close()
 
-    assert job.status == 'done', f'Expected the job to complete despite the Groq outage, got: {job.status}'
+    assert job.status == 'done', f'Expected the job to complete despite the Claude outage, got: {job.status}'
     assert job.output_docx and os.path.exists(job.output_docx)
 
 
@@ -457,7 +454,7 @@ def test_submit_never_uses_the_raw_filename_for_the_saved_path(monkeypatch):
     endpoint (not just by reading the validation code): fakes out
     BackgroundTasks.add_task to capture exactly what path run_pipeline
     would have been called with, without needing the full pipeline
-    (spaCy/Groq) to actually run.
+    (spaCy/Claude) to actually run.
     """
     import api
     from fastapi import BackgroundTasks
@@ -615,6 +612,50 @@ def test_admin_metrics_rejects_the_client_facing_key_when_a_distinct_admin_key_i
     )
 
 
+def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):
+    import json
+    import api
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    test_engine = create_engine(f'sqlite:///{tmp_path / "rewrite_status.db"}')
+    api.Base.metadata.create_all(test_engine)
+    with Session(test_engine) as db:
+        db.add_all([
+            api.Job(
+                job_id='rewrite-success',
+                status='done',
+                issues_fixed_json=json.dumps(['Improved summary']),
+            ),
+            api.Job(
+                job_id='rewrite-fallback',
+                status='done',
+                issues_fixed_json=json.dumps([api.AI_REWRITE_FALLBACK_ISSUE]),
+            ),
+        ])
+        db.commit()
+
+    monkeypatch.setattr(api, 'API_KEY', 'rewrite-status-test-key')
+    monkeypatch.setattr(api, 'get_db', lambda: Session(test_engine))
+    api.limiter.reset()
+    client = TestClient(api.app)
+
+    success = client.get(
+        '/ats/result/rewrite-success',
+        headers={'X-API-Key': api.API_KEY},
+    ).json()
+    fallback = client.get(
+        '/ats/result/rewrite-fallback',
+        headers={'X-API-Key': api.API_KEY},
+    ).json()
+
+    assert success['ai_rewrite'] is True
+    assert success['note'] is None
+    assert fallback['ai_rewrite'] is False
+    assert 'original resume content was preserved' in fallback['note']
+
+
 def _build_zlib_bomb_pdf(decompressed_mb: int) -> bytes:
     """A minimal single-page PDF whose one content stream decompresses to
     `decompressed_mb` MB of zeros from a tiny on-disk FlateDecode payload."""
@@ -733,7 +774,7 @@ def test_extract_with_timeout_still_works_normally_for_a_real_resume():
     assert 'EXTRACTION_TIMEOUT' not in result.get('structural_issues', [])
 
 
-# ── /ats/score — Stages 1-4 only, no Groq dependency ────────────────────
+# ── /ats/score — scoring only, no Claude dependency ─────────────────────
 
 def _real_pdf_fixture():
     real_pdf = 'data/myc_resume/Srinivas Menon/SrinivasMenonResume.pdf'
@@ -758,8 +799,7 @@ def test_score_endpoint_matches_the_real_submit_pipelines_stage_3_and_4(monkeypa
     import api
     from pipeline.extractor import extract_text
     from pipeline.parser import parse_resume
-    from pipeline.scorer import score_resume
-    from pipeline.maritime import maritime_score
+    from services.two_layer import score_layers
     from fastapi.testclient import TestClient
 
     real_pdf = _real_pdf_fixture()
@@ -782,16 +822,21 @@ def test_score_endpoint_matches_the_real_submit_pipelines_stage_3_and_4(monkeypa
     # directly against the exact same bytes.
     extracted        = extract_text(real_pdf, 'pdf')
     parsed           = parse_resume(extracted['raw_text'])
-    ats_result       = score_resume(extracted, parsed, '')
-    maritime_result  = maritime_score(extracted['raw_text'], parsed, pdf_path=real_pdf)
+    parsed['raw_text'] = extracted['raw_text']
+    layers = score_layers(extracted, parsed, pdf_path=real_pdf, ext='pdf')
+    ats_result = layers['generic']
+    maritime_result = layers['maritime']
 
     assert via_endpoint['ats_score'] == ats_result['total_score']
     assert via_endpoint['ats_grade'] == ats_result['grade']
-    assert via_endpoint['maritime_score'] == maritime_result['maritime_score']
-    assert via_endpoint['maritime_grade'] == maritime_result['maritime_grade']
-    assert via_endpoint['rank_detected'] == maritime_result['rank_detected']
-    assert via_endpoint['sea_months'] == maritime_result['sea_months']
-    assert via_endpoint['cert_coverage'] == maritime_result['cert_coverage']
+    if maritime_result:
+        assert via_endpoint['maritime_score'] == maritime_result['maritime_score']
+        assert via_endpoint['maritime_grade'] == maritime_result['maritime_grade']
+        assert via_endpoint['rank_detected'] == maritime_result['rank_detected']
+        assert via_endpoint['sea_months'] == maritime_result['sea_months']
+        assert via_endpoint['cert_coverage'] == maritime_result['cert_coverage']
+    else:
+        assert via_endpoint['maritime_score'] is None
 
 
 def test_score_endpoint_requires_api_key():
@@ -850,19 +895,16 @@ def test_score_endpoint_is_rate_limited_the_same_as_submit(monkeypatch):
 
     monkeypatch.setattr(api, 'API_KEY', 'score-endpoint-test-key')
     monkeypatch.setattr(api, '_extract_with_timeout', lambda _path, _ext: {'raw_text': 'resume'})
-    monkeypatch.setattr(api, 'parse_resume', lambda raw_text: {'raw_text': raw_text})
+    monkeypatch.setattr(api, 'parse_resume', lambda raw_text: {'raw_text': raw_text, 'rank': '', 'sections': {}, 'skills': [], 'contact': {}})
     monkeypatch.setattr(
         api,
-        'score_resume',
-        lambda *_args: {'total_score': 0, 'grade': 'FAIL', 'issues': []},
-    )
-    monkeypatch.setattr(
-        api,
-        'maritime_score',
+        'score_layers',
         lambda *_args, **_kwargs: {
-            'maritime_score': 0,
-            'maritime_grade': 'WEAK',
-            'issues': [],
+            'generic': {'total_score': 0, 'grade': 'FAIL', 'issues': [], 'keyword_data': {}},
+            'maritime': None,
+            'overlay': False,
+            'job_description': '',
+            'role': '',
         },
     )
     monkeypatch.setattr(

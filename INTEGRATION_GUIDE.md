@@ -20,7 +20,7 @@ There are two separate flows, and picking the right one matters:
 |---|---|---|
 | What it does | ATS score + maritime score only | Full pipeline: scores + AI-rewritten, ATS-optimised DOCX |
 | Speed | Seconds, one HTTP response | Async — queues a job, poll for completion |
-| Depends on the AI provider (Groq) | No | Yes |
+| Depends on the AI provider (Claude) | No | Yes |
 | Use when | You just need the score/issues, or want a fast pre-check before the full rewrite | You want the candidate a polished, downloadable DOCX |
 
 If your product currently only needs the score (e.g. to show the candidate their ATS grade before deciding whether to run the full rewrite), use `/ats/score` — it's faster and has no dependency on the AI provider being up.
@@ -36,7 +36,10 @@ Synchronous. One request, one response, typically a couple of seconds.
 | Field | Required | Notes |
 |---|---|---|
 | `file` | Yes | PDF or DOCX, max 5MB |
-| `job_description` | No | Improves keyword-match scoring if provided |
+| `job_description` | No | Target JD; otherwise a general or rank-based baseline is used |
+| `career_track` | No | Use `generic` to disable maritime scoring; a maritime track enables it |
+| `target_rank` | No | Overrides automatic rank detection and enables the maritime layer |
+| `target_cruise_line` | No | Optional maritime tailoring target |
 
 ```bash
 curl -X POST https://<host>/ats/score \
@@ -53,18 +56,19 @@ curl -X POST https://<host>/ats/score \
   "ats_grade": "PASS",
   "maritime_score": 78,
   "maritime_grade": "STRONG",
+  "overlay_active": true,
   "rank_detected": "third officer",
   "sea_months": 24,
   "cert_coverage": "3/3",
   "vessel_types": ["oil tanker", "bulk carrier"],
-  "issues": ["FORMAT: LINKEDIN_URL_MISSING (-2pts) [R37]", "..."],
+  "issues": ["GENERIC_ATS: SECTION_HEADINGS WARN (content/medium)", "..."],
   "recommendations": ["..."],
   "missing_certs": [],
-  "keyword_data": { "match_pct": null, "note": "No JD provided — base score assigned" }
+  "keyword_data": { "engine": "resume_matcher", "role": "third officer", "missing_keywords": [] }
 }
 ```
 
-`ats_grade` is one of `EXCELLENT` / `GOOD` / `PASS` / `FAIL`. `maritime_grade` is one of `STRONG` / `ADEQUATE` / `WEAK`.
+`ats_grade` is one of `EXCELLENT` / `GOOD` / `PASS` / `FAIL`. Maritime score fields are `null` when the overlay is inactive. `maritime_grade`, when present, is one of `STRONG` / `ADEQUATE` / `WEAK`. Pass `career_track=generic` to force generic-only scoring, or use `target_rank` / `target_cruise_line` to explicitly activate the maritime overlay.
 
 This endpoint doesn't create a job or persist anything — nothing to poll, nothing to download. If you need the AI-rewritten resume too, use `/ats/submit` below (you'll get the same scores as part of that flow, plus the rewrite).
 
@@ -79,9 +83,10 @@ This endpoint doesn't create a job or persist anything — nothing to poll, noth
 | Field | Required | Notes |
 |---|---|---|
 | `file` | Yes | PDF or DOCX, max 5MB |
-| `job_description` | No | Improves keyword-match scoring |
-| `target_rank` | No | Overrides automatic rank detection |
-| `target_cruise_line` | No | See "Cruise-line tailoring" below |
+| `job_description` | No | Target JD; otherwise a general or rank-based baseline is used |
+| `target_rank` | No | Overrides automatic rank detection and enables maritime scoring |
+| `target_cruise_line` | No | See "Cruise-line tailoring" below; enables maritime scoring |
+| `career_track` | No | Use `generic` for generic-only scoring or a maritime track for both layers |
 
 ```bash
 curl -X POST https://<host>/ats/submit \
@@ -101,6 +106,8 @@ If the exact same file (by content hash) was already processed successfully with
 { "job_id": "<existing job's id>", "status": "done", "cached": true, "message": "Same file processed recently — returning existing result" }
 ```
 
+**Important — HTTP 200 does not guarantee an AI rewrite.** The submit response only confirms the job was queued. If `ANTHROPIC_API_KEY` is missing or invalid, the service preserves the original resume content without AI rewriting. Once the job completes, `GET /ats/result/{job_id}` returns `"ai_rewrite": false` and a `note` explaining why. Check `ai_rewrite` before telling the user their resume was rewritten.
+
 ### 2. Poll status
 
 ```
@@ -112,6 +119,16 @@ GET /ats/status/{job_id}
 ```
 
 `status` is one of `queued` / `processing` / `done` / `failed`. Poll every 2-3 seconds. A full run typically takes several seconds to low tens of seconds depending on the AI provider's response time.
+
+### Rewrite quality
+
+When polling returns `status: "done"`, fetch `GET /ats/result/{job_id}` and check `rewrite_quality` in that completed result. (`/ats/status/{job_id}` reports progress; `rewrite_quality` is included in `/ats/result/{job_id}`.)
+
+- `"full"` means the rewrite improved the score by 15 or more points.
+- `"partial"` means the score improved, but by fewer than 15 points; the best available version is returned.
+- `"none"` means the score did not improve; do not tell the user their resume improved, and recommend manual review.
+
+For `"partial"`, show **“Resume improved but may need manual review”** instead of claiming a full rewrite.
 
 ### 3. Get the result
 
@@ -127,6 +144,9 @@ Only meaningful once `status == "done"`. Returns before/after scores, issues, re
   "score_before": 70, "grade_before": "PASS",
   "score_after": 78, "grade_after": "GOOD",
   "improvement": 8,
+  "ai_rewrite": true,
+  "note": null,
+  "rewrite_quality": "partial",
   "maritime_score_before": 78, "maritime_grade_before": "STRONG",
   "maritime_score_after": 78, "maritime_grade_after": "STRONG",
   "rank_detected": "third officer",
@@ -142,6 +162,8 @@ Only meaningful once `status == "done"`. Returns before/after scores, issues, re
   "expires_at": "2026-09-21T10:15:00"
 }
 ```
+
+The maritime before/after fields are `null` when the maritime overlay did not run. The generic ATS score always runs.
 
 If called while still processing, you get `202` with `{"detail": "Still processing", "progress": ..., "stage": ...}`. If the job failed, you get `500` with the failure reason in `detail`.
 
@@ -179,4 +201,4 @@ For `/ats/submit`, a bad file that fails during processing (rather than at uploa
 
 ## Rate limits
 
-10 requests/minute per IP address, shared across `/ats/submit` and `/ats/score`. Design your integration to submit on user action, not to poll-resubmit.
+Both `/ats/score` and `/ats/submit` are rate limited to 10 requests per minute per IP address. If multiple users or team members rapidly hit the same endpoint, they may receive `429 Too Many Requests`. Handle `429` by showing a retry message, not a generic error. Do not retry automatically; let the user retry manually. Design your integration to submit on user action, not to poll-resubmit.
