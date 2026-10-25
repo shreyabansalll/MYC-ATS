@@ -181,7 +181,7 @@
     color: var(--text-dim);
     margin-bottom: 7px;
   }
-  select, input[type="text"] {
+  select, input[type="text"], input[type="url"], input[type="password"], textarea {
     width: 100%;
     background: var(--surface-2);
     border: 1px solid var(--border-strong);
@@ -193,7 +193,7 @@
     appearance: none;
     -webkit-appearance: none;
   }
-  select:focus, input:focus {
+  select:focus, input:focus, textarea:focus {
     outline: none;
     border-color: var(--primary);
   }
@@ -202,6 +202,19 @@
     background-repeat: no-repeat;
     background-position: right 12px center;
     padding-right: 32px;
+  }
+  textarea {
+    resize: vertical;
+    min-height: 76px;
+  }
+  .config-note {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid rgba(251,191,36,0.3);
+    border-radius: var(--radius-sm);
+    color: var(--warning);
+    background: rgba(251,191,36,0.07);
+    font-size: 11px;
   }
 
   .actions {
@@ -509,23 +522,28 @@
       <div class="logo">RS</div>
       <div>
         <h1>Resume Scoring API</h1>
-        <div class="sub">Internal testing dashboard</div>
+        <div class="sub">ATS scoring and resume rewrite</div>
       </div>
     </div>
-    <div class="endpoint" id="endpointLabel">http://localhost:8000</div>
+    <div class="endpoint">Local server proxy</div>
   </header>
 
   <div class="grid">
     <!-- Left: input -->
     <section class="card" id="inputCard">
-      <h2>Input</h2>
+      <h2>Internal dashboard</h2>
+      <div class="config-note">
+        The dashboard uses the API key configured in the server environment. The key is never sent to the browser. This page and its proxy are restricted to local access; open it at <strong>http://localhost:8000/dashboard</strong>.
+      </div>
+
+      <h2 style="margin-top:24px">Resume</h2>
 
       <div class="dropzone" id="dropzone">
         <div class="dz-icon">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         </div>
         <div class="dz-title">Drop resume here or click to browse</div>
-        <div class="dz-hint">PDF or DOCX · max 10MB</div>
+        <div class="dz-hint">PDF or DOCX · max 5MB</div>
         <input type="file" id="fileInput" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden />
       </div>
 
@@ -545,13 +563,24 @@
       <div class="field">
         <label class="lbl" for="trackSelect">Career track (optional)</label>
         <select id="trackSelect">
-          <option value="">Generic ATS only</option>
+          <option value="">Auto-detect</option>
+          <option value="generic">Generic ATS only</option>
           <option value="deck_officer">Deck Officer</option>
           <option value="marine_engineer">Marine Engineer</option>
           <option value="eto">Electro-Technical Officer (ETO)</option>
-          <option value="gp_rating">GP Rating</option>
-          <option value="cruise_hospitality">Cruise Hospitality</option>
         </select>
+      </div>
+      <div class="field">
+        <label class="lbl" for="targetRank">Target rank (optional)</label>
+        <input type="text" id="targetRank" placeholder="e.g. Third Officer" />
+      </div>
+      <div class="field">
+        <label class="lbl" for="targetCruiseLine">Target cruise line (optional)</label>
+        <input type="text" id="targetCruiseLine" placeholder="e.g. Royal Caribbean" />
+      </div>
+      <div class="field">
+        <label class="lbl" for="jobDescription">Job description (optional)</label>
+        <textarea id="jobDescription" placeholder="Paste a job description to tailor keyword scoring"></textarea>
       </div>
 
       <div class="actions">
@@ -584,12 +613,12 @@
 <div class="toast" id="toast"></div>
 
 <script>
-const BASE_URL = 'http://localhost:8000';
 const POLL_INTERVAL = 3000;
-const MAX_FILE = 10 * 1024 * 1024;
+const MAX_FILE = 5 * 1024 * 1024;
 
 let currentFile = null;
 let pollTimer = null;
+let pollInFlight = false;
 let downloadUrl = null;
 
 const $ = (id) => document.getElementById(id);
@@ -599,8 +628,6 @@ const btnScore = $('btnScore');
 const btnRewrite = $('btnRewrite');
 const resultsBody = $('resultsBody');
 const toast = $('toast');
-
-$('endpointLabel').textContent = BASE_URL;
 
 function showToast(msg) {
   toast.textContent = msg;
@@ -624,7 +651,7 @@ function setFile(file) {
     return;
   }
   if (file.size > MAX_FILE) {
-    showToast('File exceeds 10MB limit.');
+    showToast('File exceeds the API upload limit of 5MB.');
     return;
   }
   currentFile = file;
@@ -665,11 +692,38 @@ dropzone.addEventListener('drop', (e) => {
   if (f) setFile(f);
 });
 
-function buildForm(track) {
+function buildForm() {
   const fd = new FormData();
   fd.append('file', currentFile);
-  if (track) fd.append('career_track', track);
+  const careerTrack = getTrack();
+  const targetRank = $('targetRank').value.trim();
+  const targetCruiseLine = $('targetCruiseLine').value.trim();
+  const jobDescription = $('jobDescription').value.trim();
+  if (careerTrack) fd.append('career_track', careerTrack);
+  if (targetRank) fd.append('target_rank', targetRank);
+  if (targetCruiseLine) fd.append('target_cruise_line', targetCruiseLine);
+  if (jobDescription) fd.append('job_description', jobDescription);
   return fd;
+}
+
+async function apiFetch(path, options = {}) {
+  const response = await fetch(`/dashboard-api${path}`, options);
+  if (!response.ok) {
+    let message = `HTTP ${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      const detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body);
+      if (detail) message += ` — ${detail}`;
+    } catch {
+      const text = await response.text().catch(() => '');
+      if (text) message += ` — ${text.slice(0, 200)}`;
+    }
+    if (response.status === 429) {
+      throw new Error('Rate limit reached. Please wait, then retry manually; this page will not retry automatically.');
+    }
+    throw new Error(message);
+  }
+  return response;
 }
 
 function getTrack() {
@@ -679,10 +733,11 @@ function getTrack() {
 function setBusy(btn, busy, label) {
   if (busy) {
     btn.disabled = true;
-    btn.dataset.orig = btn.innerHTML;
+    if (!btn.dataset.orig) btn.dataset.orig = btn.innerHTML;
     btn.innerHTML = '<span class="spinner"></span> ' + (label || 'Working…');
   } else {
-    btn.innerHTML = btn.dataset.orig;
+    if (btn.dataset.orig) btn.innerHTML = btn.dataset.orig;
+    delete btn.dataset.orig;
     // re-evaluate overall disabled state
     btn.disabled = !currentFile || pollTimer !== null;
   }
@@ -712,6 +767,14 @@ function severityLabel(sev) {
   return 'Suggestion';
 }
 
+function getIssueParts(item) {
+  if (typeof item === 'string') return { severity: 'suggestion', message: item, meta: '' };
+  const severity = item?.severity || item?.level || 'suggestion';
+  const message = item?.message || item?.issue || item?.description || String(item || '');
+  const meta = [item?.category, item?.section, item?.location].filter(Boolean).join(' · ');
+  return { severity, message, meta };
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -719,19 +782,17 @@ function escapeHtml(s) {
 }
 
 function renderScore(data) {
-  const overall = Number(data.overall_score ?? data.score ?? 0);
+  const overall = Number(data.ats_score ?? data.overall_score ?? data.score ?? 0);
   const ats = Number(data.ats_score ?? 0);
-  const mar = Number(data.maritime_score ?? 0);
+  const mar = data.maritime_score == null ? null : Number(data.maritime_score);
   const issues = Array.isArray(data.issues) ? data.issues : [];
 
-  const issuesHtml = issues.length ? issues.map(it => {
-    const sev = it.severity || it.level || 'suggestion';
-    const msg = it.message || it.issue || it.description || '';
-    const meta = [it.category, it.section, it.location].filter(Boolean).join(' · ');
+  const issuesHtml = issues.length ? issues.map(item => {
+    const { severity, message, meta } = getIssueParts(item);
     return `<div class="issue">
-      <span class="badge ${severityBadge(sev)}">${severityLabel(sev)}</span>
+      <span class="badge ${severityBadge(severity)}">${severityLabel(severity)}</span>
       <div class="it-body">
-        <div class="it-msg">${escapeHtml(msg)}</div>
+        <div class="it-msg">${escapeHtml(message)}</div>
         ${meta ? `<div class="it-meta">${escapeHtml(meta)}</div>` : ''}
       </div>
     </div>`;
@@ -756,8 +817,8 @@ function renderScore(data) {
       </div>
       <div class="score-tile tile-mar">
         <div class="st-label">Maritime Score</div>
-        <div class="st-val">${mar}</div>
-        <div class="st-bar"><div class="fill" style="width:${Math.min(100,mar)}%"></div></div>
+        <div class="st-val">${mar == null ? '—' : mar}</div>
+        ${mar == null ? '<div class="st-label" style="margin-top:8px">Not assessed</div>' : `<div class="st-bar"><div class="fill" style="width:${Math.max(0,Math.min(100,mar))}%"></div></div>`}
       </div>
     </div>
 
@@ -786,30 +847,33 @@ function renderRewriteProgress(statusText, pct, indeterminate) {
 }
 
 function renderRewriteDone(data) {
-  const before = Number(data.before_score ?? data.original_score ?? 0);
-  const after = Number(data.after_score ?? data.rewritten_score ?? data.new_score ?? 0);
+  const before = Number(data.score_before ?? data.before_score ?? data.original_score ?? 0);
+  const after = Number(data.score_after ?? data.after_score ?? data.rewritten_score ?? data.new_score ?? 0);
   const delta = after - before;
-  const issues = Array.isArray(data.issues) ? data.issues : [];
+  const issues = Array.isArray(data.issues_fixed) ? data.issues_fixed : [];
 
-  const issuesHtml = issues.length ? issues.map(it => {
-    const sev = it.severity || it.level || 'suggestion';
-    const msg = it.message || it.issue || it.description || '';
-    const meta = [it.category, it.section, it.location].filter(Boolean).join(' · ');
+  const issuesHtml = issues.length ? issues.map(item => {
+    const { severity, message, meta } = getIssueParts(item);
     return `<div class="issue">
-      <span class="badge ${severityBadge(sev)}">${severityLabel(sev)}</span>
+      <span class="badge ${severityBadge(severity)}">${severityLabel(severity)}</span>
       <div class="it-body">
-        <div class="it-msg">${escapeHtml(msg)}</div>
+        <div class="it-msg">${escapeHtml(message)}</div>
         ${meta ? `<div class="it-meta">${escapeHtml(meta)}</div>` : ''}
       </div>
     </div>`;
   }).join('') : '';
 
-  const dlUrl = data.download_url || data.rewritten_url || data.file_url || null;
-  let dlAbs = null;
-  if (dlUrl) {
-    dlAbs = dlUrl.startsWith('http') ? dlUrl : (BASE_URL.replace(/\/$/,'') + '/' + dlUrl.replace(/^\//,''));
-  }
-  downloadUrl = dlAbs;
+  downloadUrl = data.download_url || null;
+  const qualityMessage = data.rewrite_quality === 'partial'
+    ? 'Resume improved but may need manual review.'
+    : data.rewrite_quality === 'none'
+      ? 'The resume score did not improve. Please review the output manually.'
+      : data.rewrite_quality === 'full'
+        ? 'The rewrite improved the score by at least 15 points.'
+        : '';
+  const aiMessage = data.ai_rewrite === false
+    ? (data.note || 'AI rewriting was unavailable; original resume content was preserved.')
+    : qualityMessage;
 
   const deltaText = (delta > 0 ? '+' : '') + delta;
   const deltaClass = delta > 0 ? 'up' : (delta < 0 ? 'down' : '');
@@ -829,13 +893,15 @@ function renderRewriteDone(data) {
       </div>
     </div>
 
-    ${dlAbs ? `
+    ${aiMessage ? `<div class="config-note" role="status">${escapeHtml(aiMessage)}</div>` : ''}
+
+    ${downloadUrl ? `
     <div class="download-bar">
       <div class="dl-text">
-        <strong>Rewritten resume ready</strong>
-        <div class="dl-sub">Click to download the optimized file</div>
+        <strong>${data.ai_rewrite === false ? 'Resume output ready' : 'Rewritten resume ready'}</strong>
+        <div class="dl-sub">DOCX · download link expires with the job result</div>
       </div>
-      <button class="btn-download" id="btnDownload">
+      <button class="btn-download" id="btnDownload" type="button">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         Download
       </button>
@@ -848,8 +914,27 @@ function renderRewriteDone(data) {
   `;
 
   const dlBtn = document.getElementById('btnDownload');
-  if (dlBtn) dlBtn.addEventListener('click', () => {
-    if (downloadUrl) window.open(downloadUrl, '_blank');
+  if (dlBtn) dlBtn.addEventListener('click', async () => {
+    if (!downloadUrl) return;
+    dlBtn.disabled = true;
+    try {
+      const path = downloadUrl.startsWith('http')
+        ? new URL(downloadUrl).pathname + new URL(downloadUrl).search
+        : downloadUrl;
+      const response = await apiFetch(path);
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = `MYC_ATS_Resume_${String(data.job_id || '').slice(0, 8) || 'resume'}.docx`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch (error) {
+      showToast(`Download failed: ${error.message || 'network error'}`);
+    } finally {
+      dlBtn.disabled = false;
+    }
   });
 }
 
@@ -870,14 +955,10 @@ async function doScore() {
   setBusy(btnScore, true, 'Scoring…');
   btnRewrite.disabled = true;
   try {
-    const res = await fetch(`${BASE_URL}/ats/score`, {
+    const res = await apiFetch('/ats/score', {
       method: 'POST',
-      body: buildForm(getTrack())
+      body: buildForm()
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? ' — ' + txt.slice(0,200) : ''}`);
-    }
     const data = await res.json();
     renderScore(data);
   } catch (err) {
@@ -890,7 +971,8 @@ async function doScore() {
 }
 
 function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  pollInFlight = false;
   btnScore.disabled = !currentFile;
   btnRewrite.disabled = !currentFile;
 }
@@ -900,17 +982,13 @@ async function doRewrite() {
   setBusy(btnRewrite, true, 'Submitting…');
   btnScore.disabled = true;
   try {
-    const res = await fetch(`${BASE_URL}/ats/submit`, {
+    const res = await apiFetch('/ats/submit', {
       method: 'POST',
-      body: buildForm(getTrack())
+      body: buildForm()
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? ' — ' + txt.slice(0,200) : ''}`);
-    }
     const data = await res.json();
-    const jobId = data.job_id || data.id || data.jobId;
-    if (!jobId) throw new Error('No job_id returned from /ats/submit');
+    const jobId = data.job_id;
+    if (!jobId) throw new Error('The API did not return a job_id.');
     setBusy(btnRewrite, true, 'Rewriting…');
     renderRewriteProgress('Submitted, waiting for progress…', 0, true);
     startPolling(jobId);
@@ -923,35 +1001,42 @@ async function doRewrite() {
 }
 
 function startPolling(jobId) {
-  pollTimer = setInterval(async () => {
+  const poll = async () => {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
-      const res = await fetch(`${BASE_URL}/ats/status/${jobId}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const res = await apiFetch(`/ats/status/${encodeURIComponent(jobId)}`);
       const data = await res.json();
       const status = (data.status || '').toLowerCase();
       const pct = data.progress != null ? Number(data.progress) : null;
 
-      if (status === 'completed' || status === 'done' || status === 'success') {
+      if (status === 'done') {
         stopPolling();
         setBusy(btnRewrite, false);
-        renderRewriteDone(data);
-      } else if (status === 'failed' || status === 'error') {
+        const resultResponse = await apiFetch(`/ats/result/${encodeURIComponent(jobId)}`);
+        renderRewriteDone(await resultResponse.json());
+      } else if (status === 'failed') {
         stopPolling();
         setBusy(btnRewrite, false);
-        renderError(data.error || data.message || 'Rewrite job failed');
-        showToast('Rewrite job failed');
+        const errorMessage = data.error || 'The resume rewrite job failed.';
+        renderError(errorMessage);
+        showToast(errorMessage);
       } else {
-        const label = data.message || data.stage || (status === 'pending' ? 'Queued…' : 'Processing…');
+        const label = data.current_stage || (status === 'queued' ? 'Queued…' : 'Processing…');
         const indet = (pct == null || isNaN(pct));
         renderRewriteProgress(label, indet ? null : Math.max(0, Math.min(100, pct)), indet);
+        pollTimer = setTimeout(poll, POLL_INTERVAL);
       }
     } catch (err) {
       stopPolling();
       setBusy(btnRewrite, false);
       renderError(err.message || 'Polling failed');
       showToast('Status polling failed');
+    } finally {
+      pollInFlight = false;
     }
-  }, POLL_INTERVAL);
+  };
+  poll();
 }
 
 btnScore.addEventListener('click', doScore);

@@ -12,6 +12,8 @@ X-API-Key: <your MYC_API_KEY>
 
 Missing or wrong key → `403 Forbidden`.
 
+For internal testing, the service also serves the interactive dashboard at `GET /dashboard` on the same origin. The local-only dashboard proxy reads `MYC_API_KEY` from the server environment and never sends the key to the browser. Do not make this dashboard proxy public; production client applications should keep API keys in a trusted backend.
+
 ## Two ways to score a resume
 
 There are two separate flows, and picking the right one matters:

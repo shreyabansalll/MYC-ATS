@@ -996,6 +996,149 @@ def test_root_endpoint_lists_every_real_candidate_facing_route():
         assert real_route in listed, f'Expected {real_route!r} to be listed at GET /, got: {r.json()["endpoints"]}'
 
 
+def test_dashboard_is_served_by_the_api():
+    import asyncio
+    import httpx
+    import api
+
+    async def request_dashboard():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            return await client.get('/dashboard')
+
+    response = asyncio.run(request_dashboard())
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('text/html')
+    assert 'server environment' in response.text
+    assert 'http://localhost:8000' in response.text
+    assert 'apiKeyInput' not in response.text
+
+
+def test_dashboard_and_proxy_are_not_available_remotely(monkeypatch):
+    import asyncio
+    import httpx
+    import api
+
+    monkeypatch.setattr(api, 'API_KEY', 'dashboard-proxy-test-key')
+
+    async def request_remote_dashboard():
+        transport = httpx.ASGITransport(app=api.app, client=('198.51.100.5', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            dashboard = await client.get('/dashboard')
+            proxy = await client.get(
+                '/dashboard-api/ats/status/00000000-0000-0000-0000-000000000000',
+            )
+            return dashboard, proxy
+
+    dashboard, proxy = asyncio.run(request_remote_dashboard())
+    assert dashboard.status_code == 403
+    assert proxy.status_code == 403
+
+    async def request_with_untrusted_host():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://attacker.example') as client:
+            return await client.get('/dashboard')
+
+    assert asyncio.run(request_with_untrusted_host()).status_code == 403
+
+    async def request_cross_origin_post():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            return await client.post(
+                '/dashboard-api/ats/score',
+                headers={'Origin': 'http://attacker.example'},
+            )
+
+    assert asyncio.run(request_cross_origin_post()).status_code == 403
+
+    async def request_cross_origin_get():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            return await client.get(
+                '/dashboard-api/ats/status/00000000-0000-0000-0000-000000000000',
+                headers={'Origin': 'http://attacker.example'},
+            )
+
+    assert asyncio.run(request_cross_origin_get()).status_code == 403
+
+
+def test_dashboard_proxy_uses_server_api_key(monkeypatch):
+    import asyncio
+    import httpx
+    import api
+
+    monkeypatch.setattr(api, 'API_KEY', 'dashboard-proxy-test-key')
+
+    async def request_proxy():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            return await client.get(
+                '/dashboard-api/ats/status/00000000-0000-0000-0000-000000000000',
+            )
+
+    response = asyncio.run(request_proxy())
+
+    assert response.status_code == 404
+    assert response.json()['detail'] == 'Job not found'
+
+
+def test_dashboard_proxy_forwards_resume_upload_without_browser_key(monkeypatch):
+    import asyncio
+    import httpx
+    import api
+
+    monkeypatch.setattr(api, 'API_KEY', 'dashboard-proxy-test-key')
+    monkeypatch.setattr(
+        api,
+        '_extract_with_timeout',
+        lambda path, ext: {'raw_text': 'Candidate resume text', 'structural_issues': []},
+    )
+    monkeypatch.setattr(
+        api,
+        'parse_resume',
+        lambda raw_text: {
+            'name': 'Test Candidate',
+            'contact': {},
+            'rank': '',
+            'skills': [],
+            'sections': {},
+            'raw_text': raw_text,
+        },
+    )
+    received_options = {}
+
+    def fake_score_layers(extracted, parsed, **options):
+        received_options.update(options)
+        return {
+            'generic': {
+                'total_score': 72,
+                'grade': 'GOOD',
+                'issues': [],
+                'keyword_data': {},
+            },
+            'maritime': None,
+            'overlay': False,
+        }
+
+    monkeypatch.setattr(api, 'score_layers', fake_score_layers)
+
+    async def post_score_through_proxy():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            return await client.post(
+                '/dashboard-api/ats/score',
+                headers={'Origin': 'http://localhost'},
+                files={'file': ('resume.pdf', b'%PDF-1.4\nmock', 'application/pdf')},
+                data={'career_track': 'generic', 'job_description': 'Deck officer'},
+            )
+
+    response = asyncio.run(post_score_through_proxy())
+    assert response.status_code == 200, response.text
+    assert response.json()['ats_score'] == 72
+    assert received_options['career_track'] == 'generic'
+    assert received_options['job_description'] == 'Deck officer'
+
+
 def test_score_endpoint_includes_the_candidate_name(monkeypatch):
     """
     Real gap fixed after manual testing: the initial version of this

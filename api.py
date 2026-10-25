@@ -11,6 +11,7 @@
 
 import os
 import re
+import ipaddress
 import uuid
 import copy
 import shutil
@@ -25,9 +26,11 @@ import queue
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlsplit
 
+import httpx
 from fastapi import (
-    FastAPI, UploadFile, File, Form,
+    FastAPI, UploadFile, File, Form, Response,
     BackgroundTasks, HTTPException, Depends, Request
 )
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,6 +41,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, event
 from sqlalchemy.orm import DeclarativeBase, Session
+from starlette.datastructures import UploadFile as StarletteUploadFile
 import sentry_sdk
 
 from config import OUTPUT_DIR
@@ -1029,15 +1033,159 @@ def run_pipeline(
 
 # ── Endpoints ─────────────────────────────────────────────────────────
 
+def _require_loopback_dashboard_client(request: Request) -> None:
+    client_host = request.client.host if request.client else ''
+    requested_host = request.url.hostname or ''
+    try:
+        is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_loopback = False
+    try:
+        requested_host_is_local = ipaddress.ip_address(requested_host).is_loopback
+    except ValueError:
+        requested_host_is_local = requested_host.lower() == 'localhost'
+    if not is_loopback or not requested_host_is_local:
+        raise HTTPException(403, 'The internal dashboard is only available from this server')
+    origin = request.headers.get('origin')
+    if origin:
+        parsed_origin = urlsplit(origin)
+        if (
+            parsed_origin.scheme != request.url.scheme
+            or parsed_origin.netloc.lower() != request.headers.get('host', '').lower()
+        ):
+            raise HTTPException(403, 'Cross-origin dashboard requests are not allowed')
+    elif request.method == 'POST':
+        raise HTTPException(403, 'Dashboard submissions must originate from this page')
+
+
+@app.get('/dashboard', include_in_schema=False)
+def dashboard(request: Request):
+    """Serve the internal API testing dashboard from this API origin."""
+    _require_loopback_dashboard_client(request)
+    return FileResponse(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html'),
+        media_type='text/html',
+    )
+
+
+@app.api_route(
+    '/dashboard-api/{api_path:path}',
+    methods=['GET', 'POST'],
+    include_in_schema=False,
+)
+async def dashboard_api_proxy(api_path: str, request: Request):
+    """Forward local dashboard requests using the server-side API key."""
+    _require_loopback_dashboard_client(request)
+    if not API_KEY:
+        raise HTTPException(503, 'Service not configured — MYC_API_KEY missing')
+
+    safe_path = '/' + api_path
+    is_score_or_submit = safe_path in {'/ats/score', '/ats/submit'}
+    is_job_read = re.fullmatch(r'/ats/(status|result|download)/[0-9a-fA-F-]{36}', safe_path)
+    if not (
+        (request.method == 'POST' and is_score_or_submit)
+        or (request.method == 'GET' and is_job_read)
+    ):
+        raise HTTPException(404, 'Dashboard proxy route not found')
+
+    multipart_chunks: list[bytes] = []
+    request_headers = {'X-API-Key': API_KEY}
+    if request.method == 'POST':
+        async with request.form() as form:
+            upload = form.get('file')
+            if not isinstance(upload, StarletteUploadFile):
+                raise HTTPException(422, 'A resume file is required')
+            if upload.size is not None and upload.size > MAX_FILE_BYTES:
+                raise HTTPException(413, f'File exceeds the {MAX_FILE_MB}MB limit')
+            allowed_fields = {
+                'job_description', 'target_rank', 'target_cruise_line', 'career_track',
+            }
+            data = [
+                (key, value)
+                for key, value in form.multi_items()
+                if key in allowed_fields and isinstance(value, str)
+            ]
+            file_content = await upload.read()
+            filename = (upload.filename or 'resume').replace('\\', '_').replace('"', '_')
+            filename = filename.replace('\r', '_').replace('\n', '_')
+            file_type = (
+                'application/pdf' if filename.lower().endswith('.pdf')
+                else 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                if filename.lower().endswith('.docx')
+                else 'application/octet-stream'
+            )
+            boundary = f'marine-ats-{uuid.uuid4().hex}'
+            multipart_chunks = [
+                (
+                    f'--{boundary}\r\n'
+                    f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                ).encode('utf-8')
+                + value.encode('utf-8')
+                + b'\r\n'
+                for key, value in data
+            ]
+            multipart_chunks.extend([
+                (
+                    f'--{boundary}\r\n'
+                    f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                    f'Content-Type: {file_type}\r\n\r\n'
+                ).encode('utf-8'),
+                file_content,
+                b'\r\n',
+                f'--{boundary}--\r\n'.encode('ascii'),
+            ])
+            request_headers['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+        if 'format' in request.query_params:
+            raise HTTPException(400, 'Unexpected query parameter')
+    elif safe_path.startswith('/ats/download/'):
+        invalid_params = set(request.query_params) - {'format'}
+        if invalid_params:
+            raise HTTPException(400, 'Unsupported download query parameter')
+
+    transport = httpx.ASGITransport(app=app)
+
+    async def upload_stream():
+        for chunk in multipart_chunks or []:
+            yield chunk
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url='http://marine-ats.internal',
+        ) as client:
+            upstream = await client.request(
+                request.method,
+                safe_path,
+                params=request.query_params if request.method == 'GET' else None,
+                content=upload_stream() if request.method == 'POST' else None,
+                headers=request_headers,
+            )
+    except httpx.HTTPError as exc:
+        log.error(f'"dashboard_proxy_error":"{redact_pii(str(exc))}"')
+        raise HTTPException(502, 'Could not reach the ATS API handler')
+
+    headers = {}
+    if 'content-disposition' in upstream.headers:
+        headers['Content-Disposition'] = upstream.headers['content-disposition']
+    media_type = upstream.headers.get('content-type')
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
 @app.get('/', summary='API root — welcome and documentation')
 def root(request: Request):
     """Welcome endpoint. Links to API documentation and health check."""
     base = str(request.base_url).rstrip('/')
     return {
-        'service': 'Marine Your Career — ATS API',
+        'service': 'Marine Your Career - ATS API',
         'version': '2.0.0',
         'description': 'Resume scoring and optimisation for seafarers.',
         'documentation': f'{base}/docs',
+        'dashboard': f'{base}/dashboard',
         'health_check': f'{base}/health',
         'endpoints': {
             'submit_resume': 'POST /ats/submit',
