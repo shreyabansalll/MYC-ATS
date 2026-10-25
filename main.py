@@ -1,13 +1,15 @@
 # main.py
+import argparse
 import sys
 import os
 import json
+import copy
 import logging
 import warnings
 warnings.filterwarnings('ignore', message='.*FontBBox.*')
 logging.getLogger('pdfminer').setLevel(logging.ERROR)
 
-from pipeline.extractor import extract_text
+from pipeline.extractor import extract_text, extract_photo
 from pipeline.parser import parse_resume
 from pipeline.scorer import score_resume
 from pipeline.maritime import maritime_score
@@ -71,6 +73,7 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         job_description=job_description,
         rank=candidate_profile.rank_detected,
         license_rank=candidate_profile.license_rank,
+        sea_months=candidate_profile.sea_months,
     )
 
     if 'error' in rewritten:
@@ -85,17 +88,37 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         }
 
     # Inject fields rewriter doesn't carry
-    rewritten['name']    = candidate_profile.name
-    rewritten['contact'] = candidate_profile.contact.model_dump()
-    rewritten['rank']    = candidate_profile.rank_detected
+    rewritten['name']         = candidate_profile.name
+    rewritten['contact']      = candidate_profile.contact.model_dump()
+    rewritten['rank']         = candidate_profile.rank_detected
+    rewritten['sea_months']   = maritime['sea_months']
+    rewritten['vessel_types'] = maritime['vessel_types']
 
     print(f'      ✓  Rewrite complete')
     print(f'         Issues to fix: {len(rewritten.get("issues_fixed", []))}')
 
     # ── Stage 6: Generate DOCX ───────────────────────────────────────
+    # Two variants from the same rewrite (no duplicate Groq call): a
+    # photo-free default for automated/bulk ATS upload channels (existing
+    # filename/behavior, unchanged), and a photo-included variant for
+    # direct human/recruiter-facing submission. Photo extraction is
+    # best-effort and PDF-only (see extract_photo) — gracefully produces
+    # no photo variant path when the source has none, rather than erroring.
     print('\n[6/6] Generating ATS-clean DOCX...')
     job_id    = os.path.splitext(os.path.basename(file_path))[0]
-    docx_path = generate_docx(rewritten, job_id=job_id)
+    # generate_docx()'s enforce_length_limits() mutates nested dicts/lists
+    # in place (e.g. each role's job['bullets'] gets sliced to a cap) — a
+    # shallow copy still shares those inner objects, so the first call's
+    # trimming would silently bleed into the second variant. deepcopy
+    # gives each call its own fully independent content tree.
+    docx_path = generate_docx(copy.deepcopy(rewritten), job_id=job_id)
+
+    photo_bytes    = extract_photo(file_path) if ext == 'pdf' else None
+    docx_photo_path = None
+    if photo_bytes:
+        docx_photo_path = generate_docx(
+            copy.deepcopy(rewritten), job_id=job_id, include_photo=True, photo_bytes=photo_bytes,
+        )
 
     # Re-score to verify improvement
     extracted2 = extract_text(docx_path, 'docx')
@@ -147,7 +170,8 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
             'missing_certs': maritime['missing_certs'],
         },
         'output': {
-            'docx_path':    docx_path,
+            'docx_path':       docx_path,
+            'docx_photo_path': docx_photo_path,
         },
         'issues_fixed':    rewritten.get('issues_fixed', []),
         'issues_remaining': ats2['issues'],
@@ -155,12 +179,19 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('Usage: venv/bin/python main.py <resume_path> [job_description]')
-        sys.exit(1)
-
-    file_path = sys.argv[1]
-    job_desc  = sys.argv[2] if len(sys.argv) > 2 else ''
+    parser = argparse.ArgumentParser(
+        description='Score and rewrite a seafarer resume.'
+    )
+    parser.add_argument('resume_path', help='Path to a PDF or DOCX resume')
+    parser.add_argument(
+        'job_description',
+        nargs='?',
+        default='',
+        help='Optional job description for keyword scoring',
+    )
+    args = parser.parse_args()
+    file_path = args.resume_path
+    job_desc = args.job_description
     report    = run_pipeline(file_path, job_desc)
 
     if 'error' in report:
@@ -181,7 +212,11 @@ if __name__ == '__main__':
     print(f'Improvement  : {report["scores"]["improvement"]:+d} pts')
     print(f'Maritime Before : {report["scores"]["maritime_before"]} — {report["scores"]["maritime_grade_before"]}')
     print(f'Maritime After  : {report["scores"]["maritime_after"]} — {report["scores"]["maritime_grade_after"]}')
-    print(f'\nOutput DOCX  : {report["output"]["docx_path"]}')
+    print(f'\nOutput DOCX (photo-free): {report["output"]["docx_path"]}')
+    if report['output']['docx_photo_path']:
+        print(f'Output DOCX (with photo): {report["output"]["docx_photo_path"]}')
+    else:
+        print(f'Output DOCX (with photo): none — no extractable photo in source')
     if report['issues_fixed']:
         print(f'\nISSUES FIXED ({len(report["issues_fixed"])}):')
         for i in report['issues_fixed']:

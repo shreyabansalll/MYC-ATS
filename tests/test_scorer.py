@@ -178,3 +178,112 @@ def test_score_resume_combines_components_and_grades_correctly():
     assert result['breakdown'] == {'format': 40, 'sections': 20, 'keywords': 20}
     assert result['total_score'] == 80
     assert result['grade'] == 'GOOD'  # 75 <= 80 < 85
+
+
+# ── Priority 4: R37 LinkedIn leniency for junior/rating ranks ──────────
+
+def test_score_format_linkedin_deducted_for_senior_rank_without_it():
+    score, issues = score_format(
+        {'raw_text': 'Chief Officer with 8 years of sea service.', 'structural_issues': []},
+        {'contact': {'email': 'a@b.com', 'phone': '+1 234 567 8900'}},
+    )
+    assert score == 38  # 40 - 2 (linkedin)
+    assert any('LINKEDIN_URL_MISSING' in i for i in issues)
+
+
+def test_score_format_linkedin_not_deducted_for_junior_rating_rank():
+    """
+    Real bug fixed: junior/rating ranks (cadets, oilers, ABs) job-hunt
+    through manning agencies, not LinkedIn -- confirmed this was
+    deducting uniformly regardless of rank before the fix.
+    """
+    score, issues = score_format(
+        {'raw_text': 'Deck Cadet seeking first sea service contract, 6 months experience.', 'structural_issues': []},
+        {'contact': {'email': 'a@b.com', 'phone': '+1 234 567 8900'}},
+    )
+    assert score == 40, f'Expected no LinkedIn deduction for a junior rank, got score={score}, issues={issues}'
+    assert not any('LINKEDIN_URL_MISSING' in i for i in issues)
+
+
+# ── Priority 4: R32 quantified-achievement detection, both number/unit
+#    orderings ──────────────────────────────────────────────────────────
+
+def test_score_format_credits_grt_written_unit_before_number():
+    """
+    Real bug fixed: "GRT 62795" (unit before number) is the convention
+    services/ai_client.py's own rewrite prompt enforces (Rule 2b's worked
+    example uses "GRT 199631") -- the original regex required the number
+    to come FIRST, so it could never credit a GRT mention at all, the
+    single most common quantified fact in these resumes.
+    """
+    score, issues = score_format(
+        {'raw_text': 'Served aboard M.T Example Star, GRT 62795, as Electrical Cadet.', 'structural_issues': []},
+        {'contact': FULL_CONTACT},
+    )
+    assert not any('NO_QUANTIFIED_ACHIEVEMENTS' in i for i in issues), (
+        f'Expected a GRT mention to count as quantified, got issues={issues}'
+    )
+
+
+def test_score_format_still_credits_number_before_unit():
+    """The original ordering ("20% improvement", "15 years") must keep working."""
+    score, issues = score_format(
+        {'raw_text': 'Improved fuel efficiency by 20% over 15 months.', 'structural_issues': []},
+        {'contact': FULL_CONTACT},
+    )
+    assert not any('NO_QUANTIFIED_ACHIEVEMENTS' in i for i in issues)
+
+
+def test_score_format_flags_when_truly_no_numbers():
+    score, issues = score_format(
+        {'raw_text': 'Responsible for maintenance and safety compliance.', 'structural_issues': []},
+        {'contact': FULL_CONTACT},
+    )
+    assert any('NO_QUANTIFIED_ACHIEVEMENTS' in i for i in issues)
+
+
+# ── Priority 4: R21 reverse-chronological false positive ───────────────
+
+def test_score_sections_single_role_not_flagged_non_chronological():
+    """
+    Real bug fixed, confirmed on real generated output (Mrinal Thapa,
+    single role): the old check compared the very first 4-digit year in
+    the whole experience block to the very last one. For a single role
+    written as "09/2024 - 05/2025", that's the role's own start year vs
+    its own end year -- start < end is true by definition for a role
+    that hasn't ended before it began, so every single-role candidate
+    was flagged as "non-chronological" unconditionally.
+    """
+    parsed = {'sections': {'experience': (
+        'Electrical Cadet — Example Ship Management — 09/2024 - 05/2025\n'
+        'Assisted with maintenance. Operated equipment. Conducted inspections.'
+    )}, 'skills': SKILLS_LIST}
+    _, issues = score_sections(parsed, '')
+    assert not any('EXPERIENCE_NOT_REVERSE_CHRONOLOGICAL' in i for i in issues), (
+        f'Expected no chronology flag for a single role, got: {issues}'
+    )
+
+
+def test_score_sections_genuinely_reverse_chronological_not_flagged():
+    parsed = {'sections': {'experience': (
+        'Second Officer — Newer Co — 06/2023 - 12/2025\n'
+        'Led navigation team. Operated ECDIS. Conducted drills.\n'
+        'Third Officer — Older Co — 01/2018 - 05/2020\n'
+        'Assisted watchkeeping. Maintained charts. Supported operations.'
+    )}, 'skills': SKILLS_LIST}
+    _, issues = score_sections(parsed, '')
+    assert not any('EXPERIENCE_NOT_REVERSE_CHRONOLOGICAL' in i for i in issues)
+
+
+def test_score_sections_genuinely_forward_chronological_still_flagged():
+    """A real ordering violation (oldest role listed first) must still be caught."""
+    parsed = {'sections': {'experience': (
+        'Third Officer — Older Co — 01/2018 - 05/2020\n'
+        'Assisted watchkeeping. Maintained charts. Supported operations.\n'
+        'Second Officer — Newer Co — 06/2023 - 12/2025\n'
+        'Led navigation team. Operated ECDIS. Conducted drills.'
+    )}, 'skills': SKILLS_LIST}
+    _, issues = score_sections(parsed, '')
+    assert any('EXPERIENCE_NOT_REVERSE_CHRONOLOGICAL' in i for i in issues), (
+        f'Expected a real forward-chronological ordering to still be flagged, got: {issues}'
+    )

@@ -19,10 +19,31 @@ echo "=== Marine Your Career ATS — Production Deploy ==="
 # environment -- without it this fails with "ensurepip is not available"
 # on an otherwise-correct box. Installed proactively rather than only on
 # failure, since apt install is a no-op (fast) if already present.
+#
+# Real gap fixed, confirmed by walking through this script against a
+# genuinely bare VPS assumption: `sudo apt-get` unconditionally assumed
+# `sudo` itself is installed. Ubuntu Cloud images ship it, but a bare
+# Debian VPS (root login, no sudo package) does NOT -- "sudo: command
+# not found" would kill this script on `set -e` before it ever got to
+# installing anything. Root doesn't need sudo at all; a non-root user
+# without sudo installed is a real dead end this script can't fix for
+# them, but it can at least avoid failing on the CORRECT case (root).
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        echo "ERROR: not running as root and 'sudo' isn't installed."
+        echo "       Either run this script as root, or install sudo first"
+        echo "       (as root: apt-get install -y sudo), then re-run."
+        exit 1
+    fi
+fi
+
 if command -v apt-get >/dev/null 2>&1; then
     if ! dpkg -s python3-venv >/dev/null 2>&1; then
         echo "Installing python3-venv (required for python3 -m venv)..."
-        sudo apt-get update -qq && sudo apt-get install -y python3-venv
+        $SUDO apt-get update -qq && $SUDO apt-get install -y python3-venv
     fi
 fi
 
@@ -65,6 +86,21 @@ if grep -q "generate-a-different-strong-random-key" .env; then
     exit 1
 fi
 
+# GROQ_API_KEY left as env_template.txt's literal placeholder is a WARN,
+# not a hard exit -- unlike MYC_API_KEY/MYC_ADMIN_KEY, a missing/placeholder
+# Groq key doesn't crash the app (api.py starts fine; every Stage 5 AI
+# rewrite call just fails and falls back to "original content preserved"
+# per config.py's own warn-don't-crash pattern). Real, deliberate use
+# case as of POST /ats/score: this service can be deployed and used for
+# scoring-only with no working Groq key at all -- don't block that.
+if grep -q "your-groq-api-key-here" .env; then
+    echo "WARNING: GROQ_API_KEY is still set to its placeholder value in .env"
+    echo "         The service will start and /ats/score will work fine, but"
+    echo "         every /ats/submit AI rewrite will fail and fall back to"
+    echo "         unmodified original content. Set a real key before relying"
+    echo "         on the rewrite feature."
+fi
+
 # 3. Create required directories
 # TMP_DIR defaults to /tmp/ycm-ats (matching api.py's own default), but
 # an operator can override it in .env -- read the configured value here
@@ -73,6 +109,16 @@ TMP_DIR_CONFIGURED=$(grep -E '^TMP_DIR=' .env | cut -d '=' -f2- || true)
 mkdir -p data/outputs "${TMP_DIR_CONFIGURED:-/tmp/ycm-ats}"
 
 # 4. Start API (2 workers — safe for BackgroundTasks + SQLite WAL)
+#
+# NOTE: this runs uvicorn directly in the foreground — it exits the
+# moment this shell session ends, with no auto-restart on crash. For a
+# real deploy, use the systemd unit at marine-ats.service instead (see
+# its header comments for the paths/user to adjust first):
+#   sudo cp marine-ats.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now marine-ats
+# Run this script's steps 1-3 first either way — the unit file assumes
+# venv/ and .env already exist at the deploy path.
 echo "Starting API on port 8000..."
 uvicorn api:app \
     --host 0.0.0.0 \

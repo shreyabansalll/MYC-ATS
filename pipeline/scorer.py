@@ -5,6 +5,7 @@
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from pipeline.maritime import detect_rank
 
 STOP_WORDS = {
     'the','and','for','are','was','with','this','that','have',
@@ -23,14 +24,36 @@ PASSIVE_PATTERNS = [
 
 PERSONAL_PRONOUNS = [r'\bI\b', r'\bmy\b', r'\bwe\b', r'\bour\b', r'\bme\b']
 
+# Aligned with the verb vocabulary services/ai_client.py's rewrite
+# prompt (Rule 2) actually instructs the AI to use, plus a few more
+# confirmed on real generated output ("Served aboard...", "Assisted
+# the Electrical Officer...", "Gained hands-on experience...") --
+# these are genuinely strong, specific verbs, not filler, but weren't
+# in the original list, so real compliant output was under-scored on
+# FEW_ACTIVE_VERBS_IN_EXPERIENCE for reasons unrelated to actual quality.
 ACTIVE_VERBS = [
     'led','managed','built','developed','designed','implemented',
     'delivered','coordinated','executed','achieved','improved',
     'reduced','increased','trained','supervised','operated',
     'maintained','conducted','performed','established',
+    'commanded','directed','navigated','oversaw','inspected',
+    'monitored','diagnosed','repaired','enforced','streamlined',
+    'served','assisted','gained','ensured','provided','supported',
 ]
 
 STANDARD_FONTS = ['arial','calibri','times new roman','helvetica','garamond','cambria','georgia']
+
+# Ranks realistically job-hunting through manning agencies/crewing
+# platforms rather than LinkedIn-driven recruiting — a missing LinkedIn
+# URL isn't the same signal for a deck cadet as it is for a Chief
+# Officer. Mirrors generator.py's SINGLE_PAGE_RANKS (same population:
+# junior/rating ranks), kept as its own local copy rather than a shared
+# import so scorer.py's scoring-policy list isn't coupled to
+# generator.py's page-layout list changing for unrelated reasons.
+JUNIOR_RANKS_LINKEDIN_EXEMPT = {
+    'deck cadet', 'engine cadet', 'oiler', 'motorman',
+    'fitter', 'ab seaman', 'able seaman', 'bosun', 'jwko',
+}
 
 
 def score_resume(extracted: dict, parsed: dict, job_description: str = '') -> dict:
@@ -82,8 +105,18 @@ def score_format(extracted: dict, parsed: dict) -> tuple:
         score -= 3
         issues.append('FORMAT: PHONE_NOT_FOUND (-3pts) [R16]')
     if not contact.get('linkedin'):
-        score -= 2
-        issues.append('FORMAT: LINKEDIN_URL_MISSING (-2pts) [R37]')
+        # Junior/rating ranks job-hunt through manning agencies, not a
+        # LinkedIn presence — penalizing a deck cadet for not having one
+        # is a fair signal for a Chief Officer but not for this
+        # population. detect_rank() runs on the same raw resume text
+        # score_format already has, independent of the maritime-scoring
+        # stage that normally computes rank (which hasn't run yet at
+        # this point in the pipeline).
+        if detect_rank(raw) in JUNIOR_RANKS_LINKEDIN_EXEMPT:
+            pass
+        else:
+            score -= 2
+            issues.append('FORMAT: LINKEDIN_URL_MISSING (-2pts) [R37]')
 
     bad_chars = ['★','➤','☑','■','◆','✓','●','→','✗']
     if any(c in raw for c in bad_chars):
@@ -117,8 +150,16 @@ def score_format(extracted: dict, parsed: dict) -> tuple:
             score -= 2
             issues.append(f'FORMAT: SPELLING_ERROR "{wrong}" → "{correct}" (-2pts) [R38]')
 
+    # Two number/unit orderings, not one: "GRT 62795" (unit before number)
+    # is the convention this codebase's own rewrite prompt enforces (see
+    # services/ai_client.py Rule 2b's worked example, "GRT 199631") —
+    # the original number-first pattern alone could never credit a GRT
+    # mention at all, since GRT/DWT are essentially always written unit-
+    # first in real vessel specs, unlike "%"/"years"/"crew" which are
+    # naturally number-first ("15 years", "20 crew").
     has_numbers = bool(re.search(
-        r'\d+\s*(%|years?|months?|vessels?|crew|GRT|DWT|million|thousand)',
+        r'\d+\s*(%|years?|months?|vessels?|crew|GRT|DWT|million|thousand)'
+        r'|\b(?:GRT|DWT)\s*[:\-]?\s*\d',
         raw, re.IGNORECASE
     ))
     if not has_numbers:
@@ -233,11 +274,26 @@ def score_sections(parsed: dict, raw_text: str = '') -> tuple:
         if active_verb_count < 3:
             issues.append('SECTION: FEW_ACTIVE_VERBS_IN_EXPERIENCE [R31]')
 
-        years = re.findall(r'\b(20\d{2})\b', experience)
-        if years and len(years) >= 2:
-            years_int = [int(y) for y in years]
-            if years_int[0] < years_int[-1]:
-                issues.append('SECTION: EXPERIENCE_NOT_REVERSE_CHRONOLOGICAL [R21]')
+        # Bug fixed: the previous check took every 4-digit year anywhere
+        # in the block (start AND end years, from every role) and just
+        # compared the very first one found to the very last one found.
+        # For a role written as "09/2024 - 05/2025", that's comparing the
+        # role's own start year to its own end year — which is >
+        # by definition for a role that hasn't ended before it began, so
+        # a candidate with exactly ONE role was flagged as
+        # "non-chronological" on every single resume, unconditionally.
+        # Confirmed on real output (Mrinal Thapa, single role).
+        # Reverse-chronological order is a property of the ORDER roles
+        # are listed in relative to each other, not of any one role's own
+        # date range — so this only takes each range's START year (via
+        # the trailing '-'/'–' that anchors it as a start, not an end)
+        # and only flags when 2+ such ranges exist and are out of
+        # descending order.
+        start_years = [int(y) for y in re.findall(r'\d{2}/(\d{4})\s*[-–]', experience)]
+        if len(start_years) >= 2 and any(
+            start_years[i] < start_years[i + 1] for i in range(len(start_years) - 1)
+        ):
+            issues.append('SECTION: EXPERIENCE_NOT_REVERSE_CHRONOLOGICAL [R21]')
 
     # Certifications acronym format
     certs = sections.get('certifications', '')

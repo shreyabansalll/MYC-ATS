@@ -17,3 +17,16 @@ MAX_FILE_MB=5
 JOB_TTL_HOURS=48
 TMP_DIR=/tmp/ycm-ats
 ALLOWED_ORIGINS=https://marineYourCareer.com,https://app.marineYourCareer.com
+
+# Max resumes processing at once, SERVICE-WIDE (default 5) -- enforced by
+# an atomic check against the real jobs.db, so this holds correctly
+# across `--workers N` too (confirmed via a real --workers 2 load test,
+# see CLAUDE.md's "Known-fixed bugs"). Guards against resource exhaustion
+# from a burst of near-simultaneous uploads -- requests over this cap get
+# a clear 503, not silent queueing.
+MAX_CONCURRENT_JOBS=5
+
+# Optional — Sentry error tracking. Leave unset to run without it (falls
+# back to logs-only, same as before this was added). Get a DSN from
+# sentry.io (Settings -> Projects -> <project> -> Client Keys).
+SENTRY_DSN=

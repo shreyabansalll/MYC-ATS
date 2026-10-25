@@ -73,6 +73,159 @@ def test_detect_rank_not_falsely_matched_by_restaurant_captain():
         assert m.detect_rank(genuine) == 'master', genuine
 
 
+def test_detect_rank_not_falsely_matched_by_supervisors_title_in_a_bullet():
+    """
+    Regression test: a bullet describing a SUPERVISOR's rank, not the
+    candidate's own, previously won the match -- confirmed on three real
+    candidates. Victor John's actual rank is ETO, but his original
+    source resume contains "...working under the direction of the
+    Chief Engineer to ensure the reliable operation..."; detect_rank
+    returned 'chief engineer' (checked earlier in rank_patterns'
+    priority order than 'eto'), which then fed the AI rewrite prompt's
+    "Current Sailing Rank" and corrupted the generated Professional
+    Summary itself: "Chief Engineer with 31 months of sea service..."
+    for an actual ETO. Ankur Shrivastava's AI-rewritten Work Experience
+    bullet, "Coordinated with the Chief Engineer to implement PMS...",
+    caused the same false positive when the Stage 7 re-score ran
+    detect_rank against the regenerated DOCX text, corrupting his
+    maritime re-score (rank-dependent cert requirements/sea-service
+    minimums) even though his actual rank (Second Engineer) is stated
+    correctly elsewhere in the same document. Gilfred Chettiar's
+    original source has a COMPOUND object -- "Coordinated with the
+    Master and Chief Officer to maintain operational efficiency..." --
+    two supervisors' ranks chained by "and" before "to"; his real
+    progression (Deck Cadet -> Third Officer -> Second Officer) never
+    includes Chief Officer at all, and his real cert is OOW, not a
+    Chief Mate CoC, yet the same corrupted Summary pattern resulted:
+    "Chief Officer with over 11 years of sea service...".
+    """
+    victor_style = (
+        'Electro Technical Officer with experience in electrical systems.\n'
+        'Managed maintenance and repair of all onboard electrical systems, '
+        'working under the direction of the Chief Engineer to ensure the '
+        'reliable operation of all electrical plants.'
+    )
+    assert m.detect_rank(victor_style) == 'eto', m.detect_rank(victor_style)
+
+    ankur_style = (
+        'Second Engineer  —  AG Meritimes and Norse Ship Management  |  06/2024 - 04/2026\n'
+        'Coordinated with the Chief Engineer to implement PMS, bunkering '
+        'operations, and crisis management procedures.'
+    )
+    assert m.detect_rank(ankur_style) == 'second engineer', m.detect_rank(ankur_style)
+
+    gilfred_style = (
+        'Second Officer  —  AG Maritime Pvt Ltd  |  10/2025 - 03/2026\n'
+        'Coordinated with the Master and Chief Officer to maintain '
+        'operational efficiency on M.V. Polaris Leader GRT 51917.'
+    )
+    assert m.detect_rank(gilfred_style) == 'second officer', m.detect_rank(gilfred_style)
+
+    # A genuine self-referential Chief Engineer mention must still win --
+    # this must narrow the false-positive shape, not blind the rank
+    # entirely to every "chief engineer" occurrence.
+    genuine_chief_engineer = 'Chief Engineer with 15 years of sea service on Bulk Carriers.'
+    assert m.detect_rank(genuine_chief_engineer) == 'chief engineer'
+
+
+def test_detect_rank_prioritizes_header_over_body_mentions_of_other_ranks():
+    """
+    Regression test, confirmed on two further real candidates whose
+    false-positive shape _THIRD_PARTY_RANK_MENTION's narrow "the <rank>
+    to" pattern doesn't catch at all:
+      - Jagdish Nair: header states "Jagdish Nair - Fourth Engineer" and
+        his Profile confirms "...disciplined Fourth Engineer, recently
+        promoted from Trainee Marine..." -- a clean, unambiguous case
+        that the header-priority check alone resolves.
+      - Jaideep Verma: header states "Fourth Assistant Engineer" (his
+        real, junior rank -- work history: Fourth Assistant Engineer ->
+        Junior Engineer -> Trainee/Intern), but his References section
+        footer reads "Mr. Amit Kumar Lathar - Chief Engineer" -- a
+        referee's title, not even a supervisor mentioned in a duty
+        bullet, which the old body-only scan had no way to distinguish
+        from the candidate's own rank.
+      - Abdullah Tauqir Khan: header states "THIRD ASSISTANT ENGINEER"
+        (maps to 'fourth engineer' via the same US/Indian convention
+        offset parser.py's RANK_KEYWORDS already uses), but his body
+        text has "...supporting the Chief Engineer and senior
+        officers..." -- no trailing " to", so untouched by
+        _THIRD_PARTY_RANK_MENTION; only checking the header first (now
+        that the assistant-engineer titles are recognized there too)
+        avoids ever reaching this false positive.
+    Checking the candidate's own header/title line FIRST, before any
+    full-document scan, resolves all three in one general way rather
+    than requiring a fresh narrow regex for every new grammatical shape
+    a third-party mention takes.
+    """
+    jagdish_style = (
+        'Jagdish Nair - Fourth Engineer\n'
+        'Date of birth: 05/11/1992\nNationality: Indian\n'
+        'Profile\nA motivated and disciplined Fourth Engineer, recently '
+        'promoted from Trainee Marine Engineer.'
+    )
+    assert m.detect_rank(jagdish_style) == 'fourth engineer', m.detect_rank(jagdish_style)
+
+    jaideep_style = (
+        'Jaideep Verma\nFourth Assistant Engineer\n'
+        '+91-9999877084 jaideep.verma2009@gmail.com\n'
+        'SUMMARY\nEnthusiastic and detail-oriented maritime trainee with '
+        'foundational experience in machinery operation, maintenance, and '
+        'safety protocols. Skilled in learning and assisting with engine '
+        'room tasks under the guidance of experienced engineers. '
+        'Experienced in practical learning of engine operations, '
+        'troubleshooting, and preventive maintenance procedures.\n'
+        # Real resume: this "chief engineer" mention (a referee's title in
+        # the References footer) lands at character ~6172 of a 6644-char
+        # document -- far past any header window. Padded here so the
+        # references line falls outside _HEADER_CHARS too, matching the
+        # real document's structure rather than accidentally keeping the
+        # false positive inside the header check by test construction.
+        'REFERENCES\nMr. Kunal Kumar - Third Engineer\n919599838950\n'
+        'Mr. Amit Kumar Lathar - Chief Engineer\n91 95410 44160'
+    )
+    assert m.detect_rank(jaideep_style) == 'fourth engineer', m.detect_rank(jaideep_style)
+
+    abdullah_style = (
+        'ABDULLAH TAUQIR KHAN\nTHIRD ASSISTANT ENGINEER\n'
+        '+91 7218879328 abdullahtauqirkhan@gmail.com\nLucknow, India\n'
+        # Real resume: the "supporting the Chief Engineer..." mention
+        # lands at character ~658 of a 3851-char document -- past the
+        # header window. Padded here to match, rather than accidentally
+        # keeping the false positive inside the header check by test
+        # construction.
+        'SUMMARY\nA skilled and highly motivated Third Assistant Engineer '
+        'with diverse experience of 4 years on crude oil tankers, including '
+        'serving aboard TEEKAY TANKERS SINGAPORE vessels such as those '
+        'operating internationally.\n'
+        'Assisted with routine maintenance, conducting regular checks, and '
+        'supporting the Chief Engineer and senior officers in daily operations.'
+    )
+    assert m.detect_rank(abdullah_style) == 'fourth engineer', m.detect_rank(abdullah_style)
+
+
+def test_detect_rank_recognizes_deck_officer_title_variant():
+    """
+    Regression test, confirmed on a real candidate (Akshay Bhardwaj):
+    his header states "Third Deck Officer" verbatim -- his real,
+    current rank -- but this didn't match the 'third officer' pattern
+    as a substring (the word "Deck" sits between "Third" and
+    "Officer"). The header check found nothing there and fell through
+    to a "Deck Cadet" mention picked up from badly column-bled Summary
+    text (a US Visa expiry date bleeding mid-sentence: "...19/09/2O29
+    and Deck Cadet aboard Hong Kong..."), misclassifying a Third
+    Officer as the most junior deck rank there is -- an 8-point
+    maritime-score swing (78 -> 70 before this fix) from a single
+    unrecognized title phrasing.
+    """
+    text = (
+        'Akshay Bhardwaj\nThird Deck Officer\n+91 7837108270\n'
+        'DOCUMENTS SUMMARY\nUS Visa C1/D - V0568851 - Dedicated and skilled '
+        '19/09/2O29 and Deck Cadet aboard Hong Kong. Known of vessels '
+        'through Passport - S2992262 - of vessels through deck operations.'
+    )
+    assert m.detect_rank(text) == 'third officer', m.detect_rank(text)
+
+
 def test_detect_vessel_types_finds_known_types():
     assert m.detect_vessel_types('worked on chemical tanker and bulk carrier') == [
         'chemical tanker', 'bulk carrier',

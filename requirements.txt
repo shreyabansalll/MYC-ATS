@@ -1,5 +1,7 @@
 spacy==3.7.5
 pdfplumber==0.11.4
+pymupdf==1.28.2
+pillow==12.2.0
 python-docx==1.1.2
 python-dateutil==2.9.0
 scikit-learn==1.5.2
@@ -21,6 +23,7 @@ slowapi==0.1.9
 
 # Security & monitoring
 cryptography==43.0.1
+sentry-sdk[fastapi]==2.18.0
 
 # Logging
 python-json-logger==2.0.7

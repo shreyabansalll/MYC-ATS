@@ -12,12 +12,16 @@
 import os
 import re
 import uuid
+import copy
 import shutil
 import hashlib
 import logging
 import json
 import time
+import sqlite3
 import threading
+import multiprocessing
+import queue
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
@@ -34,9 +38,10 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, event
 from sqlalchemy.orm import DeclarativeBase, Session
+import sentry_sdk
 
 from config import OUTPUT_DIR
-from pipeline.extractor import extract_text
+from pipeline.extractor import extract_text, extract_photo
 from pipeline.parser import parse_resume
 from pipeline.scorer import score_resume
 from pipeline.maritime import maritime_score
@@ -120,6 +125,42 @@ if not ADMIN_API_KEY:
     log.warning('"MYC_ADMIN_KEY not set — /ats/admin/metrics falls back to MYC_API_KEY, '
                 'the same key client requests use. Set MYC_ADMIN_KEY to a distinct value."')
 
+# ── Error tracking (Sentry) ──────────────────────────────────────────
+# Optional — same "warn, don't crash at import" pattern as MYC_API_KEY/
+# GROQ_API_KEY above. Without SENTRY_DSN set, the service runs exactly
+# as before this was added (sentry_sdk.init() is simply never called,
+# so every sentry_sdk.capture_exception() call below is a no-op).
+
+SENTRY_DSN = os.getenv('SENTRY_DSN', '')
+
+
+def _sentry_before_send(event, hint):
+    """
+    Same PII guarantee redact_pii()/PiiFilter already give logs and
+    persisted error_detail — an exception's message or values can
+    contain raw file-read errors, and those aren't exempt from the
+    privacy guarantee just because they're headed to Sentry instead of
+    the log stream or the DB.
+    """
+    if event.get('message'):
+        event['message'] = redact_pii(event['message'])
+    for exc in event.get('exception', {}).get('values', []):
+        if exc.get('value'):
+            exc['value'] = redact_pii(exc['value'])
+    return event
+
+
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        before_send=_sentry_before_send,
+        send_default_pii=False,
+        include_local_variables=False,
+    )
+    log.info('"sentry_enabled":"true"')
+else:
+    log.warning('"SENTRY_DSN not set — error tracking disabled, exceptions only go to logs"')
+
 # ── Database ──────────────────────────────────────────────────────────
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'jobs.db')
@@ -183,6 +224,46 @@ class Job(Base):
 
 
 Base.metadata.create_all(engine)
+
+
+def _ensure_schema_columns():
+    """
+    Base.metadata.create_all() only creates tables that don't exist yet
+    -- it never alters an EXISTING table when the Job model gains a new
+    column. Real bug confirmed here, caught only by actually running a
+    real request against the real data/jobs.db for the first time (the
+    prior rate-limiting work that touched this file was syntax-checked
+    only, never executed, since this environment didn't have slowapi/
+    fastapi installed until now): the live file was missing
+    'maritime_grade_before' entirely -- a partial-migration artifact
+    from when maritime scoring was split into separate before/after
+    columns (see CLAUDE.md's "maritime re-score bug" history) -- so
+    EVERY query touching the Job table (i.e. every endpoint) would have
+    raised sqlite3.OperationalError: no such column against the real
+    production database. There's no migration framework in this
+    project (Alembic would be disproportionate complexity for a single-
+    VPS/single-client deployment), so this is the lightweight
+    equivalent: reconcile the live table's actual columns (via PRAGMA
+    table_info) against what the ORM model expects, and ADD any that
+    are missing. Purely additive -- never drops or alters an existing
+    column -- so it can't lose data, only prevent this exact class of
+    silent drift from recurring the next time a column is added to Job
+    without a matching manual ALTER on the live file.
+    """
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql('PRAGMA table_info(jobs)').fetchall()}
+        model_columns = {col.name: col for col in Job.__table__.columns}
+        missing = set(model_columns) - existing
+        for name in missing:
+            col = model_columns[name]
+            col_type = col.type.compile(engine.dialect)
+            conn.exec_driver_sql(f'ALTER TABLE jobs ADD COLUMN {name} {col_type}')
+            log.warning(f'"schema_drift_repaired":"{name}","column_type":"{col_type}"')
+        if missing:
+            conn.commit()
+
+
+_ensure_schema_columns()
 
 
 def get_db() -> Session:
@@ -285,6 +366,93 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ── Concurrency guard ────────────────────────────────────────────────
+# The rate limiter above only throttles new SUBMISSIONS per IP per
+# minute — it does nothing to bound how many already-accepted jobs can
+# be actively PROCESSING at once. A burst near the rate-limit ceiling,
+# or several different IPs submitting close together (each individually
+# well under 10/minute), could still queue an unbounded number of CPU/
+# memory-heavy jobs (spaCy NLP, PDF parsing, a live Groq HTTP call) onto
+# BackgroundTasks' shared thread pool at the same time — real risk of
+# resource exhaustion on a single small VPS, which is the literal shape
+# of "don't want the system to crash if multiple people upload
+# together." In-memory, per-worker-process — same acceptable single-VPS
+# tradeoff as the rate limiter and _Metrics counters above (not shared
+# across `--workers N`, so the real ceiling with 2 workers is roughly
+# 2x this value). Deliberately a simple counter+lock, not Celery/Redis
+# — CLAUDE.md's explicit position is that a real job queue is only
+# warranted once concurrent jobs measurably queue/block on
+# BackgroundTasks; this is the proportionate guard rail for that
+# trigger, not a queue itself — jobs over the cap are rejected
+# immediately with a clear 503 rather than silently piling up.
+MAX_CONCURRENT_JOBS = int(os.getenv('MAX_CONCURRENT_JOBS', '5'))
+
+
+def _try_acquire_job_slot(job_id: str, file_hash: str) -> bool:
+    """
+    Atomically checks whether fewer than MAX_CONCURRENT_JOBS rows are
+    currently 'queued'/'processing' and, if so, inserts the new Job row
+    in the *same* transaction — so the check and the insert can never
+    race against another process doing the same thing.
+
+    Replaces a prior in-memory, per-process threading.Lock-guarded
+    counter. Real multi-worker load test (`uvicorn --workers 2`,
+    MAX_CONCURRENT_JOBS=2) confirmed that counter was per-worker-process:
+    4 jobs ran concurrently, not 2 — deploy.sh's default --workers 2
+    silently doubled the real resource-exhaustion ceiling the guard
+    exists to enforce (unlike the 10/min rate limiter's equivalent
+    doubling, which is low-stakes for a single-shared-API-key client and
+    already documented as an accepted tradeoff, this one directly
+    undermines its own stated purpose — protecting one small VPS's
+    CPU/memory from a burst of concurrent spaCy/Groq-heavy jobs). Backing
+    the check with jobs.db instead of process memory makes the limit a
+    property of the one database every worker process already shares.
+
+    Uses the stdlib sqlite3 module directly rather than the SQLAlchemy
+    engine/Session used elsewhere in this file, specifically to issue a
+    real `BEGIN IMMEDIATE` — this takes SQLite's single writer lock for
+    the whole check-then-insert, so two processes attempting this at the
+    same instant are serialized rather than both reading a stale count
+    and both inserting. There is deliberately no separate "release" step
+    anywhere else in this file: once run_pipeline moves a row to
+    status='done'/'failed' via the ordinary update_job() path, it drops
+    out of the queued/processing count on its own — the row's status
+    *is* the slot, so there's no separate counter that a missed release
+    on some exit path could leak.
+
+    A real sqlite3.OperationalError (lock-wait timeout under extreme
+    concurrent load) is treated the same as "no slot available" rather
+    than propagating — the caller's 503 ("at capacity, try again") is an
+    honest response either way, and this guarantees the DB being briefly
+    busy is never surfaced to the candidate as a raw 500.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.isolation_level = None  # autocommit off -- we drive BEGIN/COMMIT/ROLLBACK ourselves
+        conn.execute('BEGIN IMMEDIATE')
+        count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'processing')"
+        ).fetchone()[0]
+        if count >= MAX_CONCURRENT_JOBS:
+            conn.execute('ROLLBACK')
+            return False
+        conn.execute(
+            'INSERT INTO jobs (job_id, status, progress, current_stage, file_hash, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (job_id, 'queued', 0, 'Queued', file_hash, datetime.utcnow().isoformat(sep=' ')),
+        )
+        conn.execute('COMMIT')
+        return True
+    except sqlite3.OperationalError as e:
+        log.warning(f'"concurrency_slot_check_db_busy":"{str(e)}"')
+        try:
+            conn.execute('ROLLBACK')
+        except sqlite3.OperationalError:
+            pass
+        return False
+    finally:
+        conn.close()
+
 # ── Validators ────────────────────────────────────────────────────────
 
 def _check_disk_space():
@@ -335,6 +503,67 @@ def _check_duplicate(db: Session, file_hash: str) -> Optional[str]:
 
 # ── Output validation ─────────────────────────────────────────────────
 
+def _build_fallback_experience_bullets(parsed: dict, rank: str) -> list:
+    """
+    Real bug fixed: the Groq-outage fallback below used to hardcode
+    'experience_bullets': [] unconditionally -- despite issues_fixed
+    claiming "original content preserved" -- silently producing a
+    completely EMPTY Sea Service Record / Work Experience section
+    whenever the AI rewrite fails for ANY reason (Groq outage, a real
+    account-level TPM rate limit, auth failure), not just a total,
+    obvious outage. Confirmed on a real candidate (Ashish Kumar) whose
+    rewrite failed on a real, live 413 TPM rate-limit error: the
+    generated resume had zero experience rows despite a real, correctly
+    extracted 8-row gridded service-record table sitting the whole time
+    in parsed['sections']['experience'] -- this was never a table-
+    extraction bug, it was this fallback discarding data that had
+    already been extracted successfully.
+
+    Builds real entries from the raw extracted experience/service-record
+    text rather than inventing structure (there's no LLM available here
+    to safely restructure it). Pipe-delimited rows -- the gridded-table
+    rendering shape from extractor.py's _render_table_as_text ("Company
+    Name | Vessel Name | Type of vessel | GRT | Rank | Sign On | Sign
+    Off | Number of days sailed") -- become one real entry per row, using
+    the actual extracted company/vessel/dates. Anything else (a resume
+    without a gridded service-record table, so no pipe-delimited rows at
+    all) becomes a single entry with the raw section text as its
+    bullets, so at minimum nothing is silently reduced to zero rows.
+    """
+    experience_text = parsed.get('sections', {}).get('experience', '') if isinstance(parsed, dict) else ''
+    if not experience_text or not experience_text.strip():
+        return []
+
+    role_title = rank.title() if rank else 'Seafarer'
+    lines = [l.strip() for l in experience_text.split('\n') if l.strip()]
+
+    entries = []
+    for line in lines:
+        if line.count('|') < 5:
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if parts[0].lower() in ('company name', 'company'):
+            continue  # header row
+        company, vessel = parts[0], parts[1]
+        sign_on  = parts[5] if len(parts) > 5 else ''
+        sign_off = parts[6] if len(parts) > 6 else ''
+        entries.append({
+            'role':    role_title,
+            'company': company,
+            'dates':   f'{sign_on} - {sign_off}'.strip(' -'),
+            'bullets': [f'Served aboard {vessel}.'] if vessel else [],
+        })
+    if entries:
+        return entries
+
+    return [{
+        'role':    role_title,
+        'company': '',
+        'dates':   '',
+        'bullets': lines[:5],
+    }]
+
+
 def _validate_rewrite_output(result: dict, source_raw: str) -> list[str]:
     """
     Checks generated content for quality issues.
@@ -362,6 +591,117 @@ def _validate_rewrite_output(result: dict, source_raw: str) -> list[str]:
 
     return warnings_out
 
+# ── Extraction timeout guard ─────────────────────────────────────────
+# Real gap confirmed by a deliberate test: an 800MB zlib decompression
+# bomb (a <1MB PDF, comfortably under MAX_FILE_MB) hung extract_pdf()
+# for 90+ real seconds with zero sign of completing, and kept consuming
+# ~100% CPU indefinitely with nothing to stop it. Stage 1 previously had
+# no wall-clock bound at all.
+#
+# A signal.alarm()-based timeout doesn't work here: run_pipeline executes
+# on BackgroundTasks' worker thread, not the main thread, and Python's
+# signal handling only works on the main thread of the main interpreter
+# -- calling signal.alarm() from here would raise ValueError. A
+# thread-based timeout (ThreadPoolExecutor.result(timeout=...)) doesn't
+# genuinely fix it either: it only stops the CALLER from waiting, it
+# can't forcibly kill a still-running thread, so the runaway CPU/memory
+# consumption would continue regardless of whether the caller gave up
+# waiting on it. Only a separate OS process can actually be killed and
+# have its resources reclaimed -- hence multiprocessing here, not
+# threading.
+
+EXTRACTION_TIMEOUT_SECONDS = 30
+
+
+def _extract_worker(result_queue: multiprocessing.Queue, file_path: str, ext: str):
+    """Runs in a disposable child process -- see _extract_with_timeout()."""
+    try:
+        result_queue.put(('ok', extract_text(file_path, ext)))
+    except Exception as e:
+        result_queue.put(('error', str(e)))
+
+
+def _extract_with_timeout(file_path: str, ext: str) -> dict:
+    """
+    Runs extract_text() in a fresh child process and forcibly kills it if
+    it's still running past EXTRACTION_TIMEOUT_SECONDS -- actually
+    reclaiming whatever memory/CPU a pathological input (decompression
+    bomb, deeply malformed/nested object structure) is consuming, not
+    just giving up on waiting for it.
+
+    Reads the result queue WITH the timeout (queue.get(timeout=...)),
+    rather than proc.join(timeout) followed by a separate queue.get().
+    That ordering looks equivalent but isn't: multiprocessing.Queue is
+    pipe-backed with a limited OS buffer (~64KB), and a child that has
+    put() a larger payload blocks writing the remainder until something
+    reads it. join()-before-get() never reads it, so a sufficiently
+    large (but completely successful, non-pathological) extraction
+    result deadlocks the child against the parent's own wait -- this was
+    confirmed for real: a 975-page benign PDF (~65KB of extracted text,
+    just over the pipe buffer) was being wrongly killed and reported as
+    EXTRACTION_TIMEOUT by an earlier version of this function that
+    joined first, even though extract_pdf() itself completes that exact
+    file in ~1.3s standalone. Reading the queue first drains the pipe as
+    the child writes to it, so this only ever times out for a genuinely
+    stuck extraction, never a large-but-finished one.
+
+    Also deliberately uses multiprocessing's PLATFORM DEFAULT start
+    method (no explicit 'fork' override) -- forcing 'fork' unconditionally
+    reproduced a second, separate real hazard: forking this process
+    (after api.py's full import chain -- spaCy, numpy, etc. -- has
+    already loaded) can deadlock on macOS, a known fork-safety hazard
+    that's exactly why Python changed macOS's default start method from
+    'fork' to 'spawn' in 3.8. Linux's default remains 'fork', which is
+    the fast, safe path in production per deploy.sh's Ubuntu target --
+    this just doesn't override whichever default is actually safe for
+    the platform it's running on.
+    """
+    ctx   = multiprocessing.get_context()
+    result_queue = ctx.Queue()
+    proc  = ctx.Process(target=_extract_worker, args=(result_queue, file_path, ext))
+    proc.start()
+
+    try:
+        status, payload = result_queue.get(timeout=EXTRACTION_TIMEOUT_SECONDS)
+    except queue.Empty:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+        return {
+            'raw_text':          '',
+            'structural_issues': [f'EXTRACTION_TIMEOUT: exceeded {EXTRACTION_TIMEOUT_SECONDS}s '
+                                   '-- file may be a decompression bomb or a pathologically malformed document'],
+            'is_ocr':            False,
+        }
+
+    # The child should exit almost immediately after the put() above --
+    # bounded join as a final cleanup, not a second timeout window.
+    proc.join(5)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+
+    if status == 'ok':
+        return payload
+    if status == 'error':
+        return {
+            'raw_text':          '',
+            'structural_issues': [f'EXTRACTION_ERROR: {payload}'],
+            'is_ocr':            False,
+        }
+
+    # Unreachable in practice (status is always 'ok' or 'error' from
+    # _extract_worker), kept only so a future change to that function
+    # can't silently fall through here without a signal.
+    return {
+        'raw_text':          '',
+        'structural_issues': [f'EXTRACTION_UNKNOWN_STATUS: {status!r}'],
+        'is_ocr':            False,
+    }
+
 # ── Background pipeline ───────────────────────────────────────────────
 
 def run_pipeline(
@@ -370,6 +710,7 @@ def run_pipeline(
     ext: str,
     job_description: str,
     target_rank: str,
+    target_cruise_line: str = '',
 ):
     """
     Full pipeline. Runs in BackgroundTasks thread.
@@ -401,11 +742,27 @@ def run_pipeline(
 
     try:
         # ── 1. Extract ────────────────────────────────────────────────
+        # Runs in a subprocess with a hard wall-clock timeout -- see
+        # _extract_with_timeout()'s docstring for why (a real
+        # decompression bomb confirmed to hang this stage indefinitely
+        # with nothing previously bounding it).
         stage('Extracting text', 10)
-        extracted = extract_text(file_path, ext)
+        extracted = _extract_with_timeout(file_path, ext)
 
         if not extracted.get('raw_text', '').strip():
-            raise ValueError('Could not extract text — file may be image-based or empty')
+            # Real gap fixed, confirmed against real password-protected/
+            # corrupt/zero-byte test files: extract_pdf() already
+            # distinguishes these (PASSWORD_PROTECTED_PDF, PDF_READ_ERROR
+            # with a real message, SCANNED_PDF_DETECTED_OCR_NEEDED) via
+            # structural_issues, but this generic message discarded all of
+            # that detail -- every failure shape reached the candidate as
+            # the exact same unhelpful "file may be image-based or empty",
+            # even a password-protected upload, which needs completely
+            # different, actionable advice (remove the password) than a
+            # genuinely corrupt file (re-export and re-upload) or an
+            # actually-empty one.
+            reason = '; '.join(extracted.get('structural_issues', [])) or 'unknown reason'
+            raise ValueError(f'Could not extract text ({reason})')
 
         # ── 2. Parse ──────────────────────────────────────────────────
         stage('Parsing resume', 20)
@@ -436,6 +793,8 @@ def run_pipeline(
             job_description=job_description,
             rank=rank,
             license_rank=candidate_profile.license_rank,
+            sea_months=candidate_profile.sea_months,
+            target_cruise_line=target_cruise_line,
         )
 
         groq_retry_count = rewritten.pop('_groq_retry_count', 0)
@@ -448,7 +807,7 @@ def run_pipeline(
             log.warning(f'"job_id":"{job_id}","rewrite_error":"{rewritten["error"]}"')
             rewritten = {
                 'summary':          parsed['sections'].get('summary', ''),
-                'experience_bullets': [],
+                'experience_bullets': _build_fallback_experience_bullets(parsed, rank),
                 'skills':           parsed.get('skills', []),
                 'certifications':   [],
                 'education':        [],
@@ -465,21 +824,45 @@ def run_pipeline(
             log.warning(f'"job_id":"{job_id}","quality_warnings":{json.dumps(quality_warnings)}')
 
         # Inject contact/name back (rewriter doesn't carry these)
-        rewritten['name']    = candidate_profile.name
-        rewritten['contact'] = candidate_profile.contact.model_dump()
-        rewritten['rank']    = rank
+        rewritten['name']         = candidate_profile.name
+        rewritten['contact']      = candidate_profile.contact.model_dump()
+        rewritten['rank']         = rank
+        rewritten['sea_months']   = maritime_before.get('sea_months')
+        rewritten['vessel_types'] = maritime_before.get('vessel_types', [])
 
         # ── 5. Generate DOCX ──────────────────────────────────────────
+        # Two variants from the same rewrite (no duplicate Groq call): the
+        # photo-free default below remains the file /ats/download/{job_id}
+        # serves — same filename/behavior as before this change, so the
+        # existing API contract is untouched. The photo-included variant
+        # (for direct human/recruiter-facing submission, per Priority 2)
+        # is generated alongside it into the same job folder but isn't
+        # wired to a public download route yet — that's a separate,
+        # flagged product decision (new endpoint naming, TTL/cleanup
+        # wiring, DB schema for a second file path), not silently added
+        # here. generate_docx() mutates its content dict in place
+        # (enforce_length_limits trims nested lists/dicts), so each call
+        # gets its own deep copy rather than sharing rewritten directly.
         stage('Generating ATS-clean DOCX', 65)
         out_dir   = os.path.join(OUTPUT_DIR, job_id)
         os.makedirs(out_dir, exist_ok=True)
         docx_path = os.path.join(out_dir, f'{job_id}_ats.docx')
 
-        generate_docx(rewritten, job_id=job_id)
+        generate_docx(copy.deepcopy(rewritten), job_id=job_id)
         # generate_docx saves to OUTPUT_DIR/{job_id}_ats_resume.docx — move to job folder
         default_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume.docx')
         if os.path.exists(default_path):
             shutil.move(default_path, docx_path)
+
+        photo_bytes = extract_photo(file_path) if ext == 'pdf' else None
+        if photo_bytes:
+            generate_docx(
+                copy.deepcopy(rewritten), job_id=job_id,
+                include_photo=True, photo_bytes=photo_bytes,
+            )
+            photo_default_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume_photo.docx')
+            if os.path.exists(photo_default_path):
+                shutil.move(photo_default_path, os.path.join(out_dir, f'{job_id}_ats_photo.docx'))
 
         # ── 6. Re-score ───────────────────────────────────────────────
         stage('Verifying improvement', 80)
@@ -535,6 +918,7 @@ def run_pipeline(
     except Exception as e:
         _finish_open_stage()
         log.error(f'"job_id":"{job_id}","error":"{str(e)}"')
+        sentry_sdk.capture_exception(e)
         try:
             update_job(
                 db, job_id,
@@ -549,6 +933,7 @@ def run_pipeline(
             # original error or leave the job silently stuck in "processing"
             # with no trace in the logs of why.
             log.error(f'"job_id":"{job_id}","error":"failed to record failure: {str(db_err)}"')
+            sentry_sdk.capture_exception(db_err)
     finally:
         # Always clean up temp upload file
         try:
@@ -556,6 +941,16 @@ def run_pipeline(
         except OSError:
             pass
         db.close()
+        # No explicit concurrency-slot release here — see
+        # _try_acquire_job_slot()'s docstring. The slot is just this
+        # row's status: once the update_job() calls above move it to
+        # 'done' or 'failed', it stops counting on its own. (If a worker
+        # process dies mid-job before either update_job() call above can
+        # run at all, the row is left 'processing' and keeps counting
+        # against capacity even across a restart — this is the exact
+        # same "job stuck in processing" scenario CLAUDE.md's
+        # Troubleshooting section already documents a manual remediation
+        # for, not a new failure mode this change introduces.)
 
 # ── Endpoints ─────────────────────────────────────────────────────────
 
@@ -571,6 +966,7 @@ def root(request: Request):
         'health_check': f'{base}/health',
         'endpoints': {
             'submit_resume': 'POST /ats/submit',
+            'score_resume': 'POST /ats/score',
             'check_status': 'GET /ats/status/{job_id}',
             'get_results': 'GET /ats/result/{job_id}',
             'download_resume': 'GET /ats/download/{job_id}',
@@ -595,6 +991,17 @@ async def submit(
     file: UploadFile = File(..., description='PDF or DOCX resume'),
     job_description: str = Form(default='', description='Target job description (optional but improves keyword scoring)'),
     target_rank: str = Form(default='', description='Override rank detection (optional)'),
+    target_cruise_line: str = Form(
+        default='',
+        description=(
+            'Optional. When the submission targets a specific cruise line (e.g. "Disney", '
+            '"Royal Caribbean", "Carnival"), layers that line\'s hiring keywords/cert emphasis '
+            'into the AI rewrite on top of the existing rank-based template -- never a '
+            'replacement for it. Unrecognized/misspelled names fall back gracefully to plain '
+            'rank-based behavior, not an error. See rules/cruise_line_keywords.py for the full '
+            'list of recognized lines.'
+        ),
+    ),
 ):
     """
     Accepts PDF or DOCX resume. Returns job_id immediately.
@@ -613,8 +1020,8 @@ async def submit(
     fhash = _file_hash(contents)
     db    = get_db()
     existing_id = _check_duplicate(db, fhash)
+    db.close()
     if existing_id:
-        db.close()
         log.info(f'"dedup_hit":"true","existing_job":"{existing_id}"')
         return {
             'job_id':   existing_id,
@@ -623,29 +1030,139 @@ async def submit(
             'message':  'Same file processed recently — returning existing result',
         }
 
-    # Save to temp
-    job_id   = str(uuid.uuid4())
+    # Concurrency check — a dedup hit above never reaches here, since
+    # returning a cached result doesn't consume a processing slot at
+    # all. _try_acquire_job_slot() atomically checks capacity AND
+    # creates the 'queued' Job row in one DB transaction (see its
+    # docstring) — there is no separate release step; the row's own
+    # status is the slot, freed automatically once run_pipeline moves it
+    # to 'done'/'failed'.
+    job_id = str(uuid.uuid4())
+    if not _try_acquire_job_slot(job_id, fhash):
+        log.warning(f'"concurrency_limit_reached":"{MAX_CONCURRENT_JOBS}"')
+        raise HTTPException(
+            503,
+            f'Server is at capacity processing other resumes (max {MAX_CONCURRENT_JOBS} '
+            'concurrent) — please try again in a moment.',
+        )
+
     tmp_path = os.path.join(TMP_DIR, f'{job_id}.{ext}')
     try:
         with open(tmp_path, 'wb') as f:
             f.write(contents)
-    except OSError as e:
-        log.error(f'"job_id":"{job_id}","error":"tmp write failed: {redact_pii(str(e))}"')
+    except Exception as e:
+        log.error(f'"job_id":"{job_id}","error":"submit failed: {redact_pii(str(e))}"')
+        sentry_sdk.capture_exception(e)
+        # The job row already exists (the slot above IS the row) --
+        # mark it failed rather than leaving it stuck 'queued' forever
+        # with nothing ever going on to process it.
+        db2 = get_db()
+        try:
+            update_job(db2, job_id, status='failed', current_stage='Failed',
+                       error_detail='Could not save upload')
+        finally:
+            db2.close()
         raise HTTPException(500, 'Could not save upload — please try again')
-
-    # Create job record
-    db.add(Job(job_id=job_id, file_hash=fhash))
-    db.commit()
-    db.close()
 
     log.info(f'"job_id":"{job_id}","ext":"{ext}","size_kb":{len(contents)//1024}')
 
-    # Queue background processing
     background_tasks.add_task(
-        run_pipeline, job_id, tmp_path, ext, job_description, target_rank
+        run_pipeline, job_id, tmp_path, ext, job_description, target_rank, target_cruise_line
     )
 
     return {'job_id': job_id, 'status': 'queued'}
+
+
+@app.post(
+    '/ats/score',
+    summary='Score a resume — ATS + maritime only, no AI rewrite, no Groq dependency',
+    dependencies=[Depends(require_api_key)],
+)
+@limiter.limit('10/minute')
+async def score(
+    request: Request,
+    file: UploadFile = File(..., description='PDF or DOCX resume'),
+    job_description: str = Form(default='', description='Target job description (optional but improves keyword scoring)'),
+):
+    """
+    Runs Stages 1-4 only (extract -> parse -> ATS score -> maritime
+    score) -- the same underlying functions run_pipeline() calls for its
+    "before" scores, just invoked directly and returned synchronously.
+    No BackgroundTasks/job_id/polling: there's no Groq call to wait on,
+    so this responds in the same request, typically in a couple of
+    seconds. Does not persist a Job row or generate a DOCX -- this is a
+    read-only scoring operation, not a submission.
+
+    Same security posture as /ats/submit: API key auth, the same
+    10/minute rate limit, the same file validation (extension/magic-
+    byte/size via _validate_file), and the same PII redaction on
+    anything returned.
+    """
+    _check_disk_space()
+
+    contents = await file.read()
+    ext      = _validate_file(contents, file.filename or '')
+
+    tmp_id   = str(uuid.uuid4())
+    tmp_path = os.path.join(TMP_DIR, f'{tmp_id}.{ext}')
+
+    try:
+        with open(tmp_path, 'wb') as f:
+            f.write(contents)
+
+        # Same _extract_with_timeout() subprocess-isolated, wall-clock-
+        # bounded extraction /ats/submit uses -- a scoring-only endpoint
+        # is exactly as exposed to a decompression-bomb-style upload as
+        # the full pipeline is, so it needs exactly the same guard.
+        extracted = _extract_with_timeout(tmp_path, ext)
+        if not extracted.get('raw_text', '').strip():
+            reason = '; '.join(extracted.get('structural_issues', [])) or 'unknown reason'
+            raise HTTPException(422, f'Could not extract text ({reason})')
+
+        parsed = parse_resume(extracted['raw_text'])
+        parsed['raw_text'] = extracted['raw_text']
+
+        ats_result       = score_resume(extracted, parsed, job_description)
+        maritime_result  = maritime_score(extracted['raw_text'], parsed, pdf_path=tmp_path)
+        candidate_profile = build_candidate_profile(parsed, maritime_result)
+
+        # Same redaction discipline as run_pipeline's all_issues -- a
+        # PDF/DOCX read error occasionally embeds raw file content, and
+        # this response isn't exempt from the same privacy guarantee
+        # just because nothing gets persisted to the DB.
+        issues = [redact_pii(i) for i in ats_result['issues'] + maritime_result['issues']]
+
+        log.info(
+            f'"endpoint":"/ats/score","ats_score":{ats_result["total_score"]},'
+            f'"maritime_score":{maritime_result["maritime_score"]}'
+        )
+
+        return {
+            'name':            candidate_profile.name,
+            'ats_score':       ats_result['total_score'],
+            'ats_grade':       ats_result['grade'],
+            'maritime_score':  maritime_result['maritime_score'],
+            'maritime_grade':  maritime_result['maritime_grade'],
+            'rank_detected':   candidate_profile.rank_detected,
+            'sea_months':      candidate_profile.sea_months,
+            'cert_coverage':   maritime_result.get('cert_coverage'),
+            'vessel_types':    maritime_result.get('vessel_types', []),
+            'issues':          issues,
+            'recommendations': maritime_result.get('recommendations', []),
+            'missing_certs':   maritime_result.get('missing_certs', []),
+            'keyword_data':    ats_result.get('keyword_data', {}),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f'"endpoint":"/ats/score","error":"{redact_pii(str(e))}"')
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(500, 'Could not score resume — please try again')
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 @app.get(

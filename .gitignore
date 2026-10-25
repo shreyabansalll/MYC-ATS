@@ -5,6 +5,7 @@ __pycache__/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/backups/
 data/outputs/
 data/prelabel_checkpoint.json
 data/myc_resume/

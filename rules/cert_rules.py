@@ -14,6 +14,7 @@ CERT_REQUIREMENTS = {
     '3rd officer':      ['CoC', 'STCW', 'ENG1'],
     'deck cadet':       ['STCW', 'ENG1'],
     'engine cadet':     ['STCW', 'ENG1'],
+    'electrical cadet': ['STCW', 'ENG1'],  # mirrors deck cadet/engine cadet exactly -- see rules/aliases.py
     'chief engineer':   ['CoC', 'STCW', 'ENG1'],
     'second engineer':  ['CoC', 'STCW', 'ENG1'],
     '2nd engineer':     ['CoC', 'STCW', 'ENG1'],
@@ -40,6 +41,7 @@ SEA_SERVICE_MIN = {
     '3rd officer':      6,
     'deck cadet':       0,
     'engine cadet':     0,
+    'electrical cadet': 0,
     'chief engineer':   24,
     'second engineer':  12,
     '2nd engineer':     12,
