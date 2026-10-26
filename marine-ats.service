@@ -1,0 +1,45 @@
+[Unit]
+Description=Marine Your Career — ATS API
+After=network.target
+
+[Service]
+Type=simple
+
+# Adjust these three to match the actual deploy target — this assumes
+# deploy.sh was already run once from this path, so venv/ and .env
+# exist here.
+User=marine-ats
+Group=marine-ats
+WorkingDirectory=/opt/marine-ats
+
+# EnvironmentFile is optional belt-and-suspenders: config.py's
+# load_dotenv() already reads .env from the working directory above at
+# import time, but this makes .env's values visible to systemd itself
+# too (e.g. in `systemctl show`), and the leading "-" means a missing
+# file doesn't block startup — load_dotenv() already logged/handles
+# that at the application level.
+EnvironmentFile=-/opt/marine-ats/.env
+
+# Matches deploy.sh's own uvicorn invocation exactly (2 workers — safe
+# for BackgroundTasks + SQLite WAL, per CLAUDE.md's architecture notes).
+ExecStart=/opt/marine-ats/venv/bin/uvicorn api:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 2 \
+    --log-level warning \
+    --access-log \
+    --no-server-header
+
+# Auto-restart on crash (OOM, unhandled signal, etc.) and on unexpected
+# clean exit alike — this does NOT fire on a deliberate `systemctl stop`.
+Restart=always
+RestartSec=5
+
+# Structured JSON logs already go to stdout/stderr (see api.py's
+# _setup_logging()) — journald captures them as-is; read with
+# `journalctl -u marine-ats -f`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

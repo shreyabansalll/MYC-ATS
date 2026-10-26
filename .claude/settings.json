@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/bin/python3 -c ' *)",
+      "Bash(venv/bin/python main.py \"data/myc_resume/3.  Priority Candidates/Victor John/VictorJohnResume.pdf\")",
+      "Bash(venv/bin/python main.py \"data/myc_resume/Jimmy Fernandes/JimmyFernandesResume.pdf\")",
+      "Bash(venv/bin/python -c ' *)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/exception_test_files)",
+      "Bash(printf '%%PDF-1.4\\\\n%%\\\\xe2\\\\xe3\\\\xcf\\\\xd3\\\\n1 *)",
+      "Bash(touch zero_byte.pdf)",
+      "Bash(printf '%%PDF-1.4\\\\nTHIS IS NOT REAL PDF CONTENT JUST GARBAGE BYTES 12345 !@#$%%^&*\\(\\)')",
+      "Bash(grep -n \"except Exception as e:\\\\s*$\" pipeline/extractor.py)",
+      "Bash(git check-ignore *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(venv/bin/python -c \"import api; print\\('import ok, sentry init called:', api.SENTRY_DSN\\)\")",
+      "Bash(rm -f /tmp/sentry_wiring_test.pdf; ls /tmp/*.pdf 2>/dev/null | head)",
+      "Bash(chmod +x /Users/shreya/Desktop/marine-ats/backup_jobs_db.sh)",
+      "Bash(venv/bin/python -c \"import main; print\\('main.py imports cleanly'\\)\")",
+      "Bash(venv/bin/python -)",
+      "Bash(sqlite3 data/jobs.db \"SELECT COUNT\\(*\\) FROM jobs;\")",
+      "Bash(MYC_API_KEY=mw-test-key-2workers GROQ_API_KEY=gsk_invalid_test_key_for_multiworker_test MAX_CONCURRENT_JOBS=100 venv/bin/uvicorn api:app --host 127.0.0.1 --port 8001 --workers 2 --log-level warning)",
+      "Bash(echo \"SERVER_PID=$!\")",
+      "Bash(curl -s http://127.0.0.1:8001/health)",
+      "Bash(venv/bin/python /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/burst_test.py http://127.0.0.1:8001 mw-test-key-2workers 24 /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/mw_test_pdfs)",
+      "Bash(kill 88710)",
+      "Bash(pkill -f \"uvicorn api:app --host 127.0.0.1 --port 8001\")",
+      "Bash(MYC_API_KEY=mw-test-key-1worker GROQ_API_KEY=gsk_invalid_test_key_for_multiworker_test MAX_CONCURRENT_JOBS=100 venv/bin/uvicorn api:app --host 127.0.0.1 --port 8002 --workers 1 --log-level warning)",
+      "Bash(curl -s http://127.0.0.1:8002/health)",
+      "Bash(venv/bin/python /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/burst_test.py http://127.0.0.1:8002 mw-test-key-1worker 24 /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/mw_test_pdfs_b)",
+      "Bash(kill 89202)",
+      "Bash(pkill -f \"uvicorn api:app --host 127.0.0.1 --port 8002\")",
+      "Bash(MYC_API_KEY=mw-conc-key-2w GROQ_API_KEY=gsk_invalid_test_key_for_multiworker_test MAX_CONCURRENT_JOBS=2 venv/bin/uvicorn api:app --host 127.0.0.1 --port 8004 --workers 2 --log-level warning)",
+      "Bash(curl -s http://127.0.0.1:8004/health)",
+      "Bash(venv/bin/python /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/burst_test.py http://127.0.0.1:8005 mw-conc-key-1w 16 /private/tmp/claude-501/-Users-shreya-Desktop-marine-ats/70b5a891-7893-4eee-a45f-fa01969a49cb/scratchpad/mw_test_pdfs_d)",
+      "Bash(pkill -f \"uvicorn api:app --host 127.0.0.1 --port 8005\")",
+      "Bash(venv/bin/python -c \"import api; print\\('imports ok'\\); print\\(api._try_acquire_job_slot\\)\")",
+      "Bash(venv/bin/python -m pytest tests/test_api.py -v)",
+      "Bash(venv/bin/python -m pytest tests/test_api.py -v -k \"simultaneous_writes\")"
+    ],
+    "additionalDirectories": [
+      "/private/tmp"
+    ]
+  }
+}

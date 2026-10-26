@@ -7,10 +7,11 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Reads from .env file
 
-# ── Groq API (AI Rewriting) ──────────────────────────────────────────
-GROQ_API_KEY       = os.getenv('GROQ_API_KEY')
-GROQ_MODEL         = 'llama-3.3-70b-versatile'  # Replacement for decommissioned llama3-70b-8192
-GROQ_PRELABEL_MODEL = GROQ_MODEL
+# ── Anthropic Claude (AI Rewriting) ──────────────────────────────────
+# Resume rewriting and tailoring use Anthropic Claude.
+# The key is read from the environment; keep it out of source control.
+ANTHROPIC_API_KEY  = os.getenv('ANTHROPIC_API_KEY')
+CLAUDE_MODEL       = 'claude-haiku-5-5'
 
 # ── Ollama (Local NER pre-labeling) ──────────────────────────────────
 OLLAMA_BASE_URL    = 'http://localhost:11434/v1'
@@ -32,3 +33,7 @@ KEYWORD_WEIGHT  = 40
 SCORE_EXCELLENT = 85
 SCORE_GOOD      = 75
 SCORE_PASS      = 60
+
+# After rewrite, if generic ATS improvement is under this many points,
+# retry once with a stricter prompt and keep the better of the two.
+REWRITE_IMPROVEMENT_RETRY_POINTS = 15

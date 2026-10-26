@@ -21,7 +21,7 @@ if ROOT_DIR not in sys.path:
 from pipeline.extractor import extract_text
 from pipeline.parser import parse_resume
 from pipeline.scorer import score_resume
-from pipeline.maritime_scorer import maritime_score
+from pipeline.maritime import maritime_score
 
 
 def process_single(file_path: str) -> dict:
@@ -131,7 +131,18 @@ def run_batch(list_path: str = 'data/resume_file_list.txt'):
 
         result = process_single(path)
 
-        if result.get('error') and result['name'] in ('ERROR', 'UNREADABLE'):
+        # Bug fixed: this used to only treat result['name'] in ('ERROR',
+        # 'UNREADABLE') as a failure. process_single() also returns
+        # name='NO_RESUME_FOUND' with a real error set (empty folder, no
+        # PDF inside) -- that value wasn't in the tuple, so folders with
+        # no resume silently fell into the success branch and polluted
+        # batch_results.csv's averages/grade distribution with bogus
+        # 0-score "successes". Any non-empty error means failure,
+        # regardless of what name value came with it -- process_single's
+        # success path always sets error='' (falsy), so this is a
+        # strictly more correct check, not just a wider allowlist that
+        # could go stale again the next time a new error name is added.
+        if result.get('error'):
             print(f'✗ {result["error"]}')
             failed.append(result)
         else:

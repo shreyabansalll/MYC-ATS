@@ -3,3 +3,11 @@
 
 0 2 * * * curl -s -X POST http://localhost:8000/ats/cleanup \
   -H "X-API-Key: YOUR_MYC_API_KEY" >> /var/log/ycm-cleanup.log 2>&1
+
+# Runs nightly at 3am — backs up data/jobs.db to a second location via
+# backup_jobs_db.sh (sqlite3 .backup, WAL-safe — see CLAUDE.md's
+# "Backup / restore" section for why this isn't a plain `cp`). Adjust
+# the repo path and backup destination below to the real deploy path;
+# defaults to /var/backups/marine-ats if no destination arg is given.
+
+0 3 * * * /opt/marine-ats/backup_jobs_db.sh /var/backups/marine-ats >> /var/log/ycm-backup.log 2>&1
