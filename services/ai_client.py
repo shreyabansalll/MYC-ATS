@@ -1145,9 +1145,201 @@ def sanitise_section(text: str, max_chars: int = 800) -> str:
     return ' | '.join(kept) if kept else result[:max_chars]
 
 
+def _protected_terms_block(protected_signals: list[dict[str, str]] | None) -> str:
+    terms = []
+    seen = set()
+    for signal in protected_signals or []:
+        text = signal.get('text', '').strip()
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            terms.append(text)
+    if not terms:
+        return ''
+    return (
+        'PROTECTED TERMS — do not rephrase, remove, or alter these. They must '
+        'appear in the rewritten resume exactly as shown. You may improve '
+        'sentence structure, grammar, formatting, and clarity around them, '
+        'but never remove them:\n'
+        + '\n'.join(f'- {term}' for term in terms)
+    )
+
+
+def _rewrite_contains_text(result: dict, text: str) -> bool:
+    rendered_fields = (
+        'summary', 'rank', 'experience_bullets', 'skills', 'certifications',
+        'education', 'documents', 'languages', 'technical_expertise',
+    )
+
+    def contains_in_values(value) -> bool:
+        if isinstance(value, str):
+            return text in value
+        if isinstance(value, dict):
+            return any(contains_in_values(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_in_values(item) for item in value)
+        return False
+
+    return any(
+        contains_in_values(result.get(field))
+        for field in rendered_fields
+        if field in result
+    )
+
+
+def _append_rewrite_text(result: dict, section: str, text: str) -> None:
+    if section == 'rank':
+        result['rank'] = text
+    elif section == 'summary':
+        current = result.get('summary') or ''
+        result['summary'] = f'{current.rstrip()} {text}'.strip()
+    elif section == 'experience':
+        entries = result.setdefault('experience_bullets', [])
+        if not isinstance(entries, list):
+            entries = result['experience_bullets'] = []
+        if entries and isinstance(entries[0], dict):
+            bullets = entries[0].setdefault('bullets', [])
+            if not isinstance(bullets, list):
+                bullets = entries[0]['bullets'] = [str(bullets)]
+            bullets.append(text)
+        else:
+            entries.append({
+                'role': result.get('rank') or 'Professional',
+                'company': '',
+                'dates': '',
+                'bullets': [text],
+            })
+    elif section == 'skills':
+        values = result.setdefault('skills', [])
+        if isinstance(values, list):
+            values.append(text)
+        else:
+            result['skills'] = [values, text]
+    elif section == 'certifications':
+        values = result.setdefault('certifications', [])
+        if isinstance(values, list):
+            values.append(text)
+        else:
+            result['certifications'] = [values, text]
+    elif section == 'documents':
+        documents = result.setdefault('documents', {})
+        if not isinstance(documents, dict):
+            documents = result['documents'] = {'other': [str(documents)]}
+        other = documents.setdefault('other', [])
+        if not isinstance(other, list):
+            other = documents['other'] = [str(other)]
+        other.append(text)
+    elif section == 'education':
+        values = result.setdefault('education', [])
+        if isinstance(values, list):
+            values.append(text)
+        else:
+            result['education'] = [values, text]
+    elif section == 'languages':
+        values = result.setdefault('languages', [])
+        if isinstance(values, list):
+            values.append(text)
+        else:
+            result['languages'] = [values, text]
+    elif section == 'technical_expertise':
+        values = result.setdefault('technical_expertise', [])
+        if isinstance(values, list):
+            values.append(text)
+        else:
+            result['technical_expertise'] = [values, text]
+    else:
+        _append_rewrite_text(result, 'experience', text)
+
+
+def _restore_source_section(result: dict, parsed: dict, section: str) -> bool:
+    source_sections = parsed.get('sections') or {}
+    source_text = source_sections.get(section)
+    if not isinstance(source_text, str) or not source_text.strip():
+        return False
+
+    if section == 'experience':
+        lines = [line.strip() for line in source_text.splitlines() if line.strip()]
+        result['experience_bullets'] = [{
+            'role': result.get('rank') or parsed.get('rank') or 'Professional',
+            'company': '',
+            'dates': '',
+            'bullets': lines,
+        }]
+    elif section == 'skills':
+        lines = parsed.get('skills') or [
+            line.strip(' •-\t') for line in source_text.splitlines() if line.strip()
+        ]
+        result['skills'] = list(lines)
+    elif section == 'education':
+        result['education'] = [
+            line.strip() for line in source_text.splitlines() if line.strip()
+        ]
+    elif section == 'summary':
+        result['summary'] = source_text.strip()
+    elif section == 'technical_expertise':
+        result['technical_expertise'] = [
+            line.strip() for line in source_text.splitlines() if line.strip()
+        ]
+    elif section == 'certifications':
+        result['certifications'] = [
+            line.strip() for line in source_text.splitlines() if line.strip()
+        ]
+    elif section == 'languages':
+        result['languages'] = [
+            line.strip() for line in source_text.splitlines() if line.strip()
+        ]
+    else:
+        return False
+    return True
+
+
+def restore_protected_signals(
+    result: dict,
+    parsed: dict,
+    protected_signals: list[dict[str, str]],
+) -> dict:
+    """Restore source-backed signals omitted by the model into their section."""
+    section_targets = {
+        'summary': 'summary',
+        'experience': 'experience',
+        'education': 'education',
+        'skills': 'skills',
+        'technical_expertise': 'technical_expertise',
+        'certifications': 'certifications',
+        'license': 'documents',
+        'documents': 'documents',
+        'languages': 'languages',
+    }
+    section_has_content = {
+        'summary': bool(result.get('summary')),
+        'experience': bool(result.get('experience_bullets')),
+        'education': bool(result.get('education')),
+        'skills': bool(result.get('skills')),
+    }
+    for signal in protected_signals:
+        text = signal.get('text', '').strip()
+        if not text:
+            continue
+        section = signal.get('section', '')
+        if signal.get('kind') == 'section_heading':
+            if section_has_content.get(section):
+                continue
+            _restore_source_section(result, parsed, section)
+            continue
+        if _rewrite_contains_text(result, text):
+            continue
+        target = 'rank' if signal.get('kind') == 'rank' else section_targets.get(section, '')
+        if signal.get('kind') == 'vessel_type':
+            target = 'experience'
+        if signal.get('kind') in {'keyword', 'certificate_code', 'metric'} and not target:
+            target = 'skills' if signal.get('kind') == 'keyword' else 'experience'
+        _append_rewrite_text(result, target, signal.get('restore_text') or text)
+    return result
+
+
 def build_rewrite_prompt(parsed: dict, issues: list, job_description: str,
                          rank: str = '', license_rank: str = '', sea_months: int = 0,
-                         target_cruise_line: str = '', strict: bool = False) -> str:
+                         target_cruise_line: str = '', strict: bool = False,
+                         protected_signals: list[dict[str, str]] | None = None) -> str:
 
     rank = _normalize_rank(rank)
 
@@ -1204,6 +1396,7 @@ real experience genuinely supports the phrasing):
 
     license_line = (f'Highest License Held : {license_rank.title()}'
                     if license_rank and license_rank != rank else '')
+    protected_block = _protected_terms_block(protected_signals)
 
     # Decide whether to use parsed sections or raw text fallback.
     # Raw fallback triggers when experience or summary content is thin —
@@ -1257,6 +1450,7 @@ Minimum Skills       : {min_skills_text}
 
 {source_block}
 
+{protected_block}
 ATS ISSUES TO FIX:
 {chr(10).join(issues) if issues else 'No major issues detected'}
 
@@ -1702,7 +1896,8 @@ def _as_openai_shaped_response(response):
 
 
 def build_generic_rewrite_prompt(parsed: dict, issues: list, job_description: str,
-                                 strict: bool = False) -> str:
+                                 strict: bool = False,
+                                 protected_signals: list[dict[str, str]] | None = None) -> str:
     from generic_ats.keywords import GENERIC_PROFESSIONAL_JD
     jd = sanitize_prompt_input((job_description or '').strip() or GENERIC_PROFESSIONAL_JD.strip())
     kw = extract_job_keywords(jd)
@@ -1715,6 +1910,7 @@ def build_generic_rewrite_prompt(parsed: dict, issues: list, job_description: st
         strict_block=STRICT_RETRY_ADDENDUM if strict else '',
         job_description=jd,
         job_keywords=', '.join(kw.get('keywords') or []),
+        protected_signals=_protected_terms_block(protected_signals),
         original_resume=sanitise_section(raw, 4000),
     )
 
@@ -1765,15 +1961,20 @@ def _call_claude_with_retry(prompt: str, *, generic_mode: bool = False):
 def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
                    rank: str = '', license_rank: str = '', sea_months: int = 0,
                    target_cruise_line: str = '', strict: bool = False,
-                   generic_mode: bool = False) -> dict:
+                   generic_mode: bool = False,
+                   protected_signals: list[dict[str, str]] | None = None) -> dict:
 
     rank = _normalize_rank(rank)
     if generic_mode:
-        prompt = build_generic_rewrite_prompt(parsed, issues, job_description, strict=strict)
+        prompt = build_generic_rewrite_prompt(
+            parsed, issues, job_description, strict=strict,
+            protected_signals=protected_signals,
+        )
     else:
         prompt = build_rewrite_prompt(
             parsed, issues, job_description, rank, license_rank, sea_months,
             target_cruise_line, strict=strict,
+            protected_signals=protected_signals,
         )
 
     if len(prompt) > 20000:
@@ -1781,11 +1982,15 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
         sections = {**sections, 'experience': sanitise_section(sections.get('experience', ''), 2500)}
         parsed = {**parsed, 'sections': sections}
         if generic_mode:
-            prompt = build_generic_rewrite_prompt(parsed, issues, job_description, strict=strict)
+            prompt = build_generic_rewrite_prompt(
+                parsed, issues, job_description, strict=strict,
+                protected_signals=protected_signals,
+            )
         else:
             prompt = build_rewrite_prompt(
                 parsed, issues, job_description, rank, license_rank, sea_months,
                 target_cruise_line, strict=strict,
+                protected_signals=protected_signals,
             )
 
     raw_text      = ''
@@ -1856,6 +2061,7 @@ def rewrite_resume(parsed: dict, issues: list, job_description: str = '',
             result = enforce_education_completeness(result, parsed)
             result = enforce_language_completeness(result, parsed)
             result = post_process_rewrite_result(result)
+            result = restore_protected_signals(result, parsed, protected_signals or [])
             if not result.get('rank'):
                 result['rank'] = rank
             result['_llm_retry_count'] = total_retries

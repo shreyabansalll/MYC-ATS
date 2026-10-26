@@ -6,10 +6,139 @@ JD mapping) runs only when career_track / MYC rank fields say it should.
 
 from __future__ import annotations
 
+import re
+
 from config import REWRITE_IMPROVEMENT_RETRY_POINTS
+from generic_ats.adapter import flatten_resume_text, parsed_to_resume
 from generic_ats.career_track import maritime_overlay_active, resolve_target_jd
+from generic_ats.keywords import extract_job_keywords
 from generic_ats.layer import score_generic, score_generic_rewritten
-from pipeline.maritime import detect_rank, maritime_score
+from generic_ats.text_match import keyword_in_text
+from pipeline.maritime import (
+    detect_rank,
+    detect_vessel_types,
+    extract_certificates,
+    maritime_score,
+)
+
+
+_METRIC_RE = re.compile(
+    r"(?<!\w)(?:[$€£₹][ \t]*\d[\d,]*(?:\.\d+)?|"
+    r"\d[\d,]*(?:\.\d+)?[ \t]*(?:%|percent|months?|years?|yrs?|days?|weeks?|"
+    r"hours?|hrs?|minutes?|mins?|grt|dwt|vessels?|ships?|crew|tons?|tonnes?|"
+    r"kg|km|miles?))(?!\w)",
+    re.IGNORECASE,
+)
+_CERT_CODE_RE = re.compile(
+    r"\b(?=[A-Z0-9/-]*[A-Z])(?=[A-Z0-9/-]*\d)[A-Z0-9]+(?:[-/][A-Z0-9]+)*\b",
+    re.IGNORECASE,
+)
+_BARE_CERT_NUMBER_RE = re.compile(r"\b\d{5,}\b")
+
+
+def build_protected_signals(extracted: dict, parsed: dict, layers: dict) -> list[dict[str, str]]:
+    """Collect source-backed scoring signals before invoking the rewriter."""
+    raw_text = extracted.get("raw_text") or parsed.get("raw_text") or ""
+    sections = parsed.get("sections") or {}
+    signals: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(text: str, kind: str, section: str, restore_text: str = "") -> None:
+        text = text.strip()
+        key = text.casefold()
+        if not text or key in seen:
+            return
+        seen.add(key)
+        signals.append({
+            "text": text,
+            "kind": kind,
+            "section": section,
+            "restore_text": restore_text or text,
+        })
+
+    role = layers.get("role") or ""
+    job_keywords = extract_job_keywords(layers.get("job_description") or "", role=role)
+    scoring_text = flatten_resume_text(parsed_to_resume(parsed, title=role)) or raw_text
+    for keyword in job_keywords.get("keywords") or []:
+        if not isinstance(keyword, str) or not keyword_in_text(keyword, scoring_text):
+            continue
+        section = next(
+            (
+                key
+                for key in ("skills", "experience", "summary", "technical_expertise")
+                if keyword_in_text(keyword, str(sections.get(key) or ""))
+            ),
+            "skills",
+        )
+        add(keyword, "keyword", section)
+
+    cert_lines: list[tuple[str, str]] = []
+    for section in ("certifications", "documents", "license"):
+        for line in str(sections.get(section) or "").splitlines():
+            line = line.strip()
+            if line:
+                cert_lines.append((line, section))
+                add(line, "certificate", section)
+
+    for certificate in extract_certificates(raw_text):
+        match = re.search(re.escape(certificate), raw_text, re.IGNORECASE)
+        if match:
+            add(match.group(), "certificate", "certifications")
+
+    for line, section in cert_lines:
+        for pattern in (_CERT_CODE_RE, _BARE_CERT_NUMBER_RE):
+            for match in pattern.finditer(line):
+                add(match.group(), "certificate_code", section, line)
+
+    for match in _METRIC_RE.finditer(raw_text):
+        metric = match.group().strip()
+        if not metric or not re.search(r"\d", metric):
+            continue
+        line_start = raw_text.rfind("\n", 0, match.start()) + 1
+        line_end = raw_text.find("\n", match.end())
+        source_line = raw_text[line_start:] if line_end == -1 else raw_text[line_start:line_end]
+        source_line = source_line.strip()
+        if re.search(r"[\w.+-]{1,64}@[\w-]+(?:\.[\w-]+)+", source_line):
+            continue
+        section = next(
+            (
+                key
+                for key, value in sections.items()
+                if isinstance(value, str) and metric.casefold() in value.casefold()
+            ),
+            "experience",
+        )
+        add(metric, "metric", section, source_line or metric)
+
+    checks = layers.get("generic", {}).get("parse_checks") or []
+    detected_sections = next(
+        (
+            check.get("params", {}).get("found", [])
+            for check in checks
+            if check.get("id") == "section_headings"
+        ),
+        [],
+    )
+    section_labels = {
+        "summary": "Summary",
+        "experience": "Experience",
+        "education": "Education",
+        "skills": "Skills",
+    }
+    for section in detected_sections:
+        label = section_labels.get(section)
+        if label:
+            add(label, "section_heading", section)
+
+    maritime = layers.get("maritime")
+    if maritime:
+        rank = maritime.get("rank_detected")
+        if isinstance(rank, str) and rank and rank != "unknown":
+            add(rank, "rank", "experience")
+        for vessel_type in maritime.get("vessel_types") or []:
+            add(str(vessel_type), "vessel_type", "experience")
+
+    return signals
 
 
 def score_layers(

@@ -137,10 +137,10 @@ GET /ats/status/{job_id}
 When polling returns `status: "done"`, fetch `GET /ats/result/{job_id}` and check `rewrite_quality` in that completed result. (`/ats/status/{job_id}` reports progress; `rewrite_quality` is included in `/ats/result/{job_id}`.)
 
 - `"full"` means the rewrite improved the score by 15 or more points.
-- `"partial"` means the score improved, but by fewer than 15 points; the best available version is returned.
-- `"none"` means the score did not improve; do not tell the user their resume improved, and recommend manual review.
+- `"partial"` means the score was equal to or higher than the original but improved by fewer than 15 points; the best available version is returned.
+- `"none"` means Claude failed or the best rewrite scored below the original; source-derived content is returned instead, and `ai_rewrite` is false. The source-derived DOCX is rescored, but formatting and extraction can still make its score lower than the uploaded file, so inspect `score_after` and recommend manual review.
 
-For `"partial"`, show **“Resume improved but may need manual review”** instead of claiming a full rewrite.
+For `"partial"`, show **“Resume score maintained or modestly improved; manual review recommended”** instead of claiming a full rewrite.
 
 ### 3. Get the result
 

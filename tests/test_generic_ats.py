@@ -297,6 +297,125 @@ def test_score_layers_generic_only_when_forced():
     assert 0 <= layers["generic"]["total_score"] <= 100
 
 
+def test_keyword_resume_scores_equal_or_higher_after_protected_rewrite():
+    from services.ai_client import restore_protected_signals
+    from services.two_layer import build_protected_signals, score_layers, score_layers_after_rewrite
+
+    raw_text = (
+        "Ada Lovelace\nada@example.com +1-555-0100111\n"
+        "Summary\nSoftware Engineer with Python and FastAPI experience.\n"
+        "Experience\nJan 2020 - Mar 2023 Analytical Engines\n"
+        "Built FastAPI services in Python and SQL.\n"
+        "Education\nB.S. 2014 - 2018\n"
+        "Skills\nPython FastAPI SQL\n"
+    )
+    extracted = {"raw_text": raw_text, "structural_issues": []}
+    parsed = {
+        "name": "Ada Lovelace",
+        "rank": "",
+        "contact": {"email": "ada@example.com", "phone": "+1-555-0100111"},
+        "skills": ["Python", "FastAPI", "SQL"],
+        "sections": {
+            "summary": "Software Engineer with Python and FastAPI experience.",
+            "experience": "Jan 2020 - Mar 2023 Analytical Engines\nBuilt FastAPI services in Python and SQL.",
+            "education": "B.S. 2014 - 2018",
+            "skills": "Python FastAPI SQL",
+        },
+        "raw_text": raw_text,
+    }
+    job_description = "Software Engineer\nRequired: Python, FastAPI, SQL"
+    before = score_layers(
+        extracted, parsed, job_description=job_description, career_track="generic"
+    )
+    protected_signals = build_protected_signals(extracted, parsed, before)
+    rewritten = {
+        "summary": "Software Engineer with Python experience. Built reliable services. Worked across technical teams.",
+        "rank": "",
+        "experience_bullets": [
+            {
+                "role": "Software Engineer",
+                "company": "Analytical Engines",
+                "dates": "Jan 2020 - Mar 2023",
+                "bullets": ["Built services in Python and SQL."],
+            }
+        ],
+        "skills": ["Python", "SQL"],
+        "certifications": [],
+        "education": ["B.S. 2014 - 2018"],
+        "documents": {},
+        "languages": [],
+    }
+    restore_protected_signals(rewritten, parsed, protected_signals)
+    after_text = (
+        "Ada Lovelace\nada@example.com +1-555-0100111\n"
+        "Professional Summary\n" + rewritten["summary"] + "\n"
+        "Work Experience\nSoftware Engineer Analytical Engines Jan 2020 - Mar 2023\n"
+        + " ".join(rewritten["experience_bullets"][0]["bullets"]) + "\n"
+        "Education\n" + " ".join(rewritten["education"]) + "\n"
+        "Skills\n" + " ".join(rewritten["skills"])
+    )
+    after = score_layers_after_rewrite(
+        rewritten,
+        {"raw_text": after_text, "structural_issues": []},
+        {"sections": {"experience": after_text}},
+        job_description=before["job_description"],
+        ext="docx",
+    )
+
+    assert "FastAPI" in rewritten["skills"]
+    assert after["generic"]["total_score"] >= before["generic"]["total_score"]
+
+
+def test_protected_signals_include_keywords_cert_data_metrics_headings_and_maritime():
+    from services.two_layer import build_protected_signals
+
+    raw_text = (
+        "Third Officer\n"
+        "Phone: +1-555-0100111\n"
+        "Summary\nExperienced with Python and FastAPI.\n"
+        "Experience\nServed 12 months on oil tanker. Improved output by 35%.\n"
+        "Education\nB.S. 2014 - 2018\n"
+        "Skills\nPython FastAPI\n"
+        "Certifications\nSTCW Basic Safety | MMD Mumbai | 123456\n"
+    )
+    parsed = {
+        "raw_text": raw_text,
+        "skills": ["Python", "FastAPI"],
+        "sections": {
+            "summary": "Experienced with Python and FastAPI.",
+            "experience": "Served 12 months on oil tanker. Improved output by 35%.",
+            "education": "B.S. 2014 - 2018",
+            "skills": "Python FastAPI",
+            "certifications": "STCW Basic Safety | MMD Mumbai | 123456",
+        },
+    }
+    layers = {
+        "role": "Third Officer",
+        "job_description": "Third Officer\nRequired: Python FastAPI",
+        "generic": {
+            "parse_checks": [
+                {"id": "section_headings", "params": {
+                    "found": ["summary", "experience", "education", "skills"],
+                }},
+            ],
+        },
+        "maritime": {
+            "rank_detected": "third officer",
+            "vessel_types": ["oil tanker"],
+        },
+    }
+
+    signals = build_protected_signals(
+        {"raw_text": raw_text}, parsed, layers,
+    )
+    terms = {signal["text"] for signal in signals}
+
+    assert {"Python", "FastAPI", "STCW", "123456", "12 months", "35%",
+            "Summary", "Experience", "Education", "Skills",
+            "third officer", "oil tanker"} <= terms
+    assert not any(term in {"1", "555", "0100111", "2014", "2018"} for term in terms)
+
+
 def test_score_layers_runs_maritime_for_known_track():
     from services.two_layer import score_layers
 

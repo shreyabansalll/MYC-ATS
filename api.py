@@ -48,7 +48,7 @@ import sentry_sdk
 from config import OUTPUT_DIR
 from pipeline.extractor import extract_text, extract_photo
 from pipeline.parser import parse_resume
-from services.ai_client import rewrite_resume
+from services.ai_client import restore_protected_signals, rewrite_resume
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
 from generic_ats.pdf_classic import generate_classic_pdf
@@ -58,6 +58,7 @@ from services.two_layer import (
     score_layers,
     score_layers_after_rewrite,
     should_retry_rewrite,
+    build_protected_signals,
 )
 
 # ── Logging — structured JSON, NO PII ────────────────────────────────
@@ -719,7 +720,7 @@ def _extract_with_timeout(file_path: str, ext: str) -> dict:
 
 def _rewrite_or_fallback(
     parsed, all_issues, tailored_jd, rank, candidate_profile,
-    target_cruise_line, overlay, strict=False,
+    target_cruise_line, overlay, strict=False, protected_signals=None,
 ):
     rewritten = rewrite_resume(
         parsed=parsed,
@@ -731,6 +732,7 @@ def _rewrite_or_fallback(
         target_cruise_line=target_cruise_line if overlay else '',
         strict=strict,
         generic_mode=not overlay,
+        protected_signals=protected_signals,
     )
     retries = rewritten.pop('_llm_retry_count', 0) if isinstance(rewritten, dict) else 0
     failed = isinstance(rewritten, dict) and 'error' in rewritten
@@ -748,10 +750,14 @@ def _rewrite_or_fallback(
             'issues_fixed': [AI_REWRITE_FALLBACK_ISSUE],
             'rank': rank,
         }
+        rewritten = restore_protected_signals(
+            rewritten, parsed, protected_signals or [],
+        )
     return rewritten, failed, retries
 
 
 AI_REWRITE_FALLBACK_ISSUE = 'AI rewrite unavailable — original content preserved'
+AI_REWRITE_ROLLBACK_ISSUE = 'AI rewrite reduced the ATS score; original content preserved'
 
 
 def _inject_identity(rewritten, candidate_profile, rank, maritime_before):
@@ -861,6 +867,9 @@ def run_pipeline(
             parsed,
             maritime_before if maritime_before is not None else maritime_stub_for_profile(parsed),
         )
+        protected_signals = build_protected_signals(
+            extracted, parsed, layers_before,
+        )
 
         # ── 4. AI Rewrite (Claude) ────────────────────────────────────
         stage('Rewriting for ATS optimisation', 50)
@@ -871,6 +880,7 @@ def run_pipeline(
         rewritten, rewrite_failed, llm_retries = _rewrite_or_fallback(
             parsed, all_issues, tailored_jd, rank, candidate_profile,
             target_cruise_line, overlay, strict=False,
+            protected_signals=protected_signals,
         )
         _metrics.record_llm_attempt(retries=llm_retries, failed=rewrite_failed)
         log.info(
@@ -924,6 +934,7 @@ def run_pipeline(
             retry_rewritten, retry_failed, retry_retries = _rewrite_or_fallback(
                 parsed, all_issues, tailored_jd, rank, candidate_profile,
                 target_cruise_line, overlay, strict=True,
+                protected_signals=protected_signals,
             )
             _metrics.record_llm_attempt(retries=retry_retries, failed=retry_failed)
             if not retry_failed:
@@ -947,7 +958,62 @@ def run_pipeline(
                     improvement = retry_improvement
                     extracted2, parsed2 = extracted_r, parsed_r
 
-        quality = rewrite_quality_from_improvement(improvement)
+        score_rollback = ats_after['total_score'] < ats_before['total_score']
+        if score_rollback:
+            rewritten = {
+                'summary': parsed.get('sections', {}).get('summary', ''),
+                'experience_bullets': _build_fallback_experience_bullets(parsed, rank),
+                'skills': list(parsed.get('skills') or []),
+                'certifications': [
+                    line.strip() for line in
+                    (parsed.get('sections', {}).get('certifications') or '').splitlines()
+                    if line.strip()
+                ],
+                'education': [
+                    line.strip() for line in
+                    (parsed.get('sections', {}).get('education') or '').splitlines()
+                    if line.strip()
+                ],
+                'documents': {},
+                'languages': [
+                    line.strip() for line in
+                    (parsed.get('sections', {}).get('languages') or '').splitlines()
+                    if line.strip()
+                ],
+                'technical_expertise': [
+                    line.strip() for line in
+                    (parsed.get('sections', {}).get('technical_expertise') or '').splitlines()
+                    if line.strip()
+                ],
+                'issues_fixed': [AI_REWRITE_ROLLBACK_ISSUE],
+                'rank': rank,
+            }
+            rewritten = restore_protected_signals(
+                rewritten, parsed, protected_signals,
+            )
+            _inject_identity(rewritten, candidate_profile, rank, maritime_before)
+            docx_path, pdf_path = _write_ats_outputs(rewritten, job_id, out_dir)
+            extracted2 = extract_text(docx_path, 'docx')
+            parsed2 = parse_resume(extracted2['raw_text'])
+            layers_after = score_layers_after_rewrite(
+                rewritten, extracted2, parsed2,
+                job_description=tailored_jd,
+                career_track=career_track,
+                target_rank=rank,
+                target_cruise_line=target_cruise_line,
+                overlay=overlay,
+            )
+            ats_after = layers_after['generic']
+            maritime_after = layers_after['maritime']
+            improvement = ats_after['total_score'] - ats_before['total_score']
+
+        quality = (
+            'none'
+            if score_rollback or rewrite_failed
+            else 'partial'
+            if improvement == 0
+            else rewrite_quality_from_improvement(improvement)
+        )
         log.info(
             f'"job_id":"{job_id}",'
             f'"score_before":{ats_before["total_score"]},'
@@ -1549,15 +1615,26 @@ def result(job_id: str):
             return []
 
     issues_fixed = _load(job.issues_fixed_json)
-    ai_rewrite = AI_REWRITE_FALLBACK_ISSUE not in issues_fixed
+    ai_rewrite = not any(
+        issue in issues_fixed
+        for issue in (AI_REWRITE_FALLBACK_ISSUE, AI_REWRITE_ROLLBACK_ISSUE)
+    )
+    if AI_REWRITE_ROLLBACK_ISSUE in issues_fixed:
+        rewrite_note = (
+            'The AI rewrite scored below the original resume; '
+            'source-derived content was returned instead.'
+        )
+    elif AI_REWRITE_FALLBACK_ISSUE in issues_fixed:
+        rewrite_note = (
+            'Anthropic rewriting was unavailable (missing/invalid API key or provider error); '
+            'original resume content was preserved.'
+        )
+    else:
+        rewrite_note = None
     return {
         'job_id':               job.job_id,
         'ai_rewrite':           ai_rewrite,
-        'note': (
-            None if ai_rewrite else
-            'Anthropic rewrite was unavailable (missing/invalid API key or provider error); '
-            'original resume content was preserved.'
-        ),
+        'note':                 rewrite_note,
 
         # Scores
         'score_before':         job.ats_score_before,

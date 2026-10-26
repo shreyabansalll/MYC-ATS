@@ -13,7 +13,8 @@ import config
 from services.ai_client import (
     enforce_minimum_quality, sanitise_section, enforce_cert_completeness,
     _normalize_rewrite_result, _stringify_cert, build_rewrite_prompt,
-    _drop_fabricated_reference_numbers,
+    _drop_fabricated_reference_numbers, restore_protected_signals,
+    build_generic_rewrite_prompt,
 )
 
 
@@ -310,6 +311,100 @@ def test_build_rewrite_prompt_includes_verified_sea_months():
     )
     assert '137 months' in prompt
     assert 'verified' in prompt.lower()
+
+
+def test_rewrite_prompts_include_protected_terms():
+    signals = [
+        {'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'},
+        {'text': 'CDC MUM123456', 'kind': 'certificate', 'section': 'documents'},
+    ]
+
+    maritime_prompt = build_rewrite_prompt(
+        _CRUISE_TEST_PARSED, [], '', rank='third officer',
+        protected_signals=signals,
+    )
+    generic_prompt = build_generic_rewrite_prompt(
+        _CRUISE_TEST_PARSED, [], '', protected_signals=signals,
+    )
+
+    for prompt in (maritime_prompt, generic_prompt):
+        assert 'PROTECTED TERMS' in prompt
+        assert 'do not rephrase, remove, or alter' in prompt
+        assert '- FastAPI' in prompt
+        assert '- CDC MUM123456' in prompt
+
+
+def test_rewrite_resume_restores_a_model_dropped_protected_keyword(monkeypatch):
+    import services.ai_client as ai_client_module
+
+    response = json.dumps({
+        'summary': 'First sentence here. Second sentence here. Third sentence here.',
+        'experience_bullets': [],
+        'skills': ['Python'],
+        'certifications': [],
+        'education': [],
+        'documents': {},
+        'languages': [],
+    })
+    monkeypatch.setattr(ai_client_module, 'client', _make_fake_client(response))
+
+    result = ai_client_module.rewrite_resume(
+        parsed={'sections': {}, 'contact': {}, 'skills': [], 'raw_text': '', 'name': 'Test'},
+        issues=[],
+        generic_mode=True,
+        protected_signals=[
+            {'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'},
+        ],
+    )
+
+    assert 'error' not in result
+    assert 'FastAPI' in result['skills']
+
+
+def test_restore_protected_signals_puts_omitted_terms_in_their_source_sections():
+    result = {
+        'summary': 'Third Officer with marine experience. Maintained vessel systems. Served at sea.',
+        'experience_bullets': [
+            {'role': 'Third Officer', 'company': 'Example Co', 'dates': '2020 - 2022', 'bullets': ['Managed watchkeeping.']},
+        ],
+        'skills': ['Navigation'],
+        'certifications': [],
+        'education': [],
+        'documents': {},
+        'languages': [],
+    }
+    signals = [
+        {'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'},
+        {'text': 'MUM123456', 'kind': 'certificate_code', 'section': 'documents', 'restore_text': 'CDC No. MUM123456'},
+        {'text': '27 months', 'kind': 'metric', 'section': 'experience', 'restore_text': 'Served 27 months aboard Example Vessel.'},
+    ]
+
+    fixed = restore_protected_signals(result, {}, signals)
+
+    assert 'FastAPI' in fixed['skills']
+    assert 'CDC No. MUM123456' in fixed['documents']['other']
+    assert 'Served 27 months aboard Example Vessel.' in fixed['experience_bullets'][0]['bullets']
+
+
+def test_restore_protected_section_heading_restores_source_content():
+    fixed = restore_protected_signals(
+        {'skills': []},
+        {'sections': {'skills': 'Python\nFastAPI'}, 'skills': ['Python', 'FastAPI']},
+        [{'text': 'Skills', 'kind': 'section_heading', 'section': 'skills'}],
+    )
+
+    assert fixed['skills'] == ['Python', 'FastAPI']
+    assert 'Skills' not in fixed['skills']
+
+
+def test_protected_signal_validation_preserves_exact_case():
+    fixed = restore_protected_signals(
+        {'skills': ['fastapi']},
+        {},
+        [{'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'}],
+    )
+
+    assert fixed['skills'] == ['fastapi', 'FastAPI']
 
 
 _CRUISE_TEST_PARSED = {

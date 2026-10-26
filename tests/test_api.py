@@ -400,6 +400,110 @@ def test_run_pipeline_error_message_distinguishes_extraction_failure_reason(tmp_
     )
 
 
+def test_run_pipeline_rolls_back_rewrite_when_strict_retry_still_scores_lower(
+    monkeypatch, tmp_path,
+):
+    import json
+    import api
+
+    class _Db:
+        def close(self):
+            pass
+
+    parsed = {
+        'name': 'Ada Lovelace',
+        'rank': '',
+        'contact': {'email': 'ada@example.com'},
+        'skills': ['Python', 'FastAPI'],
+        'sections': {
+            'summary': 'Software Engineer with Python experience.',
+            'experience': 'Built FastAPI services.',
+            'skills': 'Python FastAPI',
+            'certifications': 'Certificate A',
+            'education': 'B.S. Mathematics',
+            'languages': 'English',
+            'technical_expertise': 'FastAPI services',
+        },
+    }
+    before = {
+        'generic': {
+            'total_score': 60, 'grade': 'PASS', 'issues': [],
+            'keyword_data': {'match_pct': 100},
+        },
+        'maritime': None,
+        'overlay': False,
+        'job_description': 'Software Engineer Python FastAPI',
+    }
+    scores_after = iter((50, 55, 58))
+    writes = []
+    saved = {}
+
+    monkeypatch.setattr(api, 'get_db', lambda: _Db())
+    monkeypatch.setattr(api, 'update_job', lambda _db, _job_id, **values: saved.update(values))
+    monkeypatch.setattr(
+        api, '_extract_with_timeout',
+        lambda *_: {'raw_text': 'Ada Lovelace\nSoftware Engineer\nPython FastAPI', 'structural_issues': []},
+    )
+    monkeypatch.setattr(api, 'parse_resume', lambda *_: parsed.copy())
+    monkeypatch.setattr(api, 'score_layers', lambda *_args, **_kwargs: before)
+    monkeypatch.setattr(api, 'build_protected_signals', lambda *_args: [
+        {'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'},
+    ])
+
+    rewrite_calls = []
+
+    def fake_rewrite(*_args, **kwargs):
+        rewrite_calls.append(kwargs)
+        return (
+            {
+                'summary': 'Rewritten summary. Second sentence. Third sentence.',
+                'experience_bullets': [],
+                'skills': ['Python'],
+                'certifications': [],
+                'education': [],
+                'documents': {},
+                'languages': [],
+                'issues_fixed': ['Improved wording'],
+            },
+            False,
+            0,
+        )
+
+    monkeypatch.setattr(api, '_rewrite_or_fallback', fake_rewrite)
+    monkeypatch.setattr(api, '_validate_rewrite_output', lambda *_: [])
+    monkeypatch.setattr(api, '_write_ats_outputs', lambda content, *_args: (
+        writes.append(content.copy()) or (f'{tmp_path}/resume.docx', f'{tmp_path}/resume.pdf')
+    ))
+    monkeypatch.setattr(api, 'extract_text', lambda *_: {
+        'raw_text': 'Ada Lovelace\nSoftware Engineer\nPython FastAPI',
+        'structural_issues': [],
+    })
+    monkeypatch.setattr(
+        api, 'score_layers_after_rewrite',
+        lambda *_args, **_kwargs: {
+            'generic': {
+                'total_score': next(scores_after), 'grade': 'FAIL', 'issues': [],
+            },
+            'maritime': None,
+        },
+    )
+    monkeypatch.setattr(api, 'extract_photo', lambda *_: None)
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(tmp_path))
+
+    api.run_pipeline('rollback-test', str(tmp_path / 'upload.pdf'), 'pdf', '', '')
+
+    assert len(rewrite_calls) == 2
+    assert rewrite_calls[0]['strict'] is False
+    assert rewrite_calls[1]['strict'] is True
+    assert all(call['protected_signals'][0]['text'] == 'FastAPI' for call in rewrite_calls)
+    assert len(writes) == 3
+    assert writes[-1]['issues_fixed'] == [api.AI_REWRITE_ROLLBACK_ISSUE]
+    assert saved['rewrite_quality'] == 'none'
+    assert api.AI_REWRITE_ROLLBACK_ISSUE in json.loads(saved['issues_fixed_json'])
+    assert saved['ats_score_before'] == 60
+    assert saved['ats_score_after'] == 58
+
+
 def test_run_pipeline_falls_back_gracefully_on_total_claude_outage(monkeypatch):
     """
     Simulates a total Claude outage (client is None). The job must still
@@ -633,6 +737,11 @@ def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):
                 status='done',
                 issues_fixed_json=json.dumps([api.AI_REWRITE_FALLBACK_ISSUE]),
             ),
+            api.Job(
+                job_id='rewrite-rollback',
+                status='done',
+                issues_fixed_json=json.dumps([api.AI_REWRITE_ROLLBACK_ISSUE]),
+            ),
         ])
         db.commit()
 
@@ -649,11 +758,17 @@ def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):
         '/ats/result/rewrite-fallback',
         headers={'X-API-Key': api.API_KEY},
     ).json()
+    rollback = client.get(
+        '/ats/result/rewrite-rollback',
+        headers={'X-API-Key': api.API_KEY},
+    ).json()
 
     assert success['ai_rewrite'] is True
     assert success['note'] is None
     assert fallback['ai_rewrite'] is False
     assert 'original resume content was preserved' in fallback['note']
+    assert rollback['ai_rewrite'] is False
+    assert 'scored below the original' in rollback['note']
 
 
 def _build_zlib_bomb_pdf(decompressed_mb: int) -> bytes:

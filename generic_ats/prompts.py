@@ -60,6 +60,8 @@ Job Description:
 Keywords to emphasize (only if already supported by resume content):
 {job_keywords}
 
+{protected_signals}
+
 Original Resume:
 {original_resume}
 
