@@ -376,12 +376,10 @@ def test_extract_pdf_handles_a_circular_page_tree_reference_without_hanging(tmp_
     Deliberate malformed-object-structure audit item: a /Pages node whose
     own /Parent points back to itself (and whose /Kids includes itself)
     is a classic pattern that can infinite-loop a naive recursive
-    page-tree walker. Confirmed here it doesn't hang or crash the whole
-    process -- pdfminer's own recursion guard raises a real
-    RecursionError, which the existing broad except in extract_pdf
-    already catches cleanly (same PDF_READ_ERROR path as any other
-    unreadable file), fast (well under a second) rather than exhausting
-    the call stack silently or hanging.
+    page-    tree walker. The current pdfminer version safely recovers the page
+    text from this fixture; this test confirms extraction remains bounded
+    and the valid text is not discarded just because the tree contains a
+    cycle.
     """
     objs = [
         b'<< /Type /Catalog /Pages 2 0 R >>',
@@ -409,9 +407,12 @@ def test_extract_pdf_handles_a_circular_page_tree_reference_without_hanging(tmp_
     result = extract_pdf(str(path))
     elapsed = time.monotonic() - t0
 
-    assert elapsed < 5, f'Expected this to fail fast, took {elapsed:.2f}s'
-    assert result['raw_text'] == ''
-    assert any('PDF_READ_ERROR' in issue for issue in result['structural_issues'])
+    assert elapsed < 5, f'Expected bounded extraction, took {elapsed:.2f}s'
+    assert 'Circular test' in result['raw_text']
+    assert not any(
+        issue.startswith('PDF_READ_ERROR')
+        for issue in result['structural_issues']
+    )
 
 
 def test_extract_pdf_gives_a_clear_signal_for_a_password_protected_file(tmp_path):

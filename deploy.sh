@@ -68,23 +68,20 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-if grep -q "generate-a-strong-random-key" .env; then
-    echo "ERROR: MYC_API_KEY not set in .env"
-    exit 1
-fi
+python3 - <<'PY'
+import sys
+from dotenv import dotenv_values
 
-# MYC_ADMIN_KEY is optional (falls back to MYC_API_KEY if genuinely
-# unset — see api.py's require_admin_key) but if the line was copied
-# from env_template.txt and left unedited, its placeholder text is
-# public (checked into this repo) — accepting it as a "configured" key
-# would be worse than the fallback, since it's a known value rather than
-# an unset one.
-if grep -q "generate-a-different-strong-random-key" .env; then
-    echo "ERROR: MYC_ADMIN_KEY is still set to its placeholder value in .env"
-    echo "       Either set it to a real, distinct key, or remove the line entirely"
-    echo "       (falls back to MYC_API_KEY when unset — see env_template.txt)."
-    exit 1
-fi
+values = dotenv_values('.env')
+api_key = values.get('MYC_API_KEY')
+admin_key = values.get('MYC_ADMIN_KEY')
+if not api_key or api_key == 'generate-a-strong-random-key-here':
+    sys.exit('ERROR: set a real MYC_API_KEY in .env')
+if not admin_key or admin_key == 'generate-a-different-strong-random-key-here':
+    sys.exit('ERROR: set a real MYC_ADMIN_KEY in .env')
+if api_key == admin_key:
+    sys.exit('ERROR: MYC_ADMIN_KEY must differ from MYC_API_KEY')
+PY
 
 # ANTHROPIC_API_KEY left as env_template.txt's literal placeholder is a
 # warning, not a hard exit: the service still starts and scoring-only
@@ -115,8 +112,9 @@ mkdir -p data/outputs "${TMP_DIR_CONFIGURED:-/tmp/ycm-ats}"
 # Run this script's steps 1-3 first either way — the unit file assumes
 # venv/ and .env already exist at the deploy path.
 echo "Starting API on port 8000..."
+export APP_ENV=production
 uvicorn api:app \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 8000 \
     --workers 2 \
     --log-level warning \

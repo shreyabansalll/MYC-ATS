@@ -4,13 +4,13 @@ For MYC's app developer. Covers everything the app needs to call this service: a
 
 ## Base URL and auth
 
-Every endpoint below except `GET /` and `GET /health` requires an `X-API-Key` header:
+Protected client endpoints require an `X-API-Key` header matching `MYC_API_KEY`. `/ats/admin/metrics` uses a separate `MYC_ADMIN_KEY`; `/` and `/health` are unauthenticated.
 
 ```
 X-API-Key: <your MYC_API_KEY>
 ```
 
-Missing or wrong key → `403 Forbidden`.
+Missing or wrong key → `403 Forbidden`. Production startup requires a distinct admin key; the service does not fall back to the client key for metrics.
 
 For internal testing, the service serves the interactive dashboard at `GET /dashboard`. It reads `MYC_API_KEY` from the server environment and never sends it to the browser. Local access needs no extra setup. To share the dashboard through a temporary tunnel, configure a distinct `DASHBOARD_ACCESS_KEY`; each trusted tester enters that key once and receives an eight-hour HttpOnly session. The proxy is limited to scoring, submissions, job status/results, and downloads. Never share `MYC_API_KEY` or expose the dashboard without the separate access key.
 
@@ -23,6 +23,10 @@ ngrok http 8000
 ```
 
 Share the ngrok HTTPS URL with trusted testers; they open `<ngrok-url>/dashboard` and enter the dashboard access key. The page uses same-origin proxy routes, so there is no `BASE_URL` to edit in the HTML. Stop the tunnel after testing. Do not use this temporary setup for production hosting.
+
+For production, `deploy.sh` and `marine-ats.service` bind Uvicorn to `127.0.0.1`. A Caddy site example is provided in [`deploy/Caddyfile.example`](./deploy/Caddyfile.example); replace `ats.example.com` with the service's public DNS name, install Caddy from its official package repository, and merge the site block into `/etc/caddy/Caddyfile`. Caddy obtains and renews certificates automatically when DNS points to the host and inbound ports 80/443 are reachable. Validate and reload with `sudo caddy validate --config /etc/caddy/Caddyfile` and `sudo systemctl reload caddy`. Keep port 8000 inaccessible from public networks.
+
+Before enabling public access, allow inbound SSH (including any non-default SSH port), TCP 80, and TCP 443 in both the host and provider firewalls; deny inbound TCP 8000. For UFW, first inspect `sudo ufw status numbered`, ensure the correct SSH allow rule exists, then add the web rules and a top-priority deny for 8000 (`sudo ufw allow 80/tcp`, `sudo ufw allow 443/tcp`, `sudo ufw insert 1 deny 8000/tcp`). Do not enable or modify a remote firewall until SSH access and a recovery path are confirmed. These are host-operator steps; this repository does not change live firewall rules or verify a deployed host.
 
 ## Two ways to score a resume
 
@@ -47,7 +51,7 @@ Synchronous. One request, one response, typically a couple of seconds.
 
 | Field | Required | Notes |
 |---|---|---|
-| `file` | Yes | PDF or DOCX, max 5MB |
+| `file` | Yes | PDF or DOCX, max 5MB; the multipart request body is bounded to the file limit plus 256KB overhead |
 | `job_description` | No | Target JD; otherwise a general or rank-based baseline is used |
 | `career_track` | No | Use `generic` to disable maritime scoring; a maritime track enables it |
 | `target_rank` | No | Overrides automatic rank detection and enables the maritime layer |
@@ -94,7 +98,7 @@ This endpoint doesn't create a job or persist anything — nothing to poll, noth
 
 | Field | Required | Notes |
 |---|---|---|
-| `file` | Yes | PDF or DOCX, max 5MB |
+| `file` | Yes | PDF or DOCX, max 5MB; the multipart request body is bounded to the file limit plus 256KB overhead |
 | `job_description` | No | Target JD; otherwise a general or rank-based baseline is used |
 | `target_rank` | No | Overrides automatic rank detection and enables maritime scoring |
 | `target_cruise_line` | No | See "Cruise-line tailoring" below; enables maritime scoring |
@@ -202,7 +206,7 @@ Leave it blank (or omit it) for the normal, rank-only behavior — this is what 
 | Code | Meaning |
 |---|---|
 | `403` | Missing/invalid `X-API-Key` |
-| `413` | File exceeds 5MB |
+| `413` | File exceeds 5MB or the multipart request exceeds the bounded body size |
 | `415` | Not a valid PDF/DOCX (wrong extension or failed content check) |
 | `422` | (`/ats/score` only) Could not extract any text from the file — see message for why (corrupt file, password-protected, scanned image with no text layer) |
 | `429` | Rate limit — 10 requests/minute per IP on `/ats/submit` and `/ats/score` |

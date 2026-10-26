@@ -356,6 +356,268 @@ def test_validate_file_rejects_a_file_over_max_file_mb():
     assert 'MB limit' in exc_info.value.detail
 
 
+def test_upload_reader_stops_at_one_byte_over_the_limit(monkeypatch):
+    import asyncio
+    import api
+    from fastapi import HTTPException
+
+    class ChunkedUpload:
+        size = None
+
+        def __init__(self):
+            self.remaining = b'x' * 20
+            self.bytes_read = 0
+
+        async def read(self, size):
+            chunk, self.remaining = self.remaining[:size], self.remaining[size:]
+            self.bytes_read += len(chunk)
+            return chunk
+
+    monkeypatch.setattr(api, 'MAX_FILE_BYTES', 7)
+    upload = ChunkedUpload()
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api._read_upload_contents(upload))
+
+    assert exc_info.value.status_code == 413
+    assert upload.bytes_read == 8
+
+
+def test_upload_body_middleware_rejects_chunked_oversize_before_form_parsing():
+    import asyncio
+    import api
+
+    calls = []
+    messages = [
+        {'type': 'http.request', 'body': b'123456', 'more_body': True},
+        {'type': 'http.request', 'body': b'78901', 'more_body': False},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    async def send(message):
+        calls.append(message)
+
+    async def downstream(_scope, _receive, _send):
+        pytest.fail('Oversized request must not reach Starlette form parsing')
+
+    middleware = api.UploadBodyLimitMiddleware(downstream, max_body_bytes=10)
+    asyncio.run(middleware(
+        {
+            'type': 'http',
+            'method': 'POST',
+            'path': '/ats/submit',
+            'headers': [],
+        },
+        receive,
+        send,
+    ))
+
+    assert calls[0]['status'] == 413
+
+
+def test_production_requires_distinct_client_and_admin_keys(monkeypatch):
+    import api
+
+    monkeypatch.setattr(api, 'APP_ENV', 'production')
+    monkeypatch.setattr(api, 'API_KEY', 'same-key')
+    monkeypatch.setattr(api, 'ADMIN_API_KEY', 'same-key')
+    with pytest.raises(RuntimeError, match='differ from MYC_API_KEY'):
+        api._validate_production_secrets()
+
+    monkeypatch.setattr(api, 'ADMIN_API_KEY', 'separate-admin-key')
+    monkeypatch.setattr(api, 'ALLOWED_ORIGINS', ['*'])
+    with pytest.raises(RuntimeError, match='explicit ALLOWED_ORIGINS'):
+        api._validate_production_secrets()
+
+    monkeypatch.setattr(api, 'ALLOWED_ORIGINS', ['https://app.example.test'])
+    api._validate_production_secrets()
+
+
+def test_private_upload_writer_creates_owner_only_file(tmp_path):
+    import api
+    import stat
+
+    path = tmp_path / 'upload.pdf'
+    api._write_private_upload(str(path), b'%PDF-1.4')
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_output_cleanup_rejects_paths_outside_the_job_directory(tmp_path, monkeypatch):
+    import api
+
+    output_root = tmp_path / 'outputs'
+    job_dir = output_root / 'job-1'
+    job_dir.mkdir(parents=True)
+    external_file = tmp_path / 'private.docx'
+    external_file.write_text('do not delete')
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(output_root))
+
+    assert api._remove_job_output_artifacts(
+        'job-1',
+        output_docx=str(external_file),
+    ) is False
+    assert external_file.read_text() == 'do not delete'
+    assert job_dir.is_dir()
+    assert api._safe_output_file('job-1', str(external_file)) is None
+
+
+def test_output_generation_rejects_a_symlinked_job_directory(tmp_path, monkeypatch):
+    import api
+
+    output_root = tmp_path / 'outputs'
+    output_root.mkdir()
+    external_dir = tmp_path / 'external'
+    external_dir.mkdir()
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(output_root))
+    (output_root / 'job-2').symlink_to(external_dir, target_is_directory=True)
+
+    with pytest.raises(OSError, match='Unsafe output directory'):
+        api._write_ats_outputs({}, 'job-2', str(output_root / 'job-2'))
+    assert list(external_dir.iterdir()) == []
+
+
+def test_delete_endpoint_retains_job_when_stored_output_is_outside_root(
+    tmp_path, monkeypatch,
+):
+    import api
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+
+    engine = create_engine(f'sqlite:///{tmp_path / "unsafe_delete.db"}')
+    api.Base.metadata.create_all(engine)
+    monkeypatch.setattr(api, 'engine', engine)
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(tmp_path / 'outputs'))
+    monkeypatch.setattr(api, 'API_KEY', 'delete-test-key')
+    external_file = tmp_path / 'outside.docx'
+    external_file.write_text('preserve this file')
+
+    db = api.get_db()
+    db.add(api.Job(
+        job_id='unsafe-job',
+        file_hash='unsafe-hash',
+        status='done',
+        output_docx=str(external_file),
+    ))
+    db.commit()
+    db.close()
+
+    response = TestClient(api.app).delete(
+        '/ats/job/unsafe-job',
+        headers={'X-API-Key': api.API_KEY},
+    )
+    assert response.status_code == 500
+    assert external_file.read_text() == 'preserve this file'
+    db = api.get_db()
+    assert db.get(api.Job, 'unsafe-job') is not None
+    db.close()
+    engine.dispose()
+
+
+def test_cleanup_expires_old_failed_jobs_and_removes_only_their_outputs(
+    tmp_path, monkeypatch,
+):
+    import api
+    from datetime import datetime, timedelta
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+
+    engine = create_engine(f'sqlite:///{tmp_path / "cleanup.db"}')
+    api.Base.metadata.create_all(engine)
+    monkeypatch.setattr(api, 'engine', engine)
+    monkeypatch.setattr(api, 'DB_PATH', str(tmp_path / 'cleanup.db'))
+    monkeypatch.setattr(api, 'API_KEY', 'cleanup-test-key')
+    monkeypatch.setattr(api, 'JOB_TTL_HOURS', 1)
+    output_root = tmp_path / 'outputs'
+    job_dir = output_root / 'failed-job'
+    job_dir.mkdir(parents=True)
+    output_file = job_dir / 'failed-job_ats.docx'
+    output_file.write_text('temporary candidate output')
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(output_root))
+
+    db = api.get_db()
+    db.add(api.Job(
+        job_id='failed-job',
+        file_hash='failed-hash',
+        status='failed',
+        created_at=datetime.utcnow() - timedelta(hours=2),
+        output_docx=str(output_file),
+    ))
+    db.commit()
+    db.close()
+
+    response = TestClient(api.app).post(
+        '/ats/cleanup',
+        headers={'X-API-Key': api.API_KEY},
+    )
+    assert response.status_code == 200
+    assert response.json()['deleted_jobs'] == 1
+    assert not job_dir.exists()
+    db = api.get_db()
+    assert db.get(api.Job, 'failed-job') is None
+    db.close()
+    engine.dispose()
+
+
+def test_health_does_not_report_ok_when_database_check_fails(monkeypatch):
+    import api
+
+    class BrokenDb:
+        def query(self, *_args):
+            raise RuntimeError('database unavailable')
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(api, 'get_db', lambda: BrokenDb())
+    result = api.health()
+    assert result['status'] == 'degraded'
+    assert result['database_ok'] is False
+    assert result['total_jobs'] == -1
+
+
+def test_rewrite_falls_back_on_new_numeric_claims_but_keeps_source_metrics(monkeypatch):
+    import api
+    from types import SimpleNamespace
+
+    profile = SimpleNamespace(license_rank='', sea_months=0)
+    parsed = {
+        'raw_text': 'Managed 5 vessels and generated $1.2M annual revenue.',
+        'sections': {'summary': 'Managed a fleet.'},
+        'skills': ['Operations'],
+    }
+    monkeypatch.setattr(api, 'rewrite_resume', lambda **_kwargs: {
+        'summary': 'Increased revenue by 45% and generated $1.2M.',
+        'experience_bullets': [
+            {'role': 'Officer', 'bullets': ['Oversaw 12 vessels.']},
+        ],
+        'skills': ['Operations'],
+        'certifications': [],
+        'education': [],
+        'documents': {},
+        'languages': [],
+    })
+
+    fallback, failed, _ = api._rewrite_or_fallback(
+        parsed, [], '', '', profile, '', False,
+    )
+
+    assert failed is True
+    assert fallback['summary'] == 'Managed a fleet.'
+    assert fallback['issues_fixed'] == [api.AI_REWRITE_FACTUALITY_ISSUE]
+
+    monkeypatch.setattr(api, 'rewrite_resume', lambda **_kwargs: {
+        'summary': 'Oversaw 5 vessels and generated $1.2M in revenue.',
+        'experience_bullets': [],
+        'skills': [],
+    })
+    accepted, failed, _ = api._rewrite_or_fallback(
+        parsed, [], '', '', profile, '', False,
+    )
+    assert failed is False
+    assert accepted['summary'].startswith('Oversaw 5 vessels')
+
+
 def test_run_pipeline_error_message_distinguishes_extraction_failure_reason(tmp_path):
     """
     Real gap fixed, confirmed by deliberately auditing exception handling
@@ -692,9 +954,8 @@ def test_submit_accepts_a_non_ooxml_zip_disguised_as_docx_but_fails_cleanly_down
 
 def test_admin_metrics_rejects_the_client_facing_key_when_a_distinct_admin_key_is_set(monkeypatch):
     """
-    Built and reasoned about (require_admin_key() falls back to
-    MYC_API_KEY only when MYC_ADMIN_KEY is unset) but never actually
-    exercised end-to-end with two real, distinct keys until now.
+    The dedicated admin credential must protect operational metrics;
+    the client-facing key is not accepted for this route.
     """
     import api
     from fastapi.testclient import TestClient
@@ -714,6 +975,19 @@ def test_admin_metrics_rejects_the_client_facing_key_when_a_distinct_admin_key_i
     assert r_admin_key.status_code == 200, (
         f'Expected the real admin key to be accepted, got {r_admin_key.status_code}: {r_admin_key.text}'
     )
+
+
+def test_admin_metrics_is_disabled_when_admin_key_is_missing(monkeypatch):
+    import api
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(api, 'API_KEY', 'client-only-key')
+    monkeypatch.setattr(api, 'ADMIN_API_KEY', '')
+    response = TestClient(api.app).get(
+        '/ats/admin/metrics',
+        headers={'X-API-Key': api.API_KEY},
+    )
+    assert response.status_code == 503
 
 
 def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):

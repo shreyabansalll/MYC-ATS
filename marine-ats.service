@@ -19,11 +19,12 @@ WorkingDirectory=/opt/marine-ats
 # file doesn't block startup — load_dotenv() already logged/handles
 # that at the application level.
 EnvironmentFile=-/opt/marine-ats/.env
+Environment=APP_ENV=production
 
-# Matches deploy.sh's own uvicorn invocation exactly (2 workers — safe
-# for BackgroundTasks + SQLite WAL, per CLAUDE.md's architecture notes).
+# Bind only to loopback; expose HTTPS through a separately configured TLS
+# reverse proxy. This service file does not configure that proxy.
 ExecStart=/opt/marine-ats/venv/bin/uvicorn api:app \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 8000 \
     --workers 2 \
     --log-level warning \

@@ -4,10 +4,15 @@
 # Required
 MYC_API_KEY=generate-a-strong-random-key-here   # openssl rand -hex 32
 
-# Recommended — separate key for GET /ats/admin/metrics, so the
+# Required in production — separate key for GET /ats/admin/metrics, so the
 # client-facing key embedded in MYC's app doesn't also grant access to
-# internal operational metrics. Falls back to MYC_API_KEY if unset.
+# internal operational metrics. Must differ from MYC_API_KEY.
 MYC_ADMIN_KEY=generate-a-different-strong-random-key-here   # openssl rand -hex 32
+
+# Production launch configuration. deploy.sh and marine-ats.service set
+# APP_ENV=production and bind Uvicorn to loopback behind a TLS proxy.
+# Keep development for local testing and temporary ngrok access.
+APP_ENV=development
 
 # Optional — required for team dashboard access through ngrok.
 # Keep this different from MYC_API_KEY; share only with trusted testers.
@@ -20,6 +25,8 @@ ANTHROPIC_API_KEY=your-anthropic-api-key-here
 MAX_FILE_MB=5
 JOB_TTL_HOURS=48
 TMP_DIR=/tmp/ycm-ats
+# Replace with the exact production browser origins; APP_ENV=production
+# rejects the development wildcard default.
 ALLOWED_ORIGINS=https://marineYourCareer.com,https://app.marineYourCareer.com
 
 # Max resumes processing at once, SERVICE-WIDE (default 5) -- enforced by
