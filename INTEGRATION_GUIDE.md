@@ -12,7 +12,17 @@ X-API-Key: <your MYC_API_KEY>
 
 Missing or wrong key → `403 Forbidden`.
 
-For internal testing, the service also serves the interactive dashboard at `GET /dashboard` on the same origin. The local-only dashboard proxy reads `MYC_API_KEY` from the server environment and never sends the key to the browser. Do not make this dashboard proxy public; production client applications should keep API keys in a trusted backend.
+For internal testing, the service serves the interactive dashboard at `GET /dashboard`. It reads `MYC_API_KEY` from the server environment and never sends it to the browser. Local access needs no extra setup. To share the dashboard through a temporary tunnel, configure a distinct `DASHBOARD_ACCESS_KEY`; each trusted tester enters that key once and receives an eight-hour HttpOnly session. The proxy is limited to scoring, submissions, job status/results, and downloads. Never share `MYC_API_KEY` or expose the dashboard without the separate access key.
+
+Example team test with ngrok:
+
+```bash
+# .env: set DASHBOARD_ACCESS_KEY to a separate random value (e.g. openssl rand -hex 32)
+venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000 --proxy-headers
+ngrok http 8000
+```
+
+Share the ngrok HTTPS URL with trusted testers; they open `<ngrok-url>/dashboard` and enter the dashboard access key. The page uses same-origin proxy routes, so there is no `BASE_URL` to edit in the HTML. Stop the tunnel after testing. Do not use this temporary setup for production hosting.
 
 ## Two ways to score a resume
 

@@ -200,6 +200,8 @@ def compute_section_completeness(resume: dict[str, Any]) -> float:
     headings_found = sum(
         1 for patterns in _SECTION_PATTERNS.values() if any(p in text for p in patterns)
     )
+    if not headings_found:
+        return 0.0
     if has_contact:
         return (headings_found + 1) / (len(_SECTION_PATTERNS) + 1) * 100
     return headings_found / len(_SECTION_PATTERNS) * 100

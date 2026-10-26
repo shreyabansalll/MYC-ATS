@@ -165,6 +165,8 @@ venv/bin/python -m pytest tests/
 **Generic ATS Score — /100** (`generic_ats/layer.py`)
 - **Parse/layout checks (40%)**: text extractability, garbled text, columns, tables, images/text coverage, contact details, section headings, and dates.
 - **Content score (60%)**: keyword coverage, skills coverage, title match, section completeness, and date consistency. A deterministic general-professional JD is used when no JD is provided.
+- Missing experience caps content at 30/60; resumes under 150 words cap it at 20/60, and resumes under 300 words receive a 0.75 content multiplier. Missing skills/contact, unquantified experience, generic objectives, and vague duty bullets are penalized.
+- Tables deduct 15 parse points, multi-column layout deducts 12, and no/near-zero extracted text caps parse at 5/40. Scores are calibrated after composition: below 40 use a 0.75 multiplier, 40–85 interpolate linearly from 30 to 85, and above 85 use `85 + (raw - 85) * 0.6`.
 - This differs from the legacy `pipeline/scorer.py` (40/20/40 format/sections/keywords) retained for old batch baselines and regression tests. Production `/ats/score`, `/ats/submit`, and `main.py` use `score_layers()`.
 
 **Maritime overlay — optional** (`pipeline/maritime.py`)
@@ -224,6 +226,7 @@ Copy `env_template.txt` to `.env` (never commit `.env`).
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `MYC_API_KEY` | Yes | — | Shared-secret auth for every `X-API-Key`-protected endpoint. Generate with `openssl rand -hex 32`. Service refuses all requests (503) if unset. |
+| `DASHBOARD_ACCESS_KEY` | No | unset | Separate key for trusted team access to the internal dashboard over ngrok. Required before remote dashboard access is allowed; testers receive an eight-hour HttpOnly session. Never reuse `MYC_API_KEY`. |
 | `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key for Claude resume tailoring and rewrites. |
 | `MAX_FILE_MB` | No | `5` | Upload size limit. |
 | `JOB_TTL_HOURS` | No | `48` | How long output files + job records are retained before `/ats/cleanup` deletes them. This is the PII retention boundary — do not extend without a data-retention reason, and don't add long-term storage of intermediate pipeline stages (extracted text, raw parses) elsewhere either; structured logging covers debugging needs. |

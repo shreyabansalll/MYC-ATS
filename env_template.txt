@@ -9,6 +9,10 @@ MYC_API_KEY=generate-a-strong-random-key-here   # openssl rand -hex 32
 # internal operational metrics. Falls back to MYC_API_KEY if unset.
 MYC_ADMIN_KEY=generate-a-different-strong-random-key-here   # openssl rand -hex 32
 
+# Optional — required for team dashboard access through ngrok.
+# Keep this different from MYC_API_KEY; share only with trusted testers.
+DASHBOARD_ACCESS_KEY=generate-a-separate-dashboard-key-here   # openssl rand -hex 32
+
 # Anthropic Claude (rewrite / tailor). Leave blank until the key is rotated in.
 ANTHROPIC_API_KEY=your-anthropic-api-key-here
 

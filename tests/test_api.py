@@ -1009,9 +1009,90 @@ def test_dashboard_is_served_by_the_api():
     response = asyncio.run(request_dashboard())
     assert response.status_code == 200
     assert response.headers['content-type'].startswith('text/html')
-    assert 'server environment' in response.text
-    assert 'http://localhost:8000' in response.text
+    assert 'The MYC API key stays on the server' in response.text
+    assert 'Dashboard access key' in response.text
     assert 'apiKeyInput' not in response.text
+
+
+def test_dashboard_session_authenticates_remote_tunnel_user(monkeypatch):
+    import asyncio
+    import httpx
+    import api
+
+    monkeypatch.setattr(api, 'API_KEY', 'server-api-key')
+    monkeypatch.setattr(api, 'DASHBOARD_ACCESS_KEY', 'separate-team-dashboard-key')
+
+    async def exercise_remote_session():
+        transport = httpx.ASGITransport(app=api.app, client=('203.0.113.18', 12345))
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url='https://marine-test.ngrok-free.app',
+        ) as client:
+            dashboard = await client.get('/dashboard')
+            session_status = await client.get('/dashboard/session')
+            login = await client.post(
+                '/dashboard/session',
+                headers={'Origin': 'https://marine-test.ngrok-free.app'},
+                json={'access_key': 'separate-team-dashboard-key'},
+            )
+            proxy = await client.get(
+                '/dashboard-api/ats/status/00000000-0000-0000-0000-000000000000',
+                headers={'Origin': 'https://marine-test.ngrok-free.app'},
+            )
+            return dashboard, session_status, login, proxy
+
+    dashboard, session_status, login, proxy = asyncio.run(exercise_remote_session())
+    assert dashboard.status_code == 200
+    assert session_status.json() == {'required': True, 'authenticated': False}
+    assert login.status_code == 200
+    assert login.json() == {'authenticated': True}
+    cookie = login.headers['set-cookie'].lower()
+    assert 'httponly' in cookie and 'secure' in cookie and 'samesite=strict' in cookie
+    assert proxy.status_code == 404
+    assert proxy.json()['detail'] == 'Job not found'
+
+
+def test_dashboard_remote_login_rejects_invalid_key_and_cross_origin(monkeypatch):
+    import asyncio
+    import httpx
+    import api
+
+    monkeypatch.setattr(api, 'DASHBOARD_ACCESS_KEY', 'separate-team-dashboard-key')
+
+    async def attempt_login(key, origin):
+        transport = httpx.ASGITransport(app=api.app, client=('203.0.113.18', 12345))
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url='https://marine-test.ngrok-free.app',
+        ) as client:
+            return await client.post(
+                '/dashboard/session',
+                headers={'Origin': origin},
+                json={'access_key': key},
+            )
+
+    invalid = asyncio.run(attempt_login('wrong-key', 'https://marine-test.ngrok-free.app'))
+    cross_origin = asyncio.run(attempt_login('separate-team-dashboard-key', 'https://attacker.example'))
+    assert invalid.status_code == 403
+    assert cross_origin.status_code == 403
+
+
+def test_dashboard_local_access_does_not_require_a_session(monkeypatch):
+    import asyncio
+    import httpx
+    import api
+
+    monkeypatch.setattr(api, 'DASHBOARD_ACCESS_KEY', '')
+
+    async def request_dashboard():
+        transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
+        async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+            response = await client.get('/dashboard/session')
+            return response
+
+    response = asyncio.run(request_dashboard())
+    assert response.status_code == 200
+    assert response.json() == {'required': False, 'authenticated': True}
 
 
 def test_dashboard_and_proxy_are_not_available_remotely(monkeypatch):
@@ -1020,6 +1101,7 @@ def test_dashboard_and_proxy_are_not_available_remotely(monkeypatch):
     import api
 
     monkeypatch.setattr(api, 'API_KEY', 'dashboard-proxy-test-key')
+    monkeypatch.setattr(api, 'DASHBOARD_ACCESS_KEY', '')
 
     async def request_remote_dashboard():
         transport = httpx.ASGITransport(app=api.app, client=('198.51.100.5', 12345))
@@ -1068,6 +1150,7 @@ def test_dashboard_proxy_uses_server_api_key(monkeypatch):
     import api
 
     monkeypatch.setattr(api, 'API_KEY', 'dashboard-proxy-test-key')
+    monkeypatch.setattr(api, 'DASHBOARD_ACCESS_KEY', '')
 
     async def request_proxy():
         transport = httpx.ASGITransport(app=api.app, client=('127.0.0.1', 12345))
@@ -1088,6 +1171,7 @@ def test_dashboard_proxy_forwards_resume_upload_without_browser_key(monkeypatch)
     import api
 
     monkeypatch.setattr(api, 'API_KEY', 'dashboard-proxy-test-key')
+    monkeypatch.setattr(api, 'DASHBOARD_ACCESS_KEY', '')
     monkeypatch.setattr(
         api,
         '_extract_with_timeout',

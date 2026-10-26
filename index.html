@@ -216,6 +216,16 @@
     background: rgba(251,191,36,0.07);
     font-size: 11px;
   }
+  .dashboard-login {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    gap: 10px;
+    margin-top: 16px;
+  }
+  .dashboard-login .field { margin-top: 0; }
+  .dashboard-login .btn { min-height: 38px; }
+  .dashboard-login[hidden] { display: none; }
 
   .actions {
     display: grid;
@@ -531,10 +541,17 @@
   <div class="grid">
     <!-- Left: input -->
     <section class="card" id="inputCard">
-      <h2>Internal dashboard</h2>
-      <div class="config-note">
-        The dashboard uses the API key configured in the server environment. The key is never sent to the browser. This page and its proxy are restricted to local access; open it at <strong>http://localhost:8000/dashboard</strong>.
+      <h2>Team testing dashboard</h2>
+      <div class="config-note" id="dashboardNotice">
+        The MYC API key stays on the server. For ngrok/team access, enter the separate dashboard access key once; it is exchanged for a short-lived HttpOnly session cookie.
       </div>
+      <form class="dashboard-login" id="dashboardLogin" hidden>
+        <div class="field">
+          <label class="lbl" for="dashboardAccessKey">Dashboard access key</label>
+          <input type="password" id="dashboardAccessKey" autocomplete="current-password" placeholder="Enter team dashboard key" />
+        </div>
+        <button class="btn btn-score" id="btnLogin" type="submit">Connect</button>
+      </form>
 
       <h2 style="margin-top:24px">Resume</h2>
 
@@ -620,6 +637,8 @@ let currentFile = null;
 let pollTimer = null;
 let pollInFlight = false;
 let downloadUrl = null;
+let dashboardAuthorized = false;
+let dashboardAccessRequired = false;
 
 const $ = (id) => document.getElementById(id);
 const dropzone = $('dropzone');
@@ -628,6 +647,61 @@ const btnScore = $('btnScore');
 const btnRewrite = $('btnRewrite');
 const resultsBody = $('resultsBody');
 const toast = $('toast');
+
+function updateDashboardAuth(authenticated, required) {
+  dashboardAccessRequired = required;
+  dashboardAuthorized = authenticated;
+  $('dashboardLogin').hidden = authenticated || !required;
+  $('dashboardNotice').textContent = required
+    ? (authenticated
+      ? 'Connected. The MYC API key stays on the server; this browser has a temporary dashboard session.'
+      : 'Enter the separate team dashboard access key. The MYC API key stays on the server.')
+    : 'Local dashboard access is enabled. The MYC API key stays on the server.';
+  btnScore.disabled = !currentFile || !authenticated || pollTimer !== null;
+  btnRewrite.disabled = !currentFile || !authenticated || pollTimer !== null;
+}
+
+async function initializeDashboard() {
+  try {
+    const response = await fetch('/dashboard/session');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const session = await response.json();
+    updateDashboardAuth(session.authenticated, session.required);
+  } catch (error) {
+    updateDashboardAuth(false, true);
+    showToast(`Could not check dashboard access: ${error.message}`);
+  }
+}
+
+$('dashboardLogin').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const accessKey = $('dashboardAccessKey').value;
+  const button = $('btnLogin');
+  button.disabled = true;
+  try {
+    const response = await fetch('/dashboard/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_key: accessKey }),
+    });
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body.detail) message += ` — ${body.detail}`;
+      } catch {}
+      throw new Error(message);
+    }
+    $('dashboardAccessKey').value = '';
+    updateDashboardAuth(true, true);
+  } catch (error) {
+    showToast(`Could not connect: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+initializeDashboard();
 
 function showToast(msg) {
   toast.textContent = msg;
@@ -659,8 +733,8 @@ function setFile(file) {
   $('fpSize').textContent = formatSize(file.size);
   $('fpExt').textContent = isPdf ? 'PDF' : 'DOCX';
   $('filePillWrap').style.display = 'block';
-  btnScore.disabled = false;
-  btnRewrite.disabled = false;
+  btnScore.disabled = !dashboardAuthorized;
+  btnRewrite.disabled = !dashboardAuthorized;
 }
 
 function clearFile() {
@@ -721,6 +795,10 @@ async function apiFetch(path, options = {}) {
     if (response.status === 429) {
       throw new Error('Rate limit reached. Please wait, then retry manually; this page will not retry automatically.');
     }
+    if (response.status === 401) {
+      updateDashboardAuth(false, true);
+      throw new Error('Dashboard session expired. Enter the team dashboard access key again.');
+    }
     throw new Error(message);
   }
   return response;
@@ -739,7 +817,7 @@ function setBusy(btn, busy, label) {
     if (btn.dataset.orig) btn.innerHTML = btn.dataset.orig;
     delete btn.dataset.orig;
     // re-evaluate overall disabled state
-    btn.disabled = !currentFile || pollTimer !== null;
+    btn.disabled = !currentFile || !dashboardAuthorized || pollTimer !== null;
   }
 }
 
@@ -973,8 +1051,8 @@ async function doScore() {
 function stopPolling() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   pollInFlight = false;
-  btnScore.disabled = !currentFile;
-  btnRewrite.disabled = !currentFile;
+  btnScore.disabled = !currentFile || !dashboardAuthorized;
+  btnRewrite.disabled = !currentFile || !dashboardAuthorized;
 }
 
 async function doRewrite() {

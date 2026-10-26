@@ -67,12 +67,10 @@ def test_title_match_none_when_posting_has_no_role():
 
 def test_section_completeness_falls_back_to_heading_scan():
     resume = {
-        "personalInfo": {},
-        "rawDump": "Summary\nExperience\nEducation\nSkills\npython",
+        "personalInfo": {"email": "ada@example.com"},
+        "rawDump": "Ada Lovelace ada@example.com Python",
     }
-    # Unstructured: no structured sections, scan text. Contact absent.
-    score = compute_section_completeness(resume)
-    assert 0 <= score <= 100
+    assert compute_section_completeness(resume) == 0
 
 
 def test_parse_check_fails_text_layer_on_empty_extract():
@@ -126,6 +124,118 @@ def test_score_generic_returns_api_shaped_result():
     assert result["grade"] in {"EXCELLENT", "GOOD", "PASS", "FAIL"}
     assert result["keyword_data"]["engine"] == "resume_matcher"
     assert "parse_check" in result["breakdown"]
+
+
+def test_minimal_bad_resume_scores_below_45():
+    extracted = {
+        "raw_text": (
+            "John Smith john@example.com +1 555 123 4567. "
+            "Seeking a job. I worked hard and helped with many tasks."
+        ),
+        "structural_issues": ["TABLES_DETECTED"],
+    }
+    parsed = {
+        "name": "John Smith",
+        "contact": {"email": "john@example.com", "phone": "+1 555 123 4567"},
+        "skills": [],
+        "sections": {},
+    }
+
+    result = score_generic(extracted, parsed)
+
+    assert len(extracted["raw_text"].split()) < 150
+    assert result["total_score"] < 45
+    assert result["breakdown"]["sub_scores"]["section_completeness"] == 0
+    assert result["breakdown"]["content_points"] <= 20
+    assert result["keyword_data"]["match_pct"] == 0
+    assert any("missing work experience" in issue for issue in result["issues"])
+
+
+def test_parse_score_applies_fixed_table_and_column_deductions():
+    raw_text = (
+        "Ada Lovelace ada@example.com +1-555-0100111\n"
+        "Summary\nExperienced engineer.\n"
+        "Experience\nBuilt 3 reliable services.\n"
+        "Education\nB.S. 2014 - 2018\n"
+        "Skills\nPython FastAPI SQL\n"
+    )
+    parsed = {
+        "name": "Ada Lovelace",
+        "contact": {"email": "ada@example.com", "phone": "+1-555-0100111"},
+        "skills": ["Python", "FastAPI", "SQL"],
+        "sections": {
+            "summary": "Experienced engineer.",
+            "experience": "Built 3 reliable services.",
+            "education": "B.S. 2014 - 2018",
+            "skills": "Python FastAPI SQL",
+        },
+    }
+
+    table_result = score_generic(
+        {"raw_text": raw_text, "structural_issues": ["TABLES_DETECTED"]}, parsed
+    )
+    column_result = score_generic(
+        {"raw_text": raw_text, "structural_issues": ["MULTI_COLUMN_LAYOUT_DETECTED"]},
+        parsed,
+    )
+
+    assert table_result["breakdown"]["parse_points"] == 25
+    assert column_result["breakdown"]["parse_points"] == 28
+
+
+def test_near_zero_text_caps_parse_component_at_five_points():
+    result = score_generic(
+        {"raw_text": "x", "structural_issues": ["IMAGE_ONLY_PDF"]},
+        {"contact": {}, "sections": {}, "skills": []},
+    )
+
+    assert result["breakdown"]["parse_points"] <= 5
+
+
+def test_score_calibration_uses_requested_piecewise_curve():
+    from generic_ats.layer import _calibrate_score
+
+    assert _calibrate_score(39) == 29.25
+    assert _calibrate_score(40) == 30
+    assert _calibrate_score(60) == 30 + 20 * (55 / 45)
+    assert _calibrate_score(85) == 85
+    assert _calibrate_score(90) == 88
+    assert _calibrate_score(100) == 94
+
+
+def test_content_score_penalizes_generic_unquantified_vague_writing():
+    from generic_ats.layer import _content_score
+
+    raw_text = (
+        "Ada Lovelace ada@example.com +1-555-0100111\n"
+        "Summary\nSeeking a job.\n"
+        "Experience\nAssisted with tasks.\n"
+        "Education\nB.S. 2014 - 2018\n"
+        "Skills\nPython FastAPI SQL\n"
+        + ("additional content " * 160)
+    )
+    report = build_report(
+        document_from_extracted({"raw_text": raw_text, "structural_issues": []})
+    )
+    resume = _resume(
+        summary="Seeking a job.",
+        workExperience=[
+            {
+                "description": ["Assisted with tasks."],
+            }
+        ],
+    )
+    keywords = extract_job_keywords(
+        "Seeking Software Engineer with Python experience",
+        role="Software Engineer",
+    )
+
+    score, issues = _content_score(100, resume, report, keywords, raw_text)
+
+    assert score == 41
+    assert any("generic objective" in issue for issue in issues)
+    assert any("no quantified" in issue for issue in issues)
+    assert any("vague duties" in issue for issue in issues)
 
 
 def test_extract_job_keywords_is_deterministic():

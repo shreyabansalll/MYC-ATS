@@ -12,6 +12,7 @@
 import os
 import re
 import ipaddress
+import hmac
 import uuid
 import copy
 import shutil
@@ -112,6 +113,7 @@ log = logging.getLogger(__name__)
 
 API_KEY          = os.getenv('MYC_API_KEY', '')
 ADMIN_API_KEY    = os.getenv('MYC_ADMIN_KEY', '')
+DASHBOARD_ACCESS_KEY = os.getenv('DASHBOARD_ACCESS_KEY', '')
 MAX_FILE_MB      = int(os.getenv('MAX_FILE_MB', '5'))
 MAX_FILE_BYTES   = MAX_FILE_MB * 1024 * 1024
 ALLOWED_EXTS     = {'pdf', 'docx'}
@@ -1033,7 +1035,7 @@ def run_pipeline(
 
 # ── Endpoints ─────────────────────────────────────────────────────────
 
-def _require_loopback_dashboard_client(request: Request) -> None:
+def _dashboard_client_is_local(request: Request) -> bool:
     client_host = request.client.host if request.client else ''
     requested_host = request.url.hostname or ''
     try:
@@ -1044,8 +1046,10 @@ def _require_loopback_dashboard_client(request: Request) -> None:
         requested_host_is_local = ipaddress.ip_address(requested_host).is_loopback
     except ValueError:
         requested_host_is_local = requested_host.lower() == 'localhost'
-    if not is_loopback or not requested_host_is_local:
-        raise HTTPException(403, 'The internal dashboard is only available from this server')
+    return is_loopback and requested_host_is_local
+
+
+def _require_dashboard_origin(request: Request) -> None:
     origin = request.headers.get('origin')
     if origin:
         parsed_origin = urlsplit(origin)
@@ -1055,17 +1059,91 @@ def _require_loopback_dashboard_client(request: Request) -> None:
         ):
             raise HTTPException(403, 'Cross-origin dashboard requests are not allowed')
     elif request.method == 'POST':
-        raise HTTPException(403, 'Dashboard submissions must originate from this page')
+        raise HTTPException(403, 'Dashboard requests must originate from this page')
+
+
+def _dashboard_session_token() -> str:
+    return hmac.new(
+        DASHBOARD_ACCESS_KEY.encode('utf-8'),
+        b'marine-ats-dashboard-session-v1',
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _require_dashboard_access(request: Request, *, allow_login: bool = False) -> None:
+    is_local = _dashboard_client_is_local(request)
+    _require_dashboard_origin(request)
+    if is_local and not DASHBOARD_ACCESS_KEY:
+        return
+    if not DASHBOARD_ACCESS_KEY:
+        raise HTTPException(
+            403,
+            'Remote dashboard access is disabled; configure DASHBOARD_ACCESS_KEY to enable team testing',
+        )
+    if allow_login:
+        return
+
+    expected_cookie = _dashboard_session_token()
+    supplied_cookie = request.cookies.get('marine_dashboard_session', '')
+    if not hmac.compare_digest(supplied_cookie, expected_cookie):
+        raise HTTPException(401, 'Dashboard session is missing or expired')
 
 
 @app.get('/dashboard', include_in_schema=False)
 def dashboard(request: Request):
     """Serve the internal API testing dashboard from this API origin."""
-    _require_loopback_dashboard_client(request)
+    _require_dashboard_access(request, allow_login=True)
     return FileResponse(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html'),
         media_type='text/html',
     )
+
+
+@app.get('/dashboard/session', include_in_schema=False)
+def dashboard_session(request: Request):
+    _require_dashboard_access(request, allow_login=True)
+    authenticated = bool(
+        DASHBOARD_ACCESS_KEY
+        and request.cookies.get('marine_dashboard_session')
+        and hmac.compare_digest(
+            request.cookies.get('marine_dashboard_session', ''),
+            _dashboard_session_token(),
+        )
+    )
+    local_trusted = _dashboard_client_is_local(request) and not DASHBOARD_ACCESS_KEY
+    return {
+        'required': bool(DASHBOARD_ACCESS_KEY),
+        'authenticated': authenticated or local_trusted,
+    }
+
+
+@app.post('/dashboard/session', include_in_schema=False)
+async def create_dashboard_session(request: Request):
+    _require_dashboard_access(request, allow_login=True)
+    if not DASHBOARD_ACCESS_KEY:
+        raise HTTPException(404, 'Dashboard access key is not configured')
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, 'Invalid dashboard login request')
+    access_key = payload.get('access_key') if isinstance(payload, dict) else None
+    if not isinstance(access_key, str) or not hmac.compare_digest(
+        access_key,
+        DASHBOARD_ACCESS_KEY,
+    ):
+        raise HTTPException(403, 'Invalid dashboard access key')
+
+    response = JSONResponse({'authenticated': True})
+    response.set_cookie(
+        'marine_dashboard_session',
+        _dashboard_session_token(),
+        max_age=8 * 60 * 60,
+        httponly=True,
+        secure=request.url.scheme == 'https',
+        samesite='strict',
+        path='/',
+    )
+    return response
 
 
 @app.api_route(
@@ -1074,8 +1152,8 @@ def dashboard(request: Request):
     include_in_schema=False,
 )
 async def dashboard_api_proxy(api_path: str, request: Request):
-    """Forward local dashboard requests using the server-side API key."""
-    _require_loopback_dashboard_client(request)
+    """Forward authenticated dashboard requests using the server-side API key."""
+    _require_dashboard_access(request)
     if not API_KEY:
         raise HTTPException(503, 'Service not configured — MYC_API_KEY missing')
 
