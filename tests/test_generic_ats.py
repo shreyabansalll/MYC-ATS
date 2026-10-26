@@ -196,8 +196,8 @@ def test_score_calibration_uses_requested_piecewise_curve():
     from generic_ats.layer import _calibrate_score
 
     assert _calibrate_score(39) == 29.25
-    assert _calibrate_score(40) == 30
-    assert _calibrate_score(60) == 30 + 20 * (55 / 45)
+    assert _calibrate_score(40) == 40
+    assert _calibrate_score(60) == 60
     assert _calibrate_score(85) == 85
     assert _calibrate_score(90) == 88
     assert _calibrate_score(100) == 94

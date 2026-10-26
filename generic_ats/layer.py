@@ -45,7 +45,7 @@ def _calibrate_score(raw_score: float) -> float:
         return raw_score * 0.75
     if raw_score > 85:
         return 85 + (raw_score - 85) * 0.6
-    return 30 + (raw_score - 40) * (55 / 45)
+    return raw_score
 
 
 def _check_params(report, check_id: str) -> dict:
