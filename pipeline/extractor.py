@@ -344,6 +344,14 @@ def extract_pdf(path: str) -> dict:
     is_multi_column = False
 
     try:
+        with pymupdf.open(path) as probe:
+            if probe.needs_pass:
+                return {
+                    'raw_text':          '',
+                    'structural_issues': ['PASSWORD_PROTECTED_PDF'],
+                    'is_ocr':            False,
+                }
+
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
                 x0   = page.bbox[0]

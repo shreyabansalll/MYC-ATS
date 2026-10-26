@@ -7,7 +7,7 @@
 # Resilience: timeouts, disk checks, concurrent-safe job handling
 # Logging:    structured JSON logs, no PII in output
 #
-# Run: uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2
+# Production bind: uvicorn api:app --host 127.0.0.1 --port 8000 --workers 2
 
 import os
 import re
@@ -24,6 +24,7 @@ import sqlite3
 import threading
 import multiprocessing
 import queue
+from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
@@ -40,7 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, event
+from sqlalchemy import and_, create_engine, Column, String, Integer, DateTime, Text, event, or_
 from sqlalchemy.orm import DeclarativeBase, Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
 import sentry_sdk
@@ -52,6 +53,7 @@ from services.ai_client import restore_protected_signals, rewrite_resume
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
 from generic_ats.pdf_classic import generate_classic_pdf
+from generic_ats.writing_quality import detect_novel_numbers
 from services.two_layer import (
     maritime_stub_for_profile,
     rewrite_quality_from_improvement,
@@ -115,11 +117,16 @@ log = logging.getLogger(__name__)
 API_KEY          = os.getenv('MYC_API_KEY', '')
 ADMIN_API_KEY    = os.getenv('MYC_ADMIN_KEY', '')
 DASHBOARD_ACCESS_KEY = os.getenv('DASHBOARD_ACCESS_KEY', '')
+APP_ENV          = os.getenv('APP_ENV', 'development').strip().lower()
 MAX_FILE_MB      = int(os.getenv('MAX_FILE_MB', '5'))
 MAX_FILE_BYTES   = MAX_FILE_MB * 1024 * 1024
 ALLOWED_EXTS     = {'pdf', 'docx'}
 JOB_TTL_HOURS    = int(os.getenv('JOB_TTL_HOURS', '48'))   # auto-delete outputs after 48h
 MIN_DISK_FREE_MB = 200                                        # refuse uploads if disk low
+ALLOWED_ORIGINS = [
+    origin.strip() for origin in os.getenv('ALLOWED_ORIGINS', '*').split(',')
+    if origin.strip()
+]
 
 TMP_DIR = os.getenv('TMP_DIR', '/tmp/ycm-ats')
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -129,14 +136,23 @@ if not API_KEY:
     log.warning('"MYC_API_KEY not set — all requests will be rejected"')
 
 if not ADMIN_API_KEY:
-    # Not a hard requirement — /ats/admin/metrics falls back to MYC_API_KEY
-    # below so this doesn't lock out deployments that haven't set it up
-    # yet, but that means the client-facing key (the one embedded in
-    # MYC's app, more exposed than a pure backend secret) also grants
-    # access to internal operational metrics (job counts, score deltas,
-    # Claude failure rates) unless this is set.
-    log.warning('"MYC_ADMIN_KEY not set — /ats/admin/metrics falls back to MYC_API_KEY, '
-                'the same key client requests use. Set MYC_ADMIN_KEY to a distinct value."')
+    log.warning('"MYC_ADMIN_KEY not set — /ats/admin/metrics is disabled"')
+
+
+def _validate_production_secrets():
+    if APP_ENV != 'production':
+        return
+    if not API_KEY:
+        raise RuntimeError('APP_ENV=production requires MYC_API_KEY')
+    if not ADMIN_API_KEY:
+        raise RuntimeError('APP_ENV=production requires a distinct MYC_ADMIN_KEY')
+    if hmac.compare_digest(API_KEY, ADMIN_API_KEY):
+        raise RuntimeError('APP_ENV=production requires MYC_ADMIN_KEY to differ from MYC_API_KEY')
+    if not ALLOWED_ORIGINS or '*' in ALLOWED_ORIGINS:
+        raise RuntimeError('APP_ENV=production requires explicit ALLOWED_ORIGINS')
+
+
+_validate_production_secrets()
 
 # ── Error tracking (Sentry) ──────────────────────────────────────────
 # Optional — same "warn, don't crash at import" pattern as MYC_API_KEY/
@@ -293,6 +309,71 @@ def update_job(db: Session, job_id: str, **kwargs):
             setattr(job, k, v)
         db.commit()
 
+
+class UploadBodyLimitMiddleware:
+    """Bound complete multipart request bodies before Starlette parses uploads."""
+
+    def __init__(self, app, max_body_bytes: int):
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope, receive, send):
+        upload_paths = {
+            '/ats/submit', '/ats/score',
+            '/dashboard-api/ats/submit', '/dashboard-api/ats/score',
+        }
+        if scope['type'] != 'http' or scope.get('path') not in upload_paths:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get('headers', [])}
+        content_length = headers.get(b'content-length')
+        if content_length:
+            try:
+                if int(content_length) > self.max_body_bytes:
+                    await self._respond_too_large(send)
+                    return
+            except ValueError:
+                await self._respond_too_large(send)
+                return
+
+        messages = []
+        total = 0
+        while True:
+            message = await receive()
+            if message['type'] == 'http.disconnect':
+                return
+            if message['type'] == 'http.request':
+                total += len(message.get('body', b''))
+                if total > self.max_body_bytes:
+                    await self._respond_too_large(send)
+                    return
+                messages.append(message)
+                if not message.get('more_body', False):
+                    break
+
+        async def replay_request():
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        await self.app(scope, replay_request, send)
+
+    @staticmethod
+    async def _respond_too_large(send):
+        body = b'{"detail":"Request body exceeds the upload limit"}'
+        await send({
+            'type': 'http.response.start',
+            'status': 413,
+            'headers': [(b'content-type', b'application/json')],
+        })
+        await send({
+            'type': 'http.response.body',
+            'body': body,
+            'more_body': False,
+        })
+
+
 # ── In-memory observability counters ────────────────────────────────────
 # Score deltas and job counts live in the Job table already — these cover
 # what doesn't: per-stage durations and Claude retry/failure counts. Reset on
@@ -330,25 +411,16 @@ _api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
 async def require_api_key(key: Optional[str] = Depends(_api_key_header)):
     if not API_KEY:
         raise HTTPException(503, 'Service not configured — MYC_API_KEY missing')
-    if not key or key != API_KEY:
+    if not key or not hmac.compare_digest(key, API_KEY):
         log.warning('"Rejected request with invalid API key"')
         raise HTTPException(403, 'Invalid or missing API key')
     return key
 
 
 async def require_admin_key(key: Optional[str] = Depends(_api_key_header)):
-    """
-    Separate from require_api_key so the client-facing key (embedded in
-    MYC's app) doesn't also grant access to internal operational metrics.
-    Falls back to MYC_API_KEY if MYC_ADMIN_KEY isn't set — see the
-    startup warning above — so this degrades to the old (shared-key)
-    behavior rather than locking out a deployment that hasn't set the
-    new variable, rather than a hard failure.
-    """
-    expected = ADMIN_API_KEY or API_KEY
-    if not expected:
-        raise HTTPException(503, 'Service not configured — MYC_API_KEY missing')
-    if not key or key != expected:
+    if not ADMIN_API_KEY:
+        raise HTTPException(503, 'Admin metrics unavailable — MYC_ADMIN_KEY is not configured')
+    if not key or not hmac.compare_digest(key, ADMIN_API_KEY):
         log.warning('"Rejected admin request with invalid API key"')
         raise HTTPException(403, 'Invalid or missing API key')
     return key
@@ -365,9 +437,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv('ALLOWED_ORIGINS', '*').split(','),
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=['GET', 'POST'],
     allow_headers=['X-API-Key', 'Content-Type'],
+)
+app.add_middleware(
+    UploadBodyLimitMiddleware,
+    max_body_bytes=MAX_FILE_BYTES + 256 * 1024,
 )
 
 # ── Rate limiting ─────────────────────────────────────────────────────
@@ -497,6 +573,31 @@ def _validate_file(contents: bytes, filename: str) -> str:
         raise HTTPException(415, 'File does not appear to be a valid DOCX')
 
     return ext
+
+
+async def _read_upload_contents(file: UploadFile) -> bytes:
+    """Read no more than the configured upload limit plus one byte."""
+    if file.size is not None and file.size > MAX_FILE_BYTES:
+        raise HTTPException(413, f'File exceeds {MAX_FILE_MB}MB limit')
+
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(min(64 * 1024, max(1, MAX_FILE_BYTES - total + 1)))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_FILE_BYTES:
+            raise HTTPException(413, f'File exceeds {MAX_FILE_MB}MB limit')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
+def _write_private_upload(path: str, contents: bytes) -> None:
+    """Create an upload file exclusively with owner-only permissions."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'wb') as upload_file:
+        upload_file.write(contents)
 
 
 def _file_hash(contents: bytes) -> str:
@@ -735,9 +836,42 @@ def _rewrite_or_fallback(
         protected_signals=protected_signals,
     )
     retries = rewritten.pop('_llm_retry_count', 0) if isinstance(rewritten, dict) else 0
-    failed = isinstance(rewritten, dict) and 'error' in rewritten
+    provider_failed = isinstance(rewritten, dict) and 'error' in rewritten
+    factuality_rejected = False
+    if not provider_failed:
+        claim_text = '\n'.join(
+            [
+                str(rewritten.get('summary') or ''),
+                *[
+                    bullet
+                    for entry in rewritten.get('experience_bullets', [])
+                    if isinstance(entry, dict)
+                    for bullet in (
+                        entry.get('bullets', [])
+                        if isinstance(entry.get('bullets'), list)
+                        else [entry.get('bullets', '')]
+                    )
+                    if isinstance(bullet, str)
+                ],
+            ]
+        )
+        # Numeric claims without units are commonly rank ordinals; avoid
+        # treating title formatting changes as invented achievements.
+        novel_claims = [
+            claim for claim in detect_novel_numbers(
+                parsed.get('raw_text') or '',
+                claim_text,
+            )
+            if not claim.startswith(':')
+        ]
+        factuality_rejected = bool(novel_claims)
+
+    failed = provider_failed or factuality_rejected
     if failed:
-        log.warning(f'"rewrite_error":"{rewritten.get("error")}"')
+        if provider_failed:
+            log.warning(f'"rewrite_error":"{rewritten.get("error")}"')
+        else:
+            log.warning(f'"rewrite_rejected_novel_numeric_claim_count":{len(novel_claims)}')
         rewritten = {
             'summary': parsed.get('sections', {}).get('summary', ''),
             'experience_bullets': _build_fallback_experience_bullets(parsed, rank),
@@ -747,7 +881,10 @@ def _rewrite_or_fallback(
             'documents': {},
             'languages': [],
             'technical_expertise': [],
-            'issues_fixed': [AI_REWRITE_FALLBACK_ISSUE],
+            'issues_fixed': [
+                AI_REWRITE_FACTUALITY_ISSUE
+                if factuality_rejected else AI_REWRITE_FALLBACK_ISSUE
+            ],
             'rank': rank,
         }
         rewritten = restore_protected_signals(
@@ -757,6 +894,7 @@ def _rewrite_or_fallback(
 
 
 AI_REWRITE_FALLBACK_ISSUE = 'AI rewrite unavailable — original content preserved'
+AI_REWRITE_FACTUALITY_ISSUE = 'AI rewrite introduced unsupported numeric claims — original content preserved'
 AI_REWRITE_ROLLBACK_ISSUE = 'AI rewrite reduced the ATS score; original content preserved'
 
 
@@ -769,6 +907,20 @@ def _inject_identity(rewritten, candidate_profile, rank, maritime_before):
 
 
 def _write_ats_outputs(rewritten, job_id, out_dir):
+    output_root = Path(OUTPUT_DIR).resolve()
+    job_dir = output_root / job_id
+    if (
+        job_dir.name != job_id
+        or job_dir.parent != output_root
+        or Path(os.path.abspath(out_dir)) != job_dir
+    ):
+        raise OSError('Unsafe output directory for job')
+    try:
+        job_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        if job_dir.is_symlink() or not job_dir.is_dir():
+            raise OSError('Unsafe output directory for job')
+    os.chmod(job_dir, 0o700)
     generate_docx(copy.deepcopy(rewritten), job_id=job_id)
     default_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume.docx')
     docx_path = os.path.join(out_dir, f'{job_id}_ats.docx')
@@ -776,7 +928,82 @@ def _write_ats_outputs(rewritten, job_id, out_dir):
         shutil.move(default_path, docx_path)
     pdf_path = os.path.join(out_dir, f'{job_id}_ats.pdf')
     generate_classic_pdf(rewritten, pdf_path)
+    os.chmod(docx_path, 0o600)
+    os.chmod(pdf_path, 0o600)
     return docx_path, pdf_path
+
+
+def _remove_job_output_artifacts(
+    job_id: str,
+    output_docx: str | None = None,
+    output_pdf: str | None = None,
+) -> bool:
+    """Remove only output files proven to belong to this job under OUTPUT_DIR."""
+    output_root = Path(OUTPUT_DIR).resolve()
+    job_dir = output_root / job_id
+    if job_dir.name != job_id or job_dir.parent != output_root or job_dir.is_symlink():
+        log.error(f'"unsafe_output_directory":"{job_id}"')
+        return False
+
+    legacy_names = {
+        f'{job_id}_ats_resume.docx',
+        f'{job_id}_ats_resume_photo.docx',
+        f'{job_id}_ats.pdf',
+    }
+    legacy_files = [
+        output_root / name for name in legacy_names
+        if (output_root / name).exists()
+    ]
+    for stored_path in (output_docx, output_pdf):
+        if not stored_path:
+            continue
+        resolved = Path(os.path.abspath(stored_path))
+        if resolved.parent == job_dir and not resolved.is_symlink():
+            continue
+        if (
+            resolved.parent == output_root
+            and resolved.name in legacy_names
+            and not resolved.is_symlink()
+        ):
+            legacy_files.append(resolved)
+            continue
+        log.error(f'"unsafe_output_file_path":"{job_id}"')
+        return False
+
+    for path in set(legacy_files):
+        if path.is_symlink() or path.parent != output_root:
+            log.error(f'"unsafe_legacy_output_file":"{job_id}"')
+            return False
+    if job_dir.exists():
+        shutil.rmtree(job_dir)
+    for path in set(legacy_files):
+        if path.exists():
+            path.unlink()
+    return True
+
+
+def _safe_output_file(job_id: str, stored_path: str | None) -> str | None:
+    if not stored_path:
+        return None
+    output_root = Path(OUTPUT_DIR).resolve()
+    job_dir = output_root / job_id
+    if job_dir.name != job_id or job_dir.parent != output_root or job_dir.is_symlink():
+        return None
+    resolved = Path(os.path.abspath(stored_path))
+    if resolved.parent == job_dir and not resolved.is_symlink():
+        return str(resolved)
+    legacy_names = {
+        f'{job_id}_ats_resume.docx',
+        f'{job_id}_ats_resume_photo.docx',
+        f'{job_id}_ats.pdf',
+    }
+    if (
+        resolved.parent == output_root
+        and resolved.name in legacy_names
+        and not resolved.is_symlink()
+    ):
+        return str(resolved)
+    return None
 
 
 # ── Background pipeline ───────────────────────────────────────────────
@@ -882,10 +1109,20 @@ def run_pipeline(
             target_cruise_line, overlay, strict=False,
             protected_signals=protected_signals,
         )
-        _metrics.record_llm_attempt(retries=llm_retries, failed=rewrite_failed)
+        rewrite_issues = rewritten.get('issues_fixed')
+        rewrite_rejected = (
+            isinstance(rewrite_issues, list)
+            and AI_REWRITE_FACTUALITY_ISSUE in rewrite_issues
+        )
+        _metrics.record_llm_attempt(
+            retries=llm_retries,
+            failed=rewrite_failed and not rewrite_rejected,
+        )
         log.info(
             f'"job_id":"{job_id}","llm_retry_count":{llm_retries},'
-            f'"llm_failed":{str(rewrite_failed).lower()},"overlay":{str(overlay).lower()}'
+            f'"llm_failed":{str(rewrite_failed and not rewrite_rejected).lower()},'
+            f'"rewrite_rejected":{str(rewrite_rejected).lower()},'
+            f'"overlay":{str(overlay).lower()}'
         )
 
         quality_warnings = _validate_rewrite_output(rewritten, extracted['raw_text'])
@@ -900,7 +1137,6 @@ def run_pipeline(
         # without a public route (same product decision as before).
         stage('Generating ATS-clean DOCX', 65)
         out_dir = os.path.join(OUTPUT_DIR, job_id)
-        os.makedirs(out_dir, exist_ok=True)
         docx_path, pdf_path = _write_ats_outputs(rewritten, job_id, out_dir)
 
         photo_bytes = extract_photo(file_path) if ext == 'pdf' else None
@@ -911,7 +1147,9 @@ def run_pipeline(
             )
             photo_default_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume_photo.docx')
             if os.path.exists(photo_default_path):
-                shutil.move(photo_default_path, os.path.join(out_dir, f'{job_id}_ats_photo.docx'))
+                photo_output_path = os.path.join(out_dir, f'{job_id}_ats_photo.docx')
+                shutil.move(photo_default_path, photo_output_path)
+                os.chmod(photo_output_path, 0o600)
 
         # ── 6. Re-score; retry once if generic ATS gained < 15 pts ────
         stage('Verifying improvement', 80)
@@ -936,7 +1174,15 @@ def run_pipeline(
                 target_cruise_line, overlay, strict=True,
                 protected_signals=protected_signals,
             )
-            _metrics.record_llm_attempt(retries=retry_retries, failed=retry_failed)
+            retry_issues = retry_rewritten.get('issues_fixed')
+            retry_rejected = (
+                isinstance(retry_issues, list)
+                and AI_REWRITE_FACTUALITY_ISSUE in retry_issues
+            )
+            _metrics.record_llm_attempt(
+                retries=retry_retries,
+                failed=retry_failed and not retry_rejected,
+            )
             if not retry_failed:
                 _inject_identity(retry_rewritten, candidate_profile, rank, maritime_before)
                 retry_docx, retry_pdf = _write_ats_outputs(retry_rewritten, job_id, out_dir)
@@ -957,6 +1203,7 @@ def run_pipeline(
                     ats_after, maritime_after = layers_retry['generic'], layers_retry['maritime']
                     improvement = retry_improvement
                     extracted2, parsed2 = extracted_r, parsed_r
+                    rewrite_failed = False
 
         score_rollback = ats_after['total_score'] < ats_before['total_score']
         if score_rollback:
@@ -1067,12 +1314,22 @@ def run_pipeline(
         log.error(f'"job_id":"{job_id}","error":"{str(e)}"')
         sentry_sdk.capture_exception(e)
         try:
+            if not _remove_job_output_artifacts(job_id):
+                log.error(f'"job_id":"{job_id}","output_cleanup_error":"unsafe stored output path"')
+        except OSError as cleanup_error:
+            log.error(
+                f'"job_id":"{job_id}","output_cleanup_error":"'
+                f'{redact_pii(str(cleanup_error))}"'
+            )
+            sentry_sdk.capture_exception(cleanup_error)
+        try:
             update_job(
                 db, job_id,
                 status='failed',
                 progress=0,
                 current_stage='Failed',
                 error_detail=redact_pii(str(e)),   # traceback NOT stored — may contain PII
+                expires_at=datetime.utcnow() + timedelta(hours=JOB_TTL_HOURS),
             )
         except Exception as db_err:
             # If even marking the job failed doesn't succeed (e.g. a locked
@@ -1249,7 +1506,7 @@ async def dashboard_api_proxy(api_path: str, request: Request):
                 for key, value in form.multi_items()
                 if key in allowed_fields and isinstance(value, str)
             ]
-            file_content = await upload.read()
+            file_content = await _read_upload_contents(upload)
             filename = (upload.filename or 'resume').replace('\\', '_').replace('"', '_')
             filename = filename.replace('\r', '_').replace('\n', '_')
             file_type = (
@@ -1389,7 +1646,7 @@ async def submit(
     _check_disk_space()
 
     # Read and validate file
-    contents = await file.read()
+    contents = await _read_upload_contents(file)
     ext      = _validate_file(contents, file.filename or '')
 
     # Dedup check
@@ -1424,8 +1681,7 @@ async def submit(
 
     tmp_path = os.path.join(TMP_DIR, f'{job_id}.{ext}')
     try:
-        with open(tmp_path, 'wb') as f:
-            f.write(contents)
+        _write_private_upload(tmp_path, contents)
     except Exception as e:
         log.error(f'"job_id":"{job_id}","error":"submit failed: {redact_pii(str(e))}"')
         sentry_sdk.capture_exception(e)
@@ -1480,15 +1736,14 @@ async def score(
     """
     _check_disk_space()
 
-    contents = await file.read()
+    contents = await _read_upload_contents(file)
     ext      = _validate_file(contents, file.filename or '')
 
     tmp_id   = str(uuid.uuid4())
     tmp_path = os.path.join(TMP_DIR, f'{tmp_id}.{ext}')
 
     try:
-        with open(tmp_path, 'wb') as f:
-            f.write(contents)
+        _write_private_upload(tmp_path, contents)
 
         # Same _extract_with_timeout() subprocess-isolated, wall-clock-
         # bounded extraction /ats/submit uses -- a scoring-only endpoint
@@ -1692,7 +1947,7 @@ def download(job_id: str, format: str = 'docx'):
 
     want_pdf = (format or 'docx').lower() == 'pdf'
     if want_pdf:
-        path = job.output_pdf
+        path = _safe_output_file(job_id, job.output_pdf)
         if not path or not os.path.exists(path):
             raise HTTPException(410, 'PDF output expired or not found')
         return FileResponse(
@@ -1702,11 +1957,12 @@ def download(job_id: str, format: str = 'docx'):
             headers={'Content-Disposition': f'attachment; filename="MYC_ATS_Resume_{job_id[:8]}.pdf"'},
         )
 
-    if not job.output_docx or not os.path.exists(job.output_docx):
+    path = _safe_output_file(job_id, job.output_docx)
+    if not path or not os.path.exists(path):
         raise HTTPException(410, 'Output file expired or not found')
 
     return FileResponse(
-        path=job.output_docx,
+        path=path,
         media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         filename=f'MYC_ATS_Resume_{job_id[:8]}.docx',
         headers={'Content-Disposition': f'attachment; filename="MYC_ATS_Resume_{job_id[:8]}.docx"'},
@@ -1730,17 +1986,15 @@ def delete_job(job_id: str):
         db.close()
         raise HTTPException(404, 'Job not found')
 
-    # Delete output file
-    if job.output_docx:
-        out_dir = os.path.dirname(job.output_docx)
-        try:
-            shutil.rmtree(out_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    db.delete(job)
-    db.commit()
-    db.close()
+    try:
+        if not _remove_job_output_artifacts(
+            job_id, job.output_docx, job.output_pdf,
+        ):
+            raise HTTPException(500, 'Stored output path is outside the job output directory')
+        db.delete(job)
+        db.commit()
+    finally:
+        db.close()
 
     log.info(f'"job_deleted":"{job_id}"')
     return {'deleted': True, 'job_id': job_id}
@@ -1756,20 +2010,39 @@ def cleanup():
     Deletes all jobs past their TTL. Call this from a cron job nightly.
     Frees disk space and ensures PII is not retained beyond 48 hours.
     """
-    db      = get_db()
-    now     = datetime.utcnow()
-    expired = db.query(Job).filter(Job.expires_at < now).all()
+    db = get_db()
+    now = datetime.utcnow()
     deleted = 0
 
-    for job in expired:
-        if job.output_docx:
-            out_dir = os.path.dirname(job.output_docx)
-            shutil.rmtree(out_dir, ignore_errors=True)
-        db.delete(job)
-        deleted += 1
+    try:
+        retention_cutoff = now - timedelta(hours=JOB_TTL_HOURS)
+        expired = db.query(Job).filter(or_(
+            Job.expires_at < now,
+            and_(
+                Job.status == 'failed',
+                Job.expires_at.is_(None),
+                Job.created_at < retention_cutoff,
+            ),
+        )).all()
+        for job in expired:
+            try:
+                if not _remove_job_output_artifacts(
+                    job.job_id, job.output_docx, job.output_pdf,
+                ):
+                    continue
+            except OSError as exc:
+                log.error(
+                    f'"job_id":"{job.job_id}","cleanup_error":"'
+                    f'{redact_pii(str(exc))}"'
+                )
+                sentry_sdk.capture_exception(exc)
+                continue
+            db.delete(job)
+            deleted += 1
 
-    db.commit()
-    db.close()
+        db.commit()
+    finally:
+        db.close()
 
     log.info(f'"cleanup_deleted":{deleted}')
     return {'deleted_jobs': deleted, 'timestamp': now.isoformat()}
@@ -1845,19 +2118,24 @@ def health():
     free_mb = disk.free // (1024 * 1024)
 
     db = get_db()
+    database_ok = True
     try:
         job_count = db.query(Job).count()
-    except Exception:
+    except Exception as exc:
+        database_ok = False
         job_count = -1
+        log.error(f'"health_database_error":"{redact_pii(str(exc))}"')
+        sentry_sdk.capture_exception(exc)
     finally:
         db.close()
 
     return {
-        'status':       'ok',
+        'status':       'ok' if database_ok and free_mb >= MIN_DISK_FREE_MB else 'degraded',
         'service':      'Marine Your Career ATS API',
         'version':      '2.0.0',
         'disk_free_mb': free_mb,
         'disk_ok':      free_mb >= MIN_DISK_FREE_MB,
+        'database_ok':  database_ok,
         'total_jobs':   job_count,
         'timestamp':    datetime.utcnow().isoformat(),
     }

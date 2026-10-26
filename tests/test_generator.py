@@ -382,6 +382,15 @@ def test_generate_docx_does_not_crash_on_control_characters(tmp_path, monkeypatc
     assert 'Trailing control chars' in full_text, 'Expected the surrounding real text to survive, only the control byte stripped'
 
 
+def test_generated_docx_is_owner_readable_only(tmp_path, monkeypatch):
+    import stat
+    import pipeline.generator as generator
+
+    monkeypatch.setattr(generator, 'OUTPUT_DIR', str(tmp_path))
+    path = generator.generate_docx({'name': 'Test Candidate'}, job_id='private-output')
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
 # ── Priority 2: photo embedding ──────────────────────────────────────────
 
 def _tiny_jpeg_bytes() -> bytes:

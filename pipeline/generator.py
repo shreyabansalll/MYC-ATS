@@ -666,6 +666,12 @@ def generate_docx(content: dict, job_id: str = 'output',
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     suffix = '_photo' if include_photo else ''
     output_path = os.path.join(OUTPUT_DIR, f'{job_id}_ats_resume{suffix}.docx')
-    doc.save(output_path)
+    document_bytes = io.BytesIO()
+    doc.save(document_bytes)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(output_path, flags, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, 'wb') as output_file:
+        output_file.write(document_bytes.getvalue())
     print(f'✓ DOCX saved: {output_path}')
     return output_path
