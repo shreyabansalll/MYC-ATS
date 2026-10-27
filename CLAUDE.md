@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Source of truth for the narrative below: `MYC_ATS_Technical_Architecture.docx` (accurate, validated against 269 real candidate resumes), reconciled with the current codebase after the production-hardening pass described in Task 8's commit history.
+Architecture reference: `MYC_ATS_Technical_Architecture.docx`. Validation figures below distinguish the historical single-layer rewrite batch from the prior two-layer scores-only run; neither should be presented as a current two-layer rewrite-improvement evaluation. Reconcile this guidance with the current code when implementation changes.
 
 ## Project Overview
 
@@ -66,7 +66,7 @@ Only Stage 5 (AI Rewrite) is non-deterministic. Both scoring layers are rules an
 - `main.py` — CLI, single resume: `venv/bin/python main.py <resume_path> [job_description]`. Still the manual single-resume testing path; every change in this repo must keep it working.
 - `api.py` — FastAPI service, the production path MYC's app calls.
 - `pipeline/batch_processor.py` — batch-processes a list of local resumes (`data/resume_file_list.txt`) for regression testing against the 269-resume validation set. Outputs `data/outputs/batch_results.csv` / `.json`.
-- `training/prelabel.py` — offline pre-labeling tool (Ollama/qwen2.5:7b) used to build training data for a possible future custom NER model (see Roadmap). Not part of the live pipeline.
+- `training/prelabel.py` — legacy offline pre-labeling utility that can call a locally hosted Ollama/qwen2.5:7b instance. It is not currently used, is not a runtime dependency, and is not part of the live pipeline; the production rewrite integration uses Anthropic Claude only.
 
 `Resume-Matcher-main/` is a local upstream reference checkout, not a runtime dependency or part of this service's deployment. The integrated, self-contained subset is `generic_ats/` plus `services/two_layer.py`; the upstream app's frontend, database, queue, and unrelated endpoints are intentionally not merged into this service.
 
@@ -188,7 +188,7 @@ Anthropic Claude API (`CLAUDE_MODEL`, defaulting to `claude-haiku-5-5`). Three s
 
 **`target_cruise_line` (optional `/ats/submit` form field) is a layer on top of `MARITIME_JDS`, not a replacement for it.** When MYC actually knows a specific cruise line a submission targets (real MYC use case: a recruiter tailoring one application), `rules/cruise_line_keywords.py`'s per-line keyword/cert/tone data (sourced from real MYC research into what each line's own ATS/recruiters emphasize) gets blended into the rewrite prompt alongside the rank-based template — never instead of it. `resolve_cruise_line()` normalizes free-text input and returns `''` for anything unrecognized, which the prompt-builder treats as "no cruise-line layer" rather than an error — an unrecognized/misspelled line name degrades gracefully to plain rank-based behavior. This is vocabulary/emphasis guidance for phrasing the candidate's own already-grounded experience, never a new source of facts — Rule 0 (grounding) and Rule 10 (never invent certs/experience) stay in force regardless of which line is targeted, and the cruise-line prompt block says so explicitly.
 
-Note: `api.py`'s `/health/deep` endpoint verifies database and disk connectivity.
+Note: `/health` checks database and disk status. Authenticated `/health/deep` additionally checks Anthropic Claude connectivity.
 
 ## API reference (`api.py`)
 
@@ -206,7 +206,7 @@ All protected endpoints require `X-API-Key`: client endpoints use `MYC_API_KEY`,
 | POST | `/ats/cleanup` | Deletes all jobs past their TTL. Wire to cron (see `crontab_example.txt`). |
 | GET | `/ats/admin/metrics` | Aggregate stats — requires `MYC_ADMIN_KEY`, never the client key. |
 | GET | `/health` | No auth. Disk space + database check; status is `degraded` if either check fails. |
-| GET | `/health/deep` | Auth required. DB + disk checks, for monitoring alerts. |
+| GET | `/health/deep` | Auth required. Claude API, DB, and disk checks, for monitoring alerts. |
 
 `/ats/result/{job_id}` returns `maritime_score_before`/`maritime_grade_before` and `maritime_score_after`/`maritime_grade_after` as distinct, independently-computed values (plus `maritime_score`/`maritime_grade` back-compat aliases pointing at the before-value) — see "Known-fixed bugs."
 
@@ -285,7 +285,7 @@ rm -f data/jobs.db-wal data/jobs.db-shm   # stale WAL/SHM from the old process, 
 
 **Disk full**
 - `/ats/submit` checks free disk space up-front (`MIN_DISK_FREE_MB = 200`) and returns `507 Insufficient disk space` rather than accepting an upload it can't process.
-- `/health` and `/health/deep` report `disk_free_mb`/`disk_ok` — wire an alert to these.
+- `/health` reports `disk_free_mb` and `disk_ok`; `/health/deep` reports `disk_free_mb` and a `disk` status alongside Claude and DB checks. Wire an alert to these.
 - Most likely cause: `/ats/cleanup` isn't actually running on cron (check `crontab_example.txt` is installed) — expired job output isn't being swept. `data/outputs/` and `TMP_DIR` are the two places to check disk usage first.
 
 **Malformed or scanned (image-only) resume upload**
@@ -314,7 +314,7 @@ After scoring-rule changes, run the test suite. `pipeline/batch_processor.py` ex
 - **Rate limiting (`slowapi`, 10/minute on `/ats/submit`) was never actually run**: the commit that added it only ran a `py_compile` syntax check, since that environment had neither `fastapi` nor `slowapi` installed. Installed and exercised for real via `TestClient` in `tests/test_api.py` — confirmed working (11th+ request in a minute correctly returns 429). Also surfaced the schema-drift bug above, since a real request against the real `data/jobs.db` was the first thing that ever actually happened. Separately, nothing bounded concurrent in-flight jobs (the rate limit only throttles new submissions) — `MAX_CONCURRENT_JOBS` is now enforced atomically against the shared SQLite job table, not with a per-worker in-memory counter.
 - **`MAX_CONCURRENT_JOBS`'s original in-memory `_ConcurrencyGuard` was per-worker-process, silently doubling the real ceiling under `deploy.sh`'s `--workers 2`**: confirmed with a real load test — an actual `uvicorn --workers 2` process, `MAX_CONCURRENT_JOBS=2`, hit with a burst of concurrent `/ats/submit` requests — showed 4 jobs running concurrently, not 2. Fixed by replacing the in-memory counter with `_try_acquire_job_slot()`: an atomic `BEGIN IMMEDIATE` check-and-insert against the real `jobs.db` (counting rows with status `queued`/`processing`), so the limit is enforced by the one database every worker process already shares instead of by any single process's memory. Re-ran the same `--workers 2` load test after the fix: exactly 2 concurrent jobs, matching the configured limit. The 10/minute rate limiter has the same per-worker doubling and was deliberately left as-is — it's a much lower-stakes tradeoff for a service with one shared `MYC_API_KEY` across all of MYC's traffic, and `slowapi`/`limits` has no built-in SQLite storage backend to fix it the same way without meaningfully more custom code.
 - **Extraction (Stage 1) had no wall-clock bound at all**: confirmed with a real ~800MB zlib decompression bomb (built from a <1MB PDF, comfortably under `MAX_FILE_MB`) that hung `extract_pdf()` for 90+ real seconds at ~100% CPU with zero sign of completing. Fixed with `_extract_with_timeout()`, which runs `extract_text()` in a disposable child process and forcibly terminates it past `EXTRACTION_TIMEOUT_SECONDS` (30s) — actually reclaiming the CPU/memory, not just giving up on waiting. Two subtler bugs surfaced while building this fix, both worth knowing about since they're easy to reintroduce: (1) forcing `multiprocessing`'s `'fork'` start method unconditionally reproduced a real hang on macOS, where forking a process after heavy C-extension/Objective-C-runtime imports (spaCy, numpy) is a known hazard — fixed by using the platform default instead (`'fork'` on Linux, the real deploy target, stays fast; `'spawn'` on macOS is slower but safe); (2) calling `proc.join(timeout)` *before* reading the result `multiprocessing.Queue` deadlocked on any real result over the OS pipe buffer (~64KB) — a completely benign, non-malicious 975-page PDF (~65KB of real extracted text) was being wrongly killed and reported as a timeout. Fixed by reading the queue *with* the timeout instead, which drains the pipe as the child writes to it. Side effect worth knowing: on macOS, every extraction now pays a real ~3-13s `spawn` re-import cost per call (Linux's `fork` doesn't have this cost) — `tests/test_api.py`'s rate-limiter test had to be changed to mock out `BackgroundTasks.add_task` after this made 12 real sequential `/ats/submit` calls span longer than slowapi's 60s rolling window, causing the limiter to (correctly, given the real timing) never fire.
-- **Historical AI provider migration**: the former Groq/Qwen model configuration was retired; the live rewrite client now uses Anthropic Claude via `CLAUDE_MODEL` (`claude-haiku-5-5`). The following data-shape and content-preservation fixes were found during that earlier provider transition and remain applicable; references to the former provider are historical, not active configuration.
+- **Historical AI provider migration**: the former Groq/Qwen live rewrite configuration was retired; the production rewrite client uses Anthropic Claude via `CLAUDE_MODEL` (`claude-haiku-5-5`) and does not use Ollama. A separate legacy offline pre-labeling script still targets a local Ollama instance if manually run, but it is not used by the service or its deployment. The following data-shape and content-preservation fixes were found during the earlier provider transition and remain applicable; references to the former live provider are historical, not active production configuration.
   - **Rank/title was never rendered under the candidate's name at all** — confirmed `content.get('rank')` was never referenced anywhere in `pipeline/generator.py`, on any candidate, regardless of model. Not a regression from the model switch; just newly surfaced by the same review pass. Fixed by adding the missing paragraph.
   - **Certifications/Languages sections had unrelated resume content bleeding in** ("Strengths", "Hobbies", "References" — including a referee's name and phone number ending up in a candidate's own Languages section) — root cause was in `pipeline/parser.py`, not the AI rewrite: `SECTION_HEADERS` had no entry for these common headings at all, so `split_sections()` silently appended their content to whatever real section preceded them, for every resume with these headings, regardless of model. Fixed by adding a `'other'` category so they get a heading of their own to land under instead.
   - **`education`/`documents`/`languages` frequently missing from the previous model's own JSON output entirely** (not truncated — confirmed `finish_reason == 'stop'` on repeated real calls) — `education` wasn't previously defaultable (missing it was treated as a truncation signal, exhausting all 3 retries before falling back and losing the ENTIRE rewrite over one non-critical field). Added `enforce_education_completeness()`/`enforce_language_completeness()` (mirroring the existing `enforce_cert_completeness` restore-don't-invent pattern) and made `education` defaultable like `documents`/`languages` always were.
@@ -339,7 +339,7 @@ After scoring-rule changes, run the test suite. `pipeline/batch_processor.py` ex
 
 ## Roadmap
 
-- Custom spaCy NER model fine-tuned on the growing resume corpus — replaces regex-based rank/cert/vessel extraction once the labeled dataset is large enough and the rules-based approach demonstrably underperforms it. `training/prelabel.py` is the current data-prep step toward this.
+- Custom spaCy NER model fine-tuned on a sufficiently large, validated resume corpus — replace regex-based rank/cert/vessel extraction only if the rules-based approach demonstrably underperforms it. The legacy `training/prelabel.py` utility is not currently used; any future training-data preparation needs a separate decision and validation.
 - Placement-outcome prediction once 500+ MYC placement records accumulate.
 - PostgreSQL + Celery/Redis migration, if/when concurrent load exceeds SQLite WAL's safe ceiling.
 - Human-in-the-loop review queue for resumes flagged by output validation before delivery to candidates.

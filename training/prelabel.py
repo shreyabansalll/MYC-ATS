@@ -1,5 +1,6 @@
 # training/prelabel.py
-# Pre-labels all 393 resumes using Ollama/qwen2.5:7b
+# Legacy offline utility; requires a locally running Ollama/qwen2.5:7b instance.
+# Not used by the live service or current deployment.
 # Output: data/prelabeled_393.json
 # Features: checkpoint saves every 10 resumes, retry logic, robust JSON parsing
 

@@ -41,6 +41,13 @@ There are two separate flows, and picking the right one matters:
 
 If your product currently only needs the score (e.g. to show the candidate their ATS grade before deciding whether to run the full rewrite), use `/ats/score` — it's faster and has no dependency on the AI provider being up.
 
+### Scoring and evaluation notes
+
+- Production resume rewriting uses Anthropic Claude (`claude-haiku-5-5`). A separate legacy offline pre-labeling script can call local Ollama if manually invoked, but it is not used by the live service or deployment. `/ats/score` is deterministic and does not call an LLM; `/ats/submit` attempts the rewrite after its initial scoring stages.
+- The generic ATS score is always-on. Maritime scoring is an optional overlay, enabled by a detected seafarer rank or explicit maritime targeting.
+- The previously recorded two-layer batch was scores-only: 269 resumes scored with 0 pipeline errors; generic ATS mean 57.0, median 58, range 24–75, with 162 FAIL, 106 PASS, and 1 GOOD; maritime scoring ran for 254 resumes with a mean of 76.0. It was not a rewrite-improvement evaluation, and it has not been rerun after the PDF parser dependency update.
+- Older results (ATS 63.4→69.1 and maritime 54.1→70.7, with 56→2 resumes at zero detected sea months) came from the legacy single-layer scorer. They do not measure the current two-layer generic scorer and must not be used as evidence of its rewrite gains.
+
 ---
 
 ## Fast path: `POST /ats/score`

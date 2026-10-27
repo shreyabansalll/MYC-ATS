@@ -13,10 +13,6 @@ load_dotenv()  # Reads from .env file
 ANTHROPIC_API_KEY  = os.getenv('ANTHROPIC_API_KEY')
 CLAUDE_MODEL       = 'claude-haiku-5-5'
 
-# ── Ollama (Local NER pre-labeling) ──────────────────────────────────
-OLLAMA_BASE_URL    = 'http://localhost:11434/v1'
-OLLAMA_MODEL       = 'qwen2.5:7b'
-
 # ── File Paths ───────────────────────────────────────────────────────
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR        = os.path.join(BASE_DIR, 'data')
