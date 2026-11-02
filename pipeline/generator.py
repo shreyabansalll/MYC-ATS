@@ -670,3 +670,122 @@ def generate_docx(content: dict, job_id: str = 'output',
         output_file.write(document_bytes.getvalue())
     print(f'✓ DOCX saved: {output_path}')
     return output_path
+
+
+def generate_myc_docx(profile: dict, job_id: str = "myc_resume") -> str:
+    """Generate MYC's canonical officer/engineer/crew resume structure."""
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(0.6)
+    section.bottom_margin = Inches(0.6)
+    section.left_margin = Inches(0.8)
+    section.right_margin = Inches(0.8)
+    style = doc.styles["Normal"]
+    style.font.name = "Arial"
+    rendered_words = sum(len(str(profile.get(field, "")).split()) for field in (
+        "technical_expertise", "license", "documents", "certifications",
+        "education", "skills", "languages", "summary",
+    ))
+    rendered_words += sum(
+        len(str(job.get("role", "")).split()) + len(str(job.get("bullets", [])).split())
+        for job in profile.get("experience_bullets", [])
+        if isinstance(job, dict)
+    )
+    style.font.size = Pt(9 if rendered_words > 750 else 10)
+
+    name = _xml_safe(profile.get("name", "Candidate Name"))
+    rank = _xml_safe(profile.get("rank", profile.get("rank_detected", "")))
+    contact = profile.get("contact", {})
+    heading = doc.add_paragraph()
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    heading.add_run(name).bold = True
+    heading.runs[0].font.size = Pt(18)
+    if rank:
+        title = doc.add_paragraph(rank.title())
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title.runs[0].font.size = Pt(12)
+
+    contact_parts = [
+        str(contact.get(key)).strip()
+        for key in ("email", "phone", "location", "dob", "linkedin")
+        if contact.get(key)
+    ]
+    if contact_parts:
+        contact_p = doc.add_paragraph(" | ".join(contact_parts))
+        contact_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    officer = profile.get("profile_type", "officer") != "crew"
+    section_order = (
+        ["Technical Expertise / Core Competencies", "License", "Documents", "Certificates",
+         "Education", "Skills and Languages", "Professional Experience"]
+        if officer else
+        ["Professional Experience", "Training", "Certificates", "Education",
+         "Skills and Languages", "Foreign Work / Hotel Experience"]
+    )
+
+    def add_heading(text: str):
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run(text.upper())
+        run.bold = True
+        run.font.size = Pt(11)
+        return paragraph
+
+    def add_items(values, prefix=""):
+        for item in _as_list(values):
+            doc.add_paragraph(f"{prefix}{_xml_safe(str(item))}")
+
+    if officer:
+        if profile.get("technical_expertise"):
+            add_heading("Technical Expertise / Core Competencies")
+            add_items(profile["technical_expertise"])
+        if profile.get("license"):
+            add_heading("License")
+            add_items(profile["license"])
+        if profile.get("documents"):
+            add_heading("Documents")
+            add_items(profile["documents"])
+        if profile.get("certifications"):
+            add_heading("Certificates")
+            add_items(profile["certifications"])
+        if profile.get("education"):
+            add_heading("Education")
+            add_items(profile["education"])
+        if profile.get("skills") or profile.get("languages"):
+            add_heading("Skills and Languages")
+            add_items(profile.get("skills", []))
+            add_items(profile.get("languages", []))
+    else:
+        add_heading("Training")
+        add_items(profile.get("training", []))
+        add_heading("Certificates")
+        add_items(profile.get("certifications", []))
+        add_heading("Education")
+        add_items(profile.get("education", []))
+        add_heading("Skills and Languages")
+        add_items(profile.get("skills", []))
+        add_items(profile.get("languages", []))
+        add_heading("Foreign Work / Hotel Experience")
+        add_items(profile.get("hotel_experience", []))
+
+    if not officer:
+        add_heading("Professional Experience")
+    elif profile.get("experience_bullets"):
+        add_heading("Professional Experience")
+    if profile.get("experience_bullets"):
+        for job in profile["experience_bullets"]:
+            if not isinstance(job, dict):
+                doc.add_paragraph(_xml_safe(str(job)))
+                continue
+            doc.add_paragraph(_xml_safe(" | ".join(filter(None, (
+                _job_field(job, "role"), _job_field(job, "company"), _job_field(job, "dates"),
+            )))))
+            add_items(job.get("bullets", []), prefix="• ")
+
+    if profile.get("summary"):
+        add_heading("Summary")
+        doc.add_paragraph(_xml_safe(profile["summary"]))
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, f"{job_id}_myc_resume.docx")
+    doc.save(output_path)
+    return output_path
