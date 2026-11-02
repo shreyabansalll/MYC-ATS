@@ -201,6 +201,17 @@ def test_application_portal_registry_is_advisory_and_has_myc_priority_metadata()
     assert unknown['portals'] == []
 
 
+def test_sso_alternative_satisfies_stsdsd_application_evidence():
+    evidence = check_cert_evidence(
+        'third officer',
+        ['Ship Security Officer (SSO) course'],
+        'Ship Security Officer (SSO) course completed.',
+    )
+
+    stsdsd = 'Security Training for Seafarers with Designated Security Duties (STSDSD)'
+    assert evidence[stsdsd] == CertEvidence.EVIDENCED
+
+
 def test_format_checker_is_advisory_and_reports_platform_qualified_findings():
     result = check_ats_format_compliance(
         'Experience\nSkills\nProjects:\n' + ('x' * 90),
@@ -235,15 +246,19 @@ def test_ats_software_reference_platform_mapping_is_preserved_as_an_assumption()
         assert 'operational assumption' in result['source']
 
 
-def test_rank_eligibility_uses_exact_two_year_boundary_and_requires_dates():
+def test_rank_eligibility_uses_more_than_two_year_boundary_and_requires_dates():
     at_boundary = check_rank_eligibility('third officer', 2.0, 'third officer')
     below_boundary = check_rank_eligibility('second officer', 1.9, 'third officer')
+    above_boundary = check_rank_eligibility('third officer', 2.01, 'third officer')
     unknown_tenure = check_rank_eligibility('third officer', None, 'third officer')
 
-    assert at_boundary['recommended_rank'] == 'third officer'
-    assert at_boundary['eligible_for_target'] is True
+    assert at_boundary['recommended_rank'] is None
+    assert at_boundary['status'] == 'needs_review'
+    assert 'management clarification' in at_boundary['basis']
     assert below_boundary['recommended_rank'] == 'third officer'
     assert below_boundary['eligible_for_target'] is True
+    assert above_boundary['recommended_rank'] == 'third officer'
+    assert above_boundary['eligible_for_target'] is True
     assert unknown_tenure['status'] == 'needs_review'
     assert unknown_tenure['eligible_for_target'] is None
     assert 'not a regulatory' not in unknown_tenure['basis'].casefold()

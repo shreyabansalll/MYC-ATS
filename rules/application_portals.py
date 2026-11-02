@@ -75,12 +75,18 @@ def get_application_portals(company: str) -> dict:
         "company": resolved or None,
         "priority": bool(resolved in MYC_PRIORITY_COMPANIES),
         "source": PORTAL_SOURCE,
+        "status": "active" if resolved in APPLICATION_PORTALS else "unknown",
+        "last_verified": None,
+        "verification_status": "myc_supplied_not_independently_verified",
         "portals": [
             {
                 "name": name,
                 "url": url,
                 "myc_primary": primary,
                 "provenance": "operational_myc_reference",
+                "application_method": "online_application",
+                "active": True,
+                "parent_company": "Carnival Corporation & plc" if resolved == "carnival" else None,
             }
             for name, url, primary in entries
         ],

@@ -722,6 +722,14 @@ def check_cert_evidence(
             result[name] = expiry
         elif _explicitly_not_held(name, resume_text):
             result[name] = CertEvidence.CONFIRMED_MISSING
+        elif (
+            name == 'Security Training for Seafarers with Designated Security Duties (STSDSD)'
+            and any(
+                alternative in resume_text.casefold()
+                for alternative in ('ship security officer', 'sso', 'security awareness')
+            )
+        ):
+            result[name] = CertEvidence.EVIDENCED
         elif _certificate_is_present(name, certs_found, resume_text):
             result[name] = CertEvidence.EVIDENCED
         else:

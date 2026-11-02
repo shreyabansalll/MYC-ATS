@@ -385,9 +385,12 @@ def check_rank_eligibility(
     if _ELIGIBILITY_RANKS[current][0] == 'eto':
         recommended = 'third eto'
         basis = 'MYC portal guidance: ETO applications are directed to third ETO, including senior ETOs.'
-    elif years_at_rank >= 2.0:
+    elif years_at_rank > 2.0:
         recommended = current
-        basis = 'MYC policy: 2+ years at current rank — apply at the same rank.'
+        basis = 'MYC policy: more than 2 years at current rank — apply at the same rank.'
+    elif years_at_rank == 2.0:
+        recommended = None
+        basis = 'MYC policy boundary: exactly 2 years is not covered by “more than 2 years”; management clarification is required.'
     else:
         department, position = _ELIGIBILITY_RANKS[current]
         ladder = [rank for rank, (rank_department, _) in _ELIGIBILITY_RANKS.items()
@@ -396,7 +399,7 @@ def check_rank_eligibility(
         recommended = ladder[position + 1] if position + 1 < len(ladder) else None
         basis = 'MYC policy: less than 2 years at current rank — consider one rank lower.'
     base.update({
-        'status': 'review_recommended',
+        'status': 'needs_review' if recommended is None else 'review_recommended',
         'recommended_rank': _ELIGIBILITY_DISPLAY.get(recommended) if recommended else None,
         'eligible_for_target': recommended == target if target else None,
         'basis': basis,
