@@ -19,6 +19,7 @@ from rules.cert_rules import (
     check_cert_evidence,
     normalize_cert_rank,
 )
+from rules.application_portals import get_application_portals
 
 
 def test_certificate_evidence_distinguishes_all_states_without_inference():
@@ -168,6 +169,36 @@ def test_eto_keyword_signal_includes_myc_electrical_and_automation_terms():
     assert 'Insulation Resistance Testing' in result['matches']
     assert 'SCADA Systems' in result['matches']
     assert 'Shore Power Connection' in result['matches']
+
+
+def test_safety_and_environment_officer_rank_signals_are_available():
+    safety = score_rank_keywords(
+        'safety officer',
+        'Safety Officer responsible for the Safety Management System, muster drills, '
+        'permit to work and incident investigation.',
+    )
+    environment = score_rank_keywords(
+        'environment officer',
+        'Environmental Officer managing MARPOL compliance, waste management, '
+        'sewage treatment plant, ballast water management and scrubber operation.',
+    )
+
+    assert safety['rank'] == 'safety_officer'
+    assert 'Safety Management System' in safety['matches']
+    assert environment['rank'] == 'environment_officer'
+    assert 'Ballast Water Management' in environment['matches']
+
+
+def test_application_portal_registry_is_advisory_and_has_myc_priority_metadata():
+    carnival = get_application_portals('Carnival Cruise Line')
+    unknown = get_application_portals('unlisted carrier')
+
+    assert carnival['priority'] is True
+    assert carnival['company'] == 'carnival'
+    assert carnival['source'].startswith('MYC application portals.docx')
+    assert any(portal['url'].startswith('https://shipjobs.carnival.com') for portal in carnival['portals'])
+    assert unknown['company'] is None
+    assert unknown['portals'] == []
 
 
 def test_format_checker_is_advisory_and_reports_platform_qualified_findings():

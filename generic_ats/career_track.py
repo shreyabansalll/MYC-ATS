@@ -396,6 +396,14 @@ COMPANY_ALIASES = {
 }
 
 ATS_RANK_KEYWORDS = {
+    'master': [
+        'Master Mariner', 'Command Responsibility', 'Safety Management System',
+        'Bridge Resource Management', 'Voyage Planning', 'Port State Control',
+        'Passenger Safety Management', 'Muster and Emergency Drills',
+        'ISM Code', 'ISPS Compliance', 'Maritime Security',
+        'Crew Leadership', 'Company and Flag State Liaison', 'Port Operations',
+        'Polar Operations', 'Cruise Operations', 'Guest Safety',
+    ],
     'chief_engineer': [
         'Engine Department Management', 'Diesel Electric Propulsion', 'Main Engine Operations',
         'Auxiliary Engine Operations', 'Power Management System', 'Fuel Optimization',
@@ -427,6 +435,21 @@ ATS_RANK_KEYWORDS = {
         'Cruise Terminal Coordination', 'Security Operations',
         'International Crew Supervision', 'SOLAS', 'MARPOL', 'Risk Assessment',
         'Permit to Work', 'Safety Management System',
+    ],
+    'safety_officer': [
+        'Safety Officer', 'Safety Management System', 'Safety Committee',
+        'Internal Audits', 'Muster Drill Planning', 'Emergency Drills',
+        'Permit to Work', 'Risk Assessment', 'Incident Investigation',
+        'Near Miss Reporting', 'SOLAS Compliance', 'MARPOL Compliance',
+        'Security Awareness', 'Passenger Safety', 'Training and Assessment',
+    ],
+    'environment_officer': [
+        'Environmental Officer', 'Environmental Compliance', 'MARPOL Compliance',
+        'Energy Efficiency', 'SEEMP', 'Air Emissions Monitoring',
+        'Ballast Water Management', 'Waste Management', 'Garbage Management Plan',
+        'Oily Water Separator', 'Oil Record Book', 'Sewage Treatment Plant',
+        'Fuel Consumption Monitoring', 'Scrubber Operation', 'NOx and SOx Monitoring',
+        'Environmental Audits', 'Corporate Sustainability',
     ],
     'second_officer': [
         'Voyage Planning', 'Passage Planning', 'ECDIS', 'ARPA', 'Radar Navigation',

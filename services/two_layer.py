@@ -42,6 +42,7 @@ from services.vacancy_match import _is_certificate, match_vacancy
 from services.maritime_intelligence import analyze_maritime_candidate
 from services.maritime_certificates import resolve_certificate_mentions
 from pipeline.entity_evidence import extract_maritime_entities
+from rules.application_portals import get_application_portals
 
 
 _METRIC_RE = re.compile(
@@ -669,6 +670,7 @@ def score_layers(
     )
     rank_keywords = score_rank_keywords(role, raw_text)
     platform_info = company_ats_platform(target_cruise_line)
+    application_portals = get_application_portals(target_cruise_line)
     format_check = check_ats_format_compliance(
         raw_text,
         platform_info['platform'],
@@ -726,6 +728,7 @@ def score_layers(
         "company_keyword_company": company['company'],
         "company_keyword_department": company['department'],
         "company_keyword_source": company['source'],
+        "application_portals": application_portals,
         "rank_keyword_matches": rank_keywords['matches'],
         "rank_keyword_rank": rank_keywords['rank'],
         "rank_keyword_source": rank_keywords['source'],
@@ -781,6 +784,7 @@ def score_layers_after_rewrite(
     )
     rank_keywords = score_rank_keywords(role, raw_text)
     platform_info = company_ats_platform(target_cruise_line)
+    application_portals = get_application_portals(target_cruise_line)
     format_check = check_ats_format_compliance(
         raw_text,
         platform_info['platform'],
@@ -845,6 +849,7 @@ def score_layers_after_rewrite(
         "company_keyword_company": company['company'],
         "company_keyword_department": company['department'],
         "company_keyword_source": company['source'],
+        "application_portals": application_portals,
         "rank_keyword_matches": rank_keywords['matches'],
         "rank_keyword_rank": rank_keywords['rank'],
         "rank_keyword_source": rank_keywords['source'],
