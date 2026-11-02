@@ -45,12 +45,12 @@ def test_split_sections_does_not_bleed_hobbies_and_references_into_languages():
         'Travelling\n'
         'Reading\n'
         'REFERENCES\n'
-        'Ajay Vazarkar | Chief Engineer\n'
-        '91 9423777937\n'
+        'Sample Referee | Chief Engineer\n'
+        '+91-0000000000\n'
     )
     sections = split_sections(text)
     assert sections['languages'].strip() == 'English\nArabic'
     assert 'Travelling' not in sections['languages']
-    assert 'Ajay Vazarkar' not in sections['languages']
-    assert 'Ajay Vazarkar' in sections['other']
+    assert 'Sample Referee' not in sections['languages']
+    assert 'Sample Referee' in sections['other']
     assert 'Travelling' in sections['other']

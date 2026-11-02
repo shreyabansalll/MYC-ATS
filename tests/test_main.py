@@ -2,13 +2,13 @@ def test_cli_scores_before_and_after_through_two_layer_service(monkeypatch, caps
     import main
 
     parsed = {
-        "name": "Ada Lovelace",
+        "name": "Sample Candidate",
         "contact": {"email": "ada@example.com"},
         "skills": ["Python"],
         "sections": {"summary": "Software engineer"},
         "rank": "",
     }
-    extracted = {"raw_text": "Ada Lovelace\nSoftware engineer", "structural_issues": []}
+    extracted = {"raw_text": "Sample Candidate\nSoftware engineer", "structural_issues": []}
     calls = {}
 
     def score_layers(*args, **kwargs):

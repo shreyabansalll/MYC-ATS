@@ -3,7 +3,7 @@
 #
 # Security:   API key auth on all endpoints
 # Validation: file size, type, content checks
-# Privacy:    PII stripped from logs, temp files cleaned immediately
+# Privacy:    PII stripped from logs; temporary uploads cleaned after processing
 # Resilience: timeouts, disk checks, concurrent-safe job handling
 # Logging:    structured JSON logs, no PII in output
 #
@@ -24,9 +24,10 @@ import sqlite3
 import threading
 import multiprocessing
 import queue
+import stat
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -41,7 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import and_, create_engine, Column, String, Integer, DateTime, Text, event, or_
+from sqlalchemy import and_, create_engine, Column, String, Integer, Float, DateTime, Text, event, or_
 from sqlalchemy.orm import DeclarativeBase, Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
 import sentry_sdk
@@ -49,12 +50,19 @@ import sentry_sdk
 from config import OUTPUT_DIR
 from pipeline.extractor import extract_text, extract_photo
 from pipeline.parser import parse_resume
-from services.ai_client import restore_protected_signals, rewrite_resume
+from services.ai_client import (
+    enforce_cert_completeness,
+    enforce_education_completeness,
+    enforce_language_completeness,
+    restore_protected_signals,
+    rewrite_resume,
+)
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
 from generic_ats.pdf_classic import generate_classic_pdf
 from generic_ats.writing_quality import detect_novel_numbers
 from services.two_layer import (
+    AI_REWRITE_INTEGRITY_ISSUE,
     maritime_stub_for_profile,
     rewrite_quality_from_improvement,
     score_layers,
@@ -62,6 +70,7 @@ from services.two_layer import (
     should_retry_rewrite,
     build_protected_signals,
 )
+from services.candidate_matching import compare_candidate_results
 
 # ── Logging — structured JSON, NO PII ────────────────────────────────
 
@@ -122,6 +131,7 @@ MAX_FILE_MB      = int(os.getenv('MAX_FILE_MB', '5'))
 MAX_FILE_BYTES   = MAX_FILE_MB * 1024 * 1024
 ALLOWED_EXTS     = {'pdf', 'docx'}
 JOB_TTL_HOURS    = int(os.getenv('JOB_TTL_HOURS', '48'))   # auto-delete outputs after 48h
+MAX_CONCURRENT_JOBS = int(os.getenv('MAX_CONCURRENT_JOBS', '5'))
 MIN_DISK_FREE_MB = 200                                        # refuse uploads if disk low
 ALLOWED_ORIGINS = [
     origin.strip() for origin in os.getenv('ALLOWED_ORIGINS', '*').split(',')
@@ -131,6 +141,20 @@ ALLOWED_ORIGINS = [
 TMP_DIR = os.getenv('TMP_DIR', '/tmp/ycm-ats')
 os.makedirs(TMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def _require_positive_setting(name: str, value: int) -> None:
+    if value <= 0:
+        raise RuntimeError(f'{name} must be a positive integer')
+
+
+for _setting_name, _setting_value in (
+    ('MAX_FILE_MB', MAX_FILE_MB),
+    ('JOB_TTL_HOURS', JOB_TTL_HOURS),
+    ('MAX_CONCURRENT_JOBS', MAX_CONCURRENT_JOBS),
+):
+    _require_positive_setting(_setting_name, _setting_value)
+
 
 if not API_KEY:
     log.warning('"MYC_API_KEY not set — all requests will be rejected"')
@@ -243,6 +267,26 @@ class Job(Base):
     missing_certs_json    = Column(Text, nullable=True)
     issues_fixed_json     = Column(Text, nullable=True)
     keyword_data_json     = Column(Text, nullable=True)
+    cert_evidence_json    = Column(Text, nullable=True)
+    cert_requirements_json = Column(Text, nullable=True)
+    company_keyword_matches_json = Column(Text, nullable=True)
+    company_keyword_score = Column(Float, nullable=True)
+    company_keyword_company = Column(String(100), nullable=True)
+    company_keyword_source = Column(String(300), nullable=True)
+    rank_keyword_matches_json = Column(Text, nullable=True)
+    rank_keyword_rank = Column(String(50), nullable=True)
+    rank_keyword_source = Column(String(300), nullable=True)
+    format_check_json     = Column(Text, nullable=True)
+    rank_eligibility_json = Column(Text, nullable=True)
+    rewrite_evaluation_json = Column(Text, nullable=True)
+    rejected_rewrite_evaluation_json = Column(Text, nullable=True)
+    rewrite_integrity_warning = Column(Text, nullable=True)
+    vacancy_match_json = Column(Text, nullable=True)
+    certificate_validity_json = Column(Text, nullable=True)
+    score_explanation_json = Column(Text, nullable=True)
+    semantic_match_json = Column(Text, nullable=True)
+    maritime_entities_json = Column(Text, nullable=True)
+    maritime_intelligence_json = Column(Text, nullable=True)
 
     # Metadata — NO PII stored
     rank_detected         = Column(String(50), nullable=True)
@@ -308,6 +352,33 @@ def update_job(db: Session, job_id: str, **kwargs):
         for k, v in kwargs.items():
             setattr(job, k, v)
         db.commit()
+
+
+def _recover_stale_processing_jobs(now: datetime | None = None) -> int:
+    """Mark stale queued/processing jobs interrupted by a prior server process as failed."""
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(minutes=30)
+    db = get_db()
+    try:
+        recovered = db.query(Job).filter(
+            Job.status.in_(('queued', 'processing')),
+            Job.created_at < cutoff,
+        ).update(
+            {
+                Job.status: 'failed',
+                Job.progress: 0,
+                Job.current_stage: 'Failed',
+                Job.error_detail: 'Server restarted during processing — please resubmit',
+                Job.expires_at: now + timedelta(hours=JOB_TTL_HOURS),
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+        if recovered:
+            log.warning(f'"stale_processing_jobs_recovered":{recovered}')
+        return recovered
+    finally:
+        db.close()
 
 
 class UploadBodyLimitMiddleware:
@@ -435,6 +506,12 @@ app = FastAPI(
     redoc_url=None,
 )
 
+
+@app.on_event('startup')
+def recover_interrupted_jobs():
+    _recover_stale_processing_jobs()
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -477,9 +554,6 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # BackgroundTasks; this is the proportionate guard rail for that
 # trigger, not a queue itself — jobs over the cap are rejected
 # immediately with a clear 503 rather than silently piling up.
-MAX_CONCURRENT_JOBS = int(os.getenv('MAX_CONCURRENT_JOBS', '5'))
-
-
 def _try_acquire_job_slot(job_id: str, file_hash: str) -> bool:
     """
     Atomically checks whether fewer than MAX_CONCURRENT_JOBS rows are
@@ -651,7 +725,7 @@ def _build_fallback_experience_bullets(parsed: dict, rank: str) -> list:
     if not experience_text or not experience_text.strip():
         return []
 
-    role_title = rank.title() if rank else 'Seafarer'
+    role_title = rank.title() if rank and rank.casefold() != 'unknown' else 'Seafarer'
     lines = [l.strip() for l in experience_text.split('\n') if l.strip()]
 
     entries = []
@@ -885,8 +959,11 @@ def _rewrite_or_fallback(
                 AI_REWRITE_FACTUALITY_ISSUE
                 if factuality_rejected else AI_REWRITE_FALLBACK_ISSUE
             ],
-            'rank': rank,
+            'rank': candidate_profile.rank_detected,
         }
+        rewritten = enforce_cert_completeness(rewritten, parsed)
+        rewritten = enforce_education_completeness(rewritten, parsed)
+        rewritten = enforce_language_completeness(rewritten, parsed)
         rewritten = restore_protected_signals(
             rewritten, parsed, protected_signals or [],
         )
@@ -901,7 +978,11 @@ AI_REWRITE_ROLLBACK_ISSUE = 'AI rewrite reduced the ATS score; original content 
 def _inject_identity(rewritten, candidate_profile, rank, maritime_before):
     rewritten['name'] = candidate_profile.name
     rewritten['contact'] = candidate_profile.contact.model_dump()
-    rewritten['rank'] = rank
+    current_rank = candidate_profile.rank_detected
+    if current_rank and current_rank.casefold() != 'unknown':
+        rewritten['rank'] = current_rank
+    else:
+        rewritten.pop('rank', None)
     rewritten['sea_months'] = (maritime_before or {}).get('sea_months')
     rewritten['vessel_types'] = (maritime_before or {}).get('vessel_types', [])
 
@@ -1004,6 +1085,33 @@ def _safe_output_file(job_id: str, stored_path: str | None) -> str | None:
     ):
         return str(resolved)
     return None
+
+
+def _cleanup_stale_uploads(retention_cutoff: datetime, active_job_ids: set[str]) -> int:
+    """Remove old UUID-named upload files left behind by interrupted requests/jobs."""
+    removed = 0
+    upload_name = re.compile(
+        r'(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(pdf|docx)$'
+    )
+    cutoff_timestamp = retention_cutoff.replace(tzinfo=timezone.utc).timestamp()
+    for path in Path(TMP_DIR).iterdir():
+        match = upload_name.fullmatch(path.name)
+        if not match or match.group(1).lower() in active_job_ids:
+            continue
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(file_stat.st_mode):
+            continue
+        if file_stat.st_mtime >= cutoff_timestamp:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        removed += 1
+    return removed
 
 
 # ── Background pipeline ───────────────────────────────────────────────
@@ -1162,12 +1270,29 @@ def run_pipeline(
             target_rank=rank,
             target_cruise_line=target_cruise_line,
             overlay=overlay,
+            original_score=ats_before['total_score'],
+            original_text=extracted['raw_text'],
+            original_parsed=parsed,
+            original_maritime=maritime_before,
         )
         ats_after = layers_after['generic']
         maritime_after = layers_after['maritime']
         improvement = ats_after['total_score'] - ats_before['total_score']
+        rewrite_evaluation = layers_after.get('rewrite_evaluation')
+        rejected_rewrite_evaluation = None
+        rewrite_integrity_warning = None
+        integrity_risk = bool(
+            rewrite_evaluation
+            and rewrite_evaluation.get('verdict') == 'factual_integrity_risk'
+        )
+        if integrity_risk:
+            rejected_rewrite_evaluation = copy.deepcopy(rewrite_evaluation)
+            rewrite_integrity_warning = (
+                'An AI rewrite attempt introduced unsupported material facts and was rejected. '
+                'A safer retry or source-derived content was used; review the flagged changes.'
+            )
 
-        if should_retry_rewrite(improvement, rewrite_failed):
+        if integrity_risk or should_retry_rewrite(improvement, rewrite_failed):
             stage('Retrying rewrite with stricter prompt', 72)
             retry_rewritten, retry_failed, retry_retries = _rewrite_or_fallback(
                 parsed, all_issues, tailored_jd, rank, candidate_profile,
@@ -1193,23 +1318,46 @@ def run_pipeline(
                     job_description=tailored_jd,
                     career_track=career_track,
                     target_rank=rank,
+                    target_cruise_line=target_cruise_line,
                     overlay=overlay,
+                    original_score=ats_before['total_score'],
+                    original_text=extracted['raw_text'],
+                    original_parsed=parsed,
+                    original_maritime=maritime_before,
                 )
                 retry_improvement = (
                     layers_retry['generic']['total_score'] - ats_before['total_score']
                 )
-                if layers_retry['generic']['total_score'] > ats_after['total_score']:
+                retry_evaluation = layers_retry.get('rewrite_evaluation')
+                retry_integrity_risk = bool(
+                    retry_evaluation
+                    and retry_evaluation.get('verdict') == 'factual_integrity_risk'
+                )
+                if not retry_rejected and not retry_integrity_risk and (
+                    integrity_risk
+                    or layers_retry['generic']['total_score'] > ats_after['total_score']
+                ):
                     rewritten, docx_path, pdf_path = retry_rewritten, retry_docx, retry_pdf
                     ats_after, maritime_after = layers_retry['generic'], layers_retry['maritime']
                     improvement = retry_improvement
                     extracted2, parsed2 = extracted_r, parsed_r
+                    layers_after = layers_retry
+                    rewrite_evaluation = retry_evaluation
+                    integrity_risk = False
                     rewrite_failed = False
 
         score_rollback = ats_after['total_score'] < ats_before['total_score']
-        if score_rollback:
+        if score_rollback or integrity_risk:
+            fallback_issues = []
+            if score_rollback:
+                fallback_issues.append(AI_REWRITE_ROLLBACK_ISSUE)
+            if integrity_risk:
+                fallback_issues.append(AI_REWRITE_INTEGRITY_ISSUE)
             rewritten = {
                 'summary': parsed.get('sections', {}).get('summary', ''),
-                'experience_bullets': _build_fallback_experience_bullets(parsed, rank),
+                'experience_bullets': _build_fallback_experience_bullets(
+                    parsed, candidate_profile.rank_detected,
+                ),
                 'skills': list(parsed.get('skills') or []),
                 'certifications': [
                     line.strip() for line in
@@ -1232,8 +1380,8 @@ def run_pipeline(
                     (parsed.get('sections', {}).get('technical_expertise') or '').splitlines()
                     if line.strip()
                 ],
-                'issues_fixed': [AI_REWRITE_ROLLBACK_ISSUE],
-                'rank': rank,
+                'issues_fixed': fallback_issues,
+                'rank': candidate_profile.rank_detected,
             }
             rewritten = restore_protected_signals(
                 rewritten, parsed, protected_signals,
@@ -1249,14 +1397,19 @@ def run_pipeline(
                 target_rank=rank,
                 target_cruise_line=target_cruise_line,
                 overlay=overlay,
+                original_score=ats_before['total_score'],
+                original_text=extracted['raw_text'],
+                original_parsed=parsed,
+                original_maritime=maritime_before,
             )
             ats_after = layers_after['generic']
             maritime_after = layers_after['maritime']
             improvement = ats_after['total_score'] - ats_before['total_score']
+            rewrite_evaluation = layers_after.get('rewrite_evaluation')
 
         quality = (
             'none'
-            if score_rollback or rewrite_failed
+            if score_rollback or rewrite_failed or integrity_risk
             else 'partial'
             if improvement == 0
             else rewrite_quality_from_improvement(improvement)
@@ -1306,6 +1459,33 @@ def run_pipeline(
             missing_certs_json=json.dumps((maritime_before or {}).get('missing_certs', [])),
             issues_fixed_json=json.dumps(rewritten.get('issues_fixed', [])),
             keyword_data_json=json.dumps(ats_before.get('keyword_data', {})),
+            cert_evidence_json=json.dumps(layers_before.get('cert_evidence', {})),
+            cert_requirements_json=json.dumps(layers_before.get('cert_requirements', {})),
+            company_keyword_matches_json=json.dumps(
+                layers_before.get('company_keyword_matches', []),
+            ),
+            company_keyword_score=layers_before.get('company_keyword_score', 0.0),
+            company_keyword_company=layers_before.get('company_keyword_company'),
+            company_keyword_source=layers_before.get('company_keyword_source'),
+            rank_keyword_matches_json=json.dumps(
+                layers_before.get('rank_keyword_matches', []),
+            ),
+            rank_keyword_rank=layers_before.get('rank_keyword_rank'),
+            rank_keyword_source=layers_before.get('rank_keyword_source'),
+            format_check_json=json.dumps(layers_before.get('format_check', {})),
+            rank_eligibility_json=json.dumps(layers_before.get('rank_eligibility')),
+            rewrite_evaluation_json=json.dumps(rewrite_evaluation),
+            rejected_rewrite_evaluation_json=(
+                json.dumps(rejected_rewrite_evaluation)
+                if rejected_rewrite_evaluation else None
+            ),
+            rewrite_integrity_warning=rewrite_integrity_warning,
+            vacancy_match_json=json.dumps(layers_before.get('vacancy_match', {})),
+            certificate_validity_json=json.dumps(layers_before.get('certificate_validity', [])),
+            score_explanation_json=json.dumps(layers_before.get('score_explanation', {})),
+            semantic_match_json=json.dumps(layers_before.get('semantic_match', {})),
+            maritime_entities_json=json.dumps(layers_before.get('maritime_entities', [])),
+            maritime_intelligence_json=json.dumps(layers_before.get('maritime_intelligence', {})),
         )
         _finish_open_stage()
 
@@ -1797,6 +1977,26 @@ async def score(
             'recommendations': (maritime_result or {}).get('recommendations', []),
             'missing_certs':   (maritime_result or {}).get('missing_certs', []),
             'keyword_data':    ats_result.get('keyword_data', {}),
+            'cert_evidence': {
+                name: state.value if hasattr(state, 'value') else str(state)
+                for name, state in layers.get('cert_evidence', {}).items()
+            },
+            'cert_requirements': layers.get('cert_requirements', {}),
+            'company_keyword_matches': layers.get('company_keyword_matches', []),
+            'company_keyword_score': layers.get('company_keyword_score', 0.0),
+            'company_keyword_company': layers.get('company_keyword_company'),
+            'company_keyword_source': layers.get('company_keyword_source'),
+            'rank_keyword_matches': layers.get('rank_keyword_matches', []),
+            'rank_keyword_rank': layers.get('rank_keyword_rank'),
+            'rank_keyword_source': layers.get('rank_keyword_source'),
+            'format_check': layers.get('format_check', {}),
+            'rank_eligibility': layers.get('rank_eligibility'),
+            'vacancy_match': layers.get('vacancy_match', {}),
+            'certificate_validity': layers.get('certificate_validity', []),
+            'score_explanation': layers.get('score_explanation', {}),
+            'semantic_match': layers.get('semantic_match', {}),
+            'maritime_entities': layers.get('maritime_entities', []),
+            'maritime_intelligence': layers.get('maritime_intelligence', {}),
         }
     except HTTPException:
         raise
@@ -1809,6 +2009,71 @@ async def score(
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+@app.post(
+    '/ats/compare',
+    summary='Compare candidates for a vacancy using separate eligibility and evidence ranking',
+    dependencies=[Depends(require_api_key)],
+)
+@limiter.limit('3/minute')
+async def compare(
+    request: Request,
+    files: list[UploadFile] = File(..., description='2 to 10 PDF or DOCX resumes'),
+    job_description: str = Form(..., description='Vacancy description used for every candidate'),
+    target_rank: str = Form(default=''),
+    target_cruise_line: str = Form(default=''),
+):
+    """Compare in-memory candidate profiles; no Job rows or resume files are retained."""
+    if len(files) < 2 or len(files) > 10:
+        raise HTTPException(422, 'Provide between 2 and 10 candidate resumes')
+    _check_disk_space()
+    staged=[]
+    candidates=[]
+    try:
+        for index, upload in enumerate(files, 1):
+            contents=await _read_upload_contents(upload)
+            ext=_validate_file(contents, upload.filename or '')
+            path=os.path.join(TMP_DIR, f'{uuid.uuid4()}.{ext}')
+            staged.append(path)
+            _write_private_upload(path, contents)
+            extracted=_extract_with_timeout(path,ext)
+            if not extracted.get('raw_text','').strip():
+                raise HTTPException(422, f'Could not extract candidate {index}')
+            parsed=parse_resume(extracted['raw_text'])
+            parsed['raw_text']=extracted['raw_text']
+            layers=score_layers(extracted,parsed,job_description=job_description,
+                                target_rank=target_rank,target_cruise_line=target_cruise_line,
+                                pdf_path=path,ext=ext)
+            generic=layers['generic']; maritime=layers['maritime'] or {}
+            candidates.append({
+                'candidate_id':f'candidate_{index}',
+                'name':parsed.get('name') or f'Candidate {index}',
+                'rank_detected':(maritime or {}).get('rank_detected') or parsed.get('rank') or '',
+                'ats_score':generic.get('total_score'),
+                'maritime_score':maritime.get('maritime_score'),
+                'vacancy_match':layers.get('vacancy_match',{}),
+                'semantic_match':layers.get('semantic_match',{}),
+                'maritime_intelligence':layers.get('maritime_intelligence',{}),
+                'certificate_evidence':{
+                    name:state.value if hasattr(state,'value') else str(state)
+                    for name,state in layers.get('cert_evidence',{}).items()
+                },
+                'rank_eligibility':layers.get('rank_eligibility'),
+            })
+        compared=compare_candidate_results(candidates)
+        compared['vacancy_profile']=candidates[0]['vacancy_match'].get('requirements',{})
+        return compared
+    except HTTPException:
+        raise
+    except Exception as error:
+        log.error(f'"endpoint":"/ats/compare","error":"{redact_pii(str(error))}"')
+        sentry_sdk.capture_exception(error)
+        raise HTTPException(500,'Could not compare resumes — please try again')
+    finally:
+        for path in staged:
+            try: os.remove(path)
+            except OSError: pass
 
 
 @app.get(
@@ -1863,18 +2128,31 @@ def result(job_id: str):
     if job.status == 'failed':
         raise HTTPException(500, job.error_detail or 'Processing failed')
 
-    def _load(field):
+    def _load(field, default=None):
+        if default is None:
+            default = []
         try:
-            return json.loads(field) if field else []
+            return json.loads(field) if field else default
         except Exception:
-            return []
+            return default
 
     issues_fixed = _load(job.issues_fixed_json)
+    non_rewrite_issues = (
+        AI_REWRITE_FALLBACK_ISSUE,
+        AI_REWRITE_ROLLBACK_ISSUE,
+        AI_REWRITE_FACTUALITY_ISSUE,
+        AI_REWRITE_INTEGRITY_ISSUE,
+    )
     ai_rewrite = not any(
         issue in issues_fixed
-        for issue in (AI_REWRITE_FALLBACK_ISSUE, AI_REWRITE_ROLLBACK_ISSUE)
+        for issue in non_rewrite_issues
     )
-    if AI_REWRITE_ROLLBACK_ISSUE in issues_fixed:
+    if AI_REWRITE_INTEGRITY_ISSUE in issues_fixed:
+        rewrite_note = job.rewrite_integrity_warning or (
+            'The AI rewrite introduced unsupported material facts and was rejected; '
+            'source-derived content was returned for human review.'
+        )
+    elif AI_REWRITE_ROLLBACK_ISSUE in issues_fixed:
         rewrite_note = (
             'The AI rewrite scored below the original resume; '
             'source-derived content was returned instead.'
@@ -1883,6 +2161,11 @@ def result(job_id: str):
         rewrite_note = (
             'Anthropic rewriting was unavailable (missing/invalid API key or provider error); '
             'original resume content was preserved.'
+        )
+    elif AI_REWRITE_FACTUALITY_ISSUE in issues_fixed:
+        rewrite_note = (
+            'The AI rewrite was rejected because it introduced unsupported numeric claims; '
+            'source-derived content was returned instead.'
         )
     else:
         rewrite_note = None
@@ -1917,6 +2200,26 @@ def result(job_id: str):
         'missing_certs':        _load(job.missing_certs_json),
         'issues_fixed':         issues_fixed,
         'keyword_data':         _load(job.keyword_data_json),
+        'cert_evidence':        _load(job.cert_evidence_json),
+        'cert_requirements':    _load(job.cert_requirements_json),
+        'company_keyword_matches': _load(job.company_keyword_matches_json),
+        'company_keyword_score': job.company_keyword_score,
+        'company_keyword_company': job.company_keyword_company,
+        'company_keyword_source': job.company_keyword_source,
+        'rank_keyword_matches': _load(job.rank_keyword_matches_json),
+        'rank_keyword_rank': job.rank_keyword_rank,
+        'rank_keyword_source': job.rank_keyword_source,
+        'format_check':         _load(job.format_check_json),
+        'rank_eligibility':     _load(job.rank_eligibility_json),
+        'rewrite_evaluation':   _load(job.rewrite_evaluation_json),
+        'rejected_rewrite_evaluation': _load(job.rejected_rewrite_evaluation_json),
+        'rewrite_integrity_warning': job.rewrite_integrity_warning,
+        'vacancy_match': _load(job.vacancy_match_json, {}),
+        'certificate_validity': _load(job.certificate_validity_json),
+        'score_explanation': _load(job.score_explanation_json, {}),
+        'semantic_match': _load(job.semantic_match_json, {}),
+        'maritime_entities': _load(job.maritime_entities_json),
+        'maritime_intelligence': _load(job.maritime_intelligence_json, {}),
 
         # Download — DOCX remains the existing contract; PDF is additive
         'download_url':         f'/ats/download/{job_id}',
@@ -2007,8 +2310,8 @@ def delete_job(job_id: str):
 )
 def cleanup():
     """
-    Deletes all jobs past their TTL. Call this from a cron job nightly.
-    Frees disk space and ensures PII is not retained beyond 48 hours.
+    Deletes expired jobs and orphan upload files older than the retention
+    cutoff. Call this from a cron job nightly.
     """
     db = get_db()
     now = datetime.utcnow()
@@ -2024,6 +2327,12 @@ def cleanup():
                 Job.created_at < retention_cutoff,
             ),
         )).all()
+        active_job_ids = {
+            job_id.lower()
+            for (job_id,) in db.query(Job.job_id).filter(
+                Job.status.in_(('queued', 'processing'))
+            ).all()
+        }
         for job in expired:
             try:
                 if not _remove_job_output_artifacts(
@@ -2041,11 +2350,21 @@ def cleanup():
             deleted += 1
 
         db.commit()
+        stale_uploads = _cleanup_stale_uploads(
+            retention_cutoff,
+            active_job_ids,
+        )
     finally:
         db.close()
 
-    log.info(f'"cleanup_deleted":{deleted}')
-    return {'deleted_jobs': deleted, 'timestamp': now.isoformat()}
+    log.info(
+        f'"cleanup_deleted":{deleted},"stale_uploads_deleted":{stale_uploads}'
+    )
+    return {
+        'deleted_jobs': deleted,
+        'stale_uploads_deleted': stale_uploads,
+        'timestamp': now.isoformat(),
+    }
 
 
 @app.get(

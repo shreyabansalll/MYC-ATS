@@ -74,7 +74,7 @@ curl -X POST https://<host>/ats/score \
 
 ```json
 {
-  "name": "Srinivas Menon",
+  "name": "Sample Candidate",
   "ats_score": 70,
   "ats_grade": "PASS",
   "maritime_score": 78,
@@ -87,11 +87,44 @@ curl -X POST https://<host>/ats/score \
   "issues": ["GENERIC_ATS: SECTION_HEADINGS WARN (content/medium)", "..."],
   "recommendations": ["..."],
   "missing_certs": [],
-  "keyword_data": { "engine": "resume_matcher", "role": "third officer", "missing_keywords": [] }
+  "keyword_data": { "engine": "resume_matcher", "role": "third officer", "missing_keywords": [] },
+  "cert_evidence": {
+    "Passport": "not_evidenced",
+    "Proficiency in Survival Craft and Rescue Boats (PSCRB)": "evidenced"
+  },
+  "vacancy_match": {
+    "provided": true,
+    "vacancy_match_score": 66.7,
+    "mandatory_eligibility": "needs_review",
+    "missing_mandatory": ["GMDSS"],
+    "recommendation": "review_required"
+  },
+  "certificate_validity": [
+    {"certificate": "Passport", "issue_date": null, "expiry_date": "2027-03-31", "status": "EXPIRING_SOON"}
+  ],
+  "score_explanation": {
+    "composition": {"parse_points": {"weight": 0.4}, "content_points": {"weight": 0.6}}
+  },
+  "cert_requirements": {},
+  "company_keyword_matches": [],
+  "company_keyword_score": null,
+  "company_keyword_source": null,
+  "rank_keyword_matches": ["Bridge Watchkeeping"],
+  "rank_keyword_source": "ATS SOFTWARES.docx — MYC rank-wise ATS keyword reference",
+  "format_check": { "errors": [], "warnings": [], "platform": "unknown" },
+  "rank_eligibility": null
 }
 ```
 
+`vacancy_match` is populated only when the request includes an explicit `job_description`. It provides a separate evidence-based match and review status; it does not change ATS or maritime scores. `not_found` means the resume did not provide supporting text, not that the candidate lacks the skill or certificate. `certificate_validity` uses explicit printed dates only. Set `CERT_EXPIRING_SOON_DAYS` (default `183`) to adjust the document-expiry warning window; this does not encode a certificate-specific validity rule.
+
+### Optional scanned-PDF OCR
+
+If Tesseract is installed on the API host, image-only PDF pages with little extractable text use local OCR as a fallback. Mixed PDFs retain original page order. The feature can be disabled with `TESSERACT_OCR_ENABLED=0`; `OCR_MAX_PAGES`, `OCR_TIMEOUT_SECONDS`, and `OCR_DPI` bound the work. No OCR model is downloaded by the application. Install the system package separately (`brew install tesseract` on macOS or `sudo apt install tesseract-ocr` on Ubuntu). OCR failures are returned as structural advisories; OCR text is not proof that an extracted certificate or qualification is valid.
+
 `ats_grade` is one of `EXCELLENT` / `GOOD` / `PASS` / `FAIL`. Maritime score fields are `null` when the overlay is inactive. `maritime_grade`, when present, is one of `STRONG` / `ADEQUATE` / `WEAK`. Pass `career_track=generic` to force generic-only scoring, or use `target_rank` / `target_cruise_line` to explicitly activate the maritime overlay.
+
+The additional domain fields are advisory and do not alter the generic ATS score. Certificate evidence states distinguish `not_evidenced` (not found; not proof the candidate lacks it), `confirmed_missing` (explicitly stated as not held), `expired`, `evidenced`, and `not_applicable`. Rank-keyword matches are from MYC's supplied rank-wise reference. Company keyword scores are separate signals, and ATS platform mappings are MYC-supplied operational assumptions rather than verified employer configurations. `rank_eligibility` is MYC placement guidance, not a regulatory determination; unclear rank or dates should be reviewed by management.
 
 This endpoint doesn't create a job or persist anything — nothing to poll, nothing to download. If you need the AI-rewritten resume too, use `/ats/submit` below (you'll get the same scores as part of that flow, plus the rewrite).
 
@@ -143,6 +176,8 @@ GET /ats/status/{job_id}
 
 `status` is one of `queued` / `processing` / `done` / `failed`. Poll every 2-3 seconds. A full run typically takes several seconds to low tens of seconds depending on the AI provider's response time.
 
+The internal dashboard stops polling after five minutes and displays a timeout message; that client-side timeout does not cancel a server-side job. On server startup, jobs still `queued` or `processing` after 30 minutes are marked failed so the candidate can resubmit.
+
 ### Rewrite quality
 
 When polling returns `status: "done"`, fetch `GET /ats/result/{job_id}` and check `rewrite_quality` in that completed result. (`/ats/status/{job_id}` reports progress; `rewrite_quality` is included in `/ats/result/{job_id}`.)
@@ -180,6 +215,28 @@ Only meaningful once `status == "done"`. Returns before/after scores, issues, re
   "missing_certs": [],
   "issues_fixed": ["..."],
   "keyword_data": {},
+  "cert_evidence": {
+    "Passport": "not_evidenced",
+    "Proficiency in Survival Craft and Rescue Boats (PSCRB)": "evidenced"
+  },
+  "cert_requirements": {},
+  "company_keyword_matches": [],
+  "company_keyword_score": 0.0,
+  "company_keyword_company": "carnival",
+  "company_keyword_source": "Key words Officers.pdf and Keyword Engineers and ETO (1).pdf — MYC reference",
+  "rank_keyword_matches": ["Bridge Watchkeeping"],
+  "rank_keyword_rank": "third_officer",
+  "rank_keyword_source": "ATS SOFTWARES.docx — MYC rank-wise ATS keyword reference",
+  "format_check": { "errors": [], "warnings": [], "platform": "unknown" },
+  "rank_eligibility": {
+    "status": "needs_review",
+    "recommended_rank": null,
+    "eligible_for_target": null,
+    "policy_source": "MYC_application_portals.docx — internal placement policy"
+  },
+  "rewrite_evaluation": { "verdict": "neutral" },
+  "rejected_rewrite_evaluation": null,
+  "rewrite_integrity_warning": null,
   "download_url": "/ats/download/a1b2c3d4-...",
   "completed_at": "2026-09-19T10:15:00",
   "expires_at": "2026-09-21T10:15:00"
@@ -199,6 +256,12 @@ GET /ats/download/{job_id}
 Returns the optimised `.docx` file. Available for 48 hours after completion (`expires_at` above); after that, `410 Gone`.
 
 ---
+
+## Compare candidates against a vacancy (optional)
+
+`POST /ats/compare` accepts 2–10 PDF/DOCX `files`, one `job_description`, and optional `target_rank` / `target_cruise_line` form fields. Send the same `X-API-Key` as other client endpoints. It returns per-candidate ATS and vacancy evidence plus a comparison ordering with its factors; eligibility remains a separate review signal. This endpoint is synchronous and does not create or retain job records. Files are staged temporarily and removed when processing finishes.
+
+The response is intended for recruiter-assisted comparison, not automatic hiring decisions. Rank and certificate claims remain unverified; unresolved vacancy requirements and evidence gaps should be reviewed.
 
 ## Cruise-line tailoring (optional)
 

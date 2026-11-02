@@ -15,6 +15,7 @@ from services.ai_client import restore_protected_signals, rewrite_resume
 from pipeline.generator import generate_docx
 from models.candidate_profile import build_candidate_profile
 from services.two_layer import (
+    AI_REWRITE_INTEGRITY_ISSUE,
     maritime_stub_for_profile,
     build_protected_signals,
     rewrite_quality_from_improvement,
@@ -24,7 +25,11 @@ from services.two_layer import (
 )
 
 
-def run_pipeline(file_path: str, job_description: str = '') -> dict:
+def run_pipeline(
+    file_path: str,
+    job_description: str = '',
+    target_cruise_line: str = '',
+) -> dict:
     ext = file_path.split('.')[-1].lower()
 
     # ── Stage 1: Extract ─────────────────────────────────────────────
@@ -54,6 +59,7 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         extracted,
         parsed,
         job_description=job_description,
+        target_cruise_line=target_cruise_line,
         pdf_path=file_path,
         ext=ext,
     )
@@ -94,6 +100,7 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         sea_months=candidate_profile.sea_months,
         generic_mode=not overlay,
         protected_signals=protected_signals,
+        target_cruise_line=target_cruise_line,
     )
 
     if 'error' in rewritten:
@@ -110,7 +117,10 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     # Inject fields rewriter doesn't carry
     rewritten['name']         = candidate_profile.name
     rewritten['contact']      = candidate_profile.contact.model_dump()
-    rewritten['rank']         = rank
+    if candidate_profile.rank_detected and candidate_profile.rank_detected.casefold() != 'unknown':
+        rewritten['rank'] = candidate_profile.rank_detected
+    else:
+        rewritten.pop('rank', None)
     rewritten['sea_months']   = candidate_profile.sea_months
     rewritten['vessel_types'] = candidate_profile.vessel_types
 
@@ -129,7 +139,13 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
             extracted_after,
             parsed_after,
             job_description=tailored_jd,
+            target_cruise_line=target_cruise_line,
+            target_rank=rank,
             overlay=overlay,
+            original_score=ats['total_score'],
+            original_text=extracted['raw_text'],
+            original_parsed=parsed,
+            original_maritime=maritime,
         )
         return path, layers_after
 
@@ -140,7 +156,14 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
     maritime2 = layers_after['maritime']
     improvement = ats2['total_score'] - score_before
 
-    if should_retry_rewrite(improvement, rewrite_failed=False):
+    rewrite_evaluation = layers_after.get('rewrite_evaluation')
+    integrity_risk = bool(
+        rewrite_evaluation
+        and rewrite_evaluation.get('verdict') == 'factual_integrity_risk'
+    )
+    rejected_rewrite_evaluation = copy.deepcopy(rewrite_evaluation) if integrity_risk else None
+
+    if integrity_risk or should_retry_rewrite(improvement, rewrite_failed=False):
         retry_rewritten = rewrite_resume(
             parsed=parsed,
             issues=all_issues,
@@ -151,23 +174,43 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
             generic_mode=not overlay,
             protected_signals=protected_signals,
             strict=True,
+            target_cruise_line=target_cruise_line,
         )
         if 'error' not in retry_rewritten:
             retry_rewritten['name'] = candidate_profile.name
             retry_rewritten['contact'] = candidate_profile.contact.model_dump()
-            retry_rewritten['rank'] = rank
+            if candidate_profile.rank_detected and candidate_profile.rank_detected.casefold() != 'unknown':
+                retry_rewritten['rank'] = candidate_profile.rank_detected
+            else:
+                retry_rewritten.pop('rank', None)
             retry_rewritten['sea_months'] = candidate_profile.sea_months
             retry_rewritten['vessel_types'] = candidate_profile.vessel_types
             retry_path, retry_layers = generate_and_score(retry_rewritten)
-            if retry_layers['generic']['total_score'] > ats2['total_score']:
+            retry_evaluation = retry_layers.get('rewrite_evaluation')
+            retry_is_safe = not (
+                retry_evaluation
+                and retry_evaluation.get('verdict') == 'factual_integrity_risk'
+            )
+            if retry_is_safe and (
+                integrity_risk
+                or retry_layers['generic']['total_score'] > ats2['total_score']
+            ):
                 rewritten = retry_rewritten
                 docx_path = retry_path
                 ats2 = retry_layers['generic']
                 maritime2 = retry_layers['maritime']
+                layers_after = retry_layers
+                rewrite_evaluation = retry_evaluation
                 improvement = ats2['total_score'] - score_before
+                integrity_risk = False
 
     score_rollback = ats2['total_score'] < score_before
-    if score_rollback:
+    if score_rollback or integrity_risk:
+        fallback_issues = []
+        if score_rollback:
+            fallback_issues.append('AI rewrite reduced the ATS score; original content preserved')
+        if integrity_risk:
+            fallback_issues.append(AI_REWRITE_INTEGRITY_ISSUE)
         sections = parsed.get('sections') or {}
         original_experience = sections.get('experience') or ''
         rewritten = {
@@ -196,8 +239,8 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
                 line.strip() for line in (sections.get('technical_expertise') or '').splitlines()
                 if line.strip()
             ],
-            'issues_fixed': ['AI rewrite reduced the ATS score; original content preserved'],
-            'rank': rank,
+            'issues_fixed': fallback_issues,
+            'rank': candidate_profile.rank_detected,
         }
         rewritten = restore_protected_signals(rewritten, parsed, protected_signals)
         rewritten['name'] = candidate_profile.name
@@ -208,15 +251,16 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         ats2 = layers_after['generic']
         maritime2 = layers_after['maritime']
         improvement = ats2['total_score'] - score_before
+        rewrite_evaluation = layers_after.get('rewrite_evaluation')
 
     rewrite_quality = (
         'none'
-        if score_rollback
+        if score_rollback or integrity_risk
         else 'partial'
         if improvement == 0
         else rewrite_quality_from_improvement(improvement)
     )
-    ai_rewrite = not score_rollback
+    ai_rewrite = not score_rollback and not integrity_risk
 
     # The optional photo variant is generated only from the selected
     # non-degrading rewrite (or restored source content).
@@ -273,6 +317,27 @@ def run_pipeline(file_path: str, job_description: str = '') -> dict:
         },
         'issues_fixed':    rewritten.get('issues_fixed', []),
         'issues_remaining': ats2['issues'],
+        'rewrite_evaluation': rewrite_evaluation,
+        'rejected_rewrite_evaluation': rejected_rewrite_evaluation,
+        'rewrite_integrity_warning': (
+            'An AI rewrite attempt introduced unsupported material facts and was rejected. '
+            'A safer retry or source-derived content was used; review the flagged changes.'
+            if integrity_risk or rejected_rewrite_evaluation else None
+        ),
+        'cert_evidence': {
+            name: state.value if hasattr(state, 'value') else str(state)
+            for name, state in layers_before.get('cert_evidence', {}).items()
+        },
+        'cert_requirements': layers_before.get('cert_requirements', {}),
+        'format_check': layers_before.get('format_check', {}),
+        'rank_eligibility': layers_before.get('rank_eligibility'),
+        'company_keyword_matches': layers_before.get('company_keyword_matches', []),
+        'company_keyword_score': layers_before.get('company_keyword_score'),
+        'company_keyword_company': layers_before.get('company_keyword_company'),
+        'company_keyword_source': layers_before.get('company_keyword_source'),
+        'rank_keyword_matches': layers_before.get('rank_keyword_matches', []),
+        'rank_keyword_rank': layers_before.get('rank_keyword_rank'),
+        'rank_keyword_source': layers_before.get('rank_keyword_source'),
     }
 
 
@@ -287,10 +352,19 @@ if __name__ == '__main__':
         default='',
         help='Optional job description for keyword scoring',
     )
+    parser.add_argument(
+        '--target-cruise-line',
+        default='',
+        help='Optional cruise line for MYC keyword guidance (for example: Carnival)',
+    )
     args = parser.parse_args()
     file_path = args.resume_path
     job_desc = args.job_description
-    report    = run_pipeline(file_path, job_desc)
+    report    = run_pipeline(
+        file_path,
+        job_desc,
+        target_cruise_line=args.target_cruise_line,
+    )
 
     if 'error' in report:
         print(f'\n✗ Pipeline failed at stage: {report.get("stage", "unknown")}')

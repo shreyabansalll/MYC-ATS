@@ -269,7 +269,7 @@ def test_add_sea_service_section_omits_itself_when_no_experience():
 
 def test_add_sea_service_section_does_not_crash_on_list_valued_fields():
     """
-    Real crash fixed, confirmed on a real live model response: 'company'
+    A list-valued 'company'
     (or 'dates'/'role') came back as a list instead of a string --
     schema drift, the same category _stringify_cert already guards
     against for certifications. The duplicate-row check built a
@@ -285,20 +285,19 @@ def test_add_sea_service_section_does_not_crash_on_list_valued_fields():
     doc = Document()
     content = {
         'experience_bullets': [
-            {'role': 'Second Officer', 'company': ['MSC Crewing Services', 'MSC'],
+            {'role': 'Second Officer', 'company': ['Example Maritime Services', 'Example Maritime'],
              'dates': '01/2020 - 12/2021', 'bullets': ['Served aboard M.T Example, GRT 12345.']},
         ],
     }
     add_sea_service_section(doc, content)  # must not raise
     text = '\n'.join(p.text for p in doc.paragraphs)
-    assert 'MSC Crewing Services' in text and 'MSC' in text
+    assert 'Example Maritime Services' in text and 'Example Maritime' in text
 
 
 def test_add_sea_service_section_omits_dangling_separator_for_blank_company():
     """
-    Real bug fixed, confirmed on a real live model response (Ankur
-    Shrivastava): 'company' came back as an empty string for every role,
-    and the old f-string unconditionally included it, rendering
+    An empty company value must not be included by the f-string, which
+    previously rendered
     "2018-01-01 - 2020-12-31   —   Second Engineer   —   " with a
     trailing dash and nothing after it. Only the parts actually present
     should be joined.
@@ -321,13 +320,13 @@ def test_add_sea_service_section_omits_dangling_separator_for_blank_company():
 
 
 def test_generate_docx_work_experience_omits_dangling_separator_for_blank_company(tmp_path, monkeypatch):
-    """Same real bug as above, in the Work Experience section's bold role_line."""
+    """The Work Experience section also omits a dangling separator."""
     import config
     from pipeline.generator import generate_docx
     monkeypatch.setattr(config, 'OUTPUT_DIR', str(tmp_path))
 
     content = {
-        'name': 'Ankur Shrivastava', 'contact': {'email': 'a@b.com', 'phone': '123'},
+        'name': 'Sample Candidate', 'contact': {'email': 'sample@example.test', 'phone': '0000000000'},
         'summary': 'Second Engineer with extensive tanker experience.',
         'experience_bullets': [
             {'role': 'Second Engineer', 'company': '', 'dates': '01/2018 - 12/2020',

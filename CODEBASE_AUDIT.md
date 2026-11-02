@@ -40,3 +40,29 @@ The service is a deterministic two-layer scorer with optional Claude rewriting; 
 ## Validation performed
 
 The initial pre-change test baseline was 197 passing tests. The post-change test results are recorded in `FIX_LOG.md`; these results validate repository tests only and do not substitute for production deployment checks or a full 269-resume rewrite batch.
+
+## Follow-up audit — 2026-10-27
+
+This follow-up inspected the current worktree and relevant API, rewrite, temporary-file lifecycle, scorer, and test paths. It did not inspect `.env`, contact Anthropic, or exercise a deployed service. The initial local test runs predated the fixture cleanup and included tests that loaded locally available candidate resumes; those runs are not privacy-clean evaluation evidence. The tests have since been changed to use generated fictional inputs and isolated temporary storage, and the final validation below was run after that change.
+
+| Classification | Priority | Finding and evidence | Disposition |
+|---|---|---|---|
+| Confirmed defect | Medium | `/ats/result/{job_id}` set `ai_rewrite: true` for the distinct `AI_REWRITE_FACTUALITY_ISSUE` fallback case, even though the generated rewrite had been rejected and source-derived text returned. | The endpoint now reports `ai_rewrite: false` and an explanatory note for the rejection; API regression coverage added. |
+| Confirmed defect | Medium | `_rewrite_or_fallback()` initialized certifications, education, and languages as empty on a provider failure or numeric-claim rejection. The normal LLM path has source-restoration helpers, but this fallback path did not call them. | The fallback now applies the existing certification, education, and language completeness helpers before rendering; a regression test covers all three. |
+| Confirmed reliability/privacy weakness | Medium | Source uploads are deleted in `run_pipeline()`'s `finally` block and the scoring endpoint's `finally` block, but process termination can bypass `finally`, leaving UUID-named files in `TMP_DIR`. | Nightly `/ats/cleanup` now removes old regular UUID-named PDF/DOCX uploads beyond `JOB_TTL_HOURS`, skips files for queued/processing jobs, and does not follow symlinks. Cleanup still depends on the operator installing/running the cron job. |
+| Confirmed configuration weakness | Low | Positive integer settings accepted zero/negative `MAX_FILE_MB`, `JOB_TTL_HOURS`, or `MAX_CONCURRENT_JOBS`, which can disable uploads/concurrency or undermine retention. | Startup now fails clearly on non-positive values; parameterized tests cover those inputs. |
+| Confirmed test-data privacy/reproducibility issue | Medium | Several tests conditionally loaded resumes from the ignored local data directory; one outage test also copied a local resume and wrote its job/output to the default local database and output directory. A tracked coordinate dump and demo/test snippets contained identifiable or resume-derived values. | Replaced these dependencies with generated fictional PDFs, synthetic coordinates and sample records; the outage test now uses a temporary database/output directory. Deleted the extracted-word fixture, removed candidate-specific command allowlists and obsolete Groq environment assignments, anonymized demo/test values, and made the coordinate utility require an explicit PDF path. |
+| Recommendation / evidence gap | High | No authorized, de-identified, labeled benchmark is present, so the repository cannot establish real-world extraction accuracy, ATS validity, recruitment outcomes, or factuality rates. | Added a deterministic synthetic evaluation harness and guide. It uses no candidate data or live AI and explicitly does not claim representative accuracy. |
+
+### Final validation after fixture cleanup
+
+- `venv/bin/python -m pytest tests/ -q`: **214 passed, 7 warnings**. Warnings are existing PyMuPDF/spaCy deprecations and a Starlette `TestClient` deprecation.
+- `venv/bin/python -m evaluation.run_synthetic_evaluation`: passed; results below.
+- `py_compile`, `.claude/settings.json` JSON validation, `bash -n deploy.sh`, and `git diff --check`: passed.
+- Repository tests and the evaluation harness no longer read from the ignored local candidate-resume directory. The old outage-test rows and generated output directories were removed from the local database.
+
+### Synthetic evaluation observed in this pass
+
+`venv/bin/python -m evaluation.run_synthetic_evaluation` passed on generated fictional PDF and DOCX inputs: 4/4 expected text markers and 5/5 selected parser field checks per format; each synthetic score was 60/100 with a 100% keyword match for the controlled prompt; the synthetic maritime score was 22 for both formats. Malformed PDF/DOCX, empty DOCX, unsupported extension, and one controlled novel-numeric-claim example were handled as expected. These are fixture-specific regression observations, not accuracy or candidate-quality measurements. See `EVALUATION_GUIDE.md`.
+
+The synthetic checks do not test OCR, arbitrary PDF layout accuracy, live Anthropic output, comprehensive factuality, AWS infrastructure, or deployed cleanup scheduling. Existing limitations remain: the job queue is in-process; stuck `queued`/`processing` jobs are not automatically failed or requeued; rate-limit state is per worker; cleanup requires a configured cron; and numeric-claim checks are heuristic.

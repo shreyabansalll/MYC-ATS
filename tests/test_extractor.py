@@ -14,8 +14,6 @@
 # pdfplumber itself — only pipeline/extractor.py's pure helper functions
 # are under test here.
 
-import os
-
 from pipeline.extractor import (
     _detect_gutter_split, _words_to_text, _clean_text,
     _split_glued_words, _column_bleed_penalty,
@@ -25,21 +23,6 @@ from pipeline.extractor import (
 
 def _word(text, x0, x1, top):
     return {'text': text, 'x0': x0, 'x1': x1, 'top': top}
-
-
-def _load_real_words(fixture_name):
-    """
-    Loads a tab-separated (top, x0, x1, text) word dump captured from a
-    real resume PDF via pdfplumber's page.extract_words(), for tests that
-    need real ground-truth coordinates rather than synthetic ones.
-    """
-    path = os.path.join(os.path.dirname(__file__), 'fixtures', fixture_name)
-    words = []
-    with open(path) as f:
-        for line in f:
-            top, x0, x1, text = line.rstrip('\n').split('\t')
-            words.append(_word(text, float(x0), float(x1), float(top)))
-    return words
 
 
 def test_detect_gutter_split_finds_real_gutter_between_columns():
@@ -118,14 +101,10 @@ def test_detect_gutter_split_handles_narrow_sidebar_layout():
 
 def test_words_to_text_does_not_fragment_a_line_on_cumulative_y_drift():
     """
-    Regression test for a second, distinct bug found on the real Mrinal
-    Thapa PDF: _words_to_text()'s line-grouping compared every word to the
-    FIRST word of the current line, not the immediately preceding word.
-    On a long line, small cumulative y drift between words (justified
-    text, mixed bold/regular font metrics) can push a later word's 'top'
-    more than y_tolerance away from the line's first word even though each
-    word is within tolerance of its immediate neighbor -- incorrectly
-    splitting one physical line into several fragments mid-sentence.
+    _words_to_text() must compare each word with the immediately
+    preceding word, not the first word of the current line. Small
+    cumulative y drift can otherwise split one physical line into
+    fragments even when neighboring words remain aligned.
 
     Each word here drifts by 1.5pt from its immediate neighbor (well
     within y_tolerance=3.0), but the last word drifts 6pt from the first
@@ -152,49 +131,47 @@ def test_words_to_text_still_splits_on_a_genuine_new_line():
     assert text == 'First line.\nSecond line.'
 
 
-def test_full_real_page_reconstructs_summary_and_courses_correctly():
+def test_synthetic_page_reconstructs_summary_and_courses_correctly():
     """
-    End-to-end integration test against the complete, real 411-word
-    page-1 coordinate dump from Mrinal Thapa's actual resume PDF (see
-    tests/fixtures/mrinal_thapa_page1_words.tsv) — not a hand-built
-    synthetic scenario. Exercises the real _detect_gutter_split() +
-    _words_to_text() pipeline exactly as extract_pdf() calls it.
-
-    Before the header-row fix: the DOB on the header row collapsed the
-    real gutter, the detected split fell back to the page midpoint
-    (306.0), and every left-column word ending at the true column edge
-    (x1=337.3) — "in", "and", "system", "hands-", "to", "industry", etc.
-    — leaked into the Courses section as scattered fragments.
+    A synthetic header item bridges the page midpoint and nearly closes
+    the gutter. The fallback split must keep the summary and course
+    sidebar in their intended columns.
     """
-    words = _load_real_words('mrinal_thapa_page1_words.tsv')
+    words = [
+        _word('DOB', 294.0, 356.0, 20.0),
+        _word('SUMMARY', 40.0, 100.0, 40.0),
+        _word('COURSES', 361.4, 420.0, 40.0),
+        _word('with', 40.0, 60.0, 60.0),
+        _word('a', 65.0, 72.0, 60.0),
+        _word('solid', 77.0, 105.0, 60.0),
+        _word('foundation', 110.0, 170.0, 60.0),
+        _word('in', 175.0, 186.0, 60.0),
+        _word('electrical', 191.0, 245.0, 60.0),
+        _word('engineering', 250.0, 300.0, 60.0),
+        _word('Advanced', 361.4, 415.0, 60.0),
+        _word('Fire', 420.0, 440.0, 60.0),
+        _word('Fighting', 445.0, 490.0, 60.0),
+        _word('Example', 361.4, 405.0, 80.0),
+        _word('Maritime', 410.0, 460.0, 80.0),
+        _word('Institute', 465.0, 510.0, 80.0),
+    ]
     x0_page, x1_page = 0.0, 612.0
 
     split = _detect_gutter_split(words, x0_page, x1_page)
-    assert 337.3 < split < 361.4, f'Expected split inside the real gutter, got {split}'
+    assert 300.0 < split < 361.4, f'Expected split inside the synthetic gutter, got {split}'
 
     left_text = _clean_text(_words_to_text(words, x0_page, split))
     right_text = _clean_text(_words_to_text(words, split, x1_page + 1))
 
-    # The full Summary paragraph must survive intact, no dropped/relocated words.
+    # The summary must survive intact, with no dropped or relocated words.
     flat_summary = left_text.replace('\n', ' ')
     assert 'with a solid foundation in electrical engineering' in flat_summary
-    assert 'power distribution, and troubleshooting' in flat_summary
-    assert 'engineering tools for system design' in flat_summary
-    assert 'strong problem-solving abilities' in flat_summary
-    assert 'expertise through hands- on training' in flat_summary or \
-           'expertise through hands-on training' in flat_summary
-    assert 'adhering to industry standards' in flat_summary
-
-    # None of those words leaked into the right column.
-    for stray in ['foundation in\n', 'and\ntroubleshoot']:
-        assert stray not in right_text
-    assert 'COURSES' in right_text
+    assert 'COURSES' not in left_text
+    assert 'SUMMARY' in left_text
     assert 'SUMMARY' not in right_text
-
-    # Courses entries reconstruct as coherent blocks, not scattered garbage.
+    assert 'COURSES' in right_text
     assert 'Advanced Fire Fighting' in right_text
-    assert 'TOLANI MARITIME INSTITUTE' in right_text
-    assert '20100566212400120' in right_text
+    assert 'Example Maritime Institute' in right_text
 
 
 # ── Priority 2: extract_photo() — built on synthetic PDFs, not a real
@@ -283,11 +260,11 @@ def test_split_glued_words_separates_letters_from_long_digit_run():
     immediately against that course's reference number with literally no
     space character in the PDF's own content stream, so pdfplumber's
     own word-boundary detection (which only ever splits on a horizontal
-    character gap) returned it as one token: "Training10502363112502312".
+    character gap) returned it as one token: "Training00000000000000000".
     """
-    words = [_word('Training10502363112502312', 361.4, 465.5, 174.4)]
+    words = [_word('Training00000000000000000', 361.4, 465.5, 174.4)]
     result = _split_glued_words(words)
-    assert [w['text'] for w in result] == ['Training', '10502363112502312']
+    assert [w['text'] for w in result] == ['Training', '00000000000000000']
     # x-span split proportionally and still ordered left-to-right.
     assert result[0]['x0'] == 361.4
     assert result[0]['x1'] == result[1]['x0']
@@ -486,49 +463,52 @@ def test_table_has_real_gridlines_rejects_spurious_heuristic_detection():
 
 def test_render_table_as_text_produces_clean_pipe_delimited_rows():
     """
-    Real bug fixed, confirmed on a real resume (Gilfred Chettiar): the
-    word-coordinate reconstruction lost the "Company Name" and "Vessel
-    Name" columns entirely from a real Seafarer's Service Record table
-    (multi-line cell wrapping, e.g. "Bulk\\nCarriers", broke the
-    row-grouping heuristic it relies on). extract_tables() pairs every
-    cell correctly regardless of wrapping, since it reads the table's
-    actual ruling-line grid rather than inferring rows from word
-    y-coordinates -- this renders that structured data as clean,
-    unambiguous text.
+    Wrapped cells in a synthetic service-record table must render as
+    clean, unambiguous pipe-delimited text.
     """
     table_data = [
         ['Company Name', 'Vessel Name', 'Type of\nvessel', 'GRT', 'Rank', 'Sign On', 'Sign Off'],
-        ['AG Maritime\nPvt Ltd', 'M.V. Hampton\nOcean', 'Bulk\nCarriers', '43291', 'Second\nOfficer', '01/03/2026', '18/03/2026'],
+        ['Example Maritime\nServices', 'M.V. Synthetic\nHorizon', 'Bulk\nCarrier', '43291', 'Second\nOfficer', '01/03/2026', '18/03/2026'],
     ]
     rendered = _render_table_as_text(table_data)
     lines = rendered.split('\n')
     assert lines[0] == 'Company Name | Vessel Name | Type of vessel | GRT | Rank | Sign On | Sign Off'
-    assert lines[1] == 'AG Maritime Pvt Ltd | M.V. Hampton Ocean | Bulk Carriers | 43291 | Second Officer | 01/03/2026 | 18/03/2026'
+    assert lines[1] == 'Example Maritime Services | M.V. Synthetic Horizon | Bulk Carrier | 43291 | Second Officer | 01/03/2026 | 18/03/2026'
 
 
-def test_extract_pdf_uses_real_table_grid_for_gilfred_service_record():
+def test_extract_pdf_uses_grid_for_synthetic_service_record(tmp_path):
     """
-    End-to-end confirmation against the real Gilfred Chettiar PDF (not
-    synthetic data) -- the exact real bug: Company Name and Vessel Name
-    were completely absent from the old word-coordinate-reconstructed
-    text for this candidate's Seafarer's Service Record table. Skips if
-    the real candidate fixture isn't present in this environment.
+    End-to-end extraction must preserve columns from a generated,
+    fictional, ruled service-record table.
     """
-    path = (
-        '/Users/shreya/Desktop/marine-ats/data/myc_resume/'
-        '1. 2024 Candidates/Gilfred Chettiar/GilfredChettiarResume.pdf'
-    )
-    if not os.path.exists(path):
-        import pytest
-        pytest.skip('Real candidate fixture not present in this environment')
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-    result = extract_pdf(path)
+    path = tmp_path / 'synthetic_service_record.pdf'
+    styles = getSampleStyleSheet()
+    data = [
+        ['Company Name', 'Vessel Name', 'Vessel Type', 'Rank', 'Sign On', 'Sign Off'],
+        ['Example Maritime Services', 'M.V. Synthetic Horizon', 'Bulk Carrier', 'Deck Cadet', '01/2021', '12/2021'],
+        ['Example Maritime Services', 'M.V. Fictional Passage', 'Container Ship', 'Third Officer', '01/2022', '12/2022'],
+        ['Example Maritime Services', 'M.V. Sample Voyager', 'Bulk Carrier', 'Second Officer', '01/2023', '12/2023'],
+    ]
+    table = Table(data, colWidths=[120, 120, 90, 75, 65, 65])
+    table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+        ('FONTSIZE', (0, 0), (-1, -1), 7),
+    ]))
+    SimpleDocTemplate(str(path), pagesize=letter).build([
+        Paragraph("Seafarer's Service Record", styles['Heading2']),
+        Spacer(1, 8),
+        table,
+    ])
+
+    result = extract_pdf(str(path))
     text = result['raw_text']
     assert 'Company Name | Vessel Name' in text
-    assert 'AG Maritime Pvt Ltd | M.V. Hampton Ocean' in text
-    # The real header regression: the table must land in the AI-visible
-    # "experience" section, not get lost/miscategorized (see
-    # pipeline/parser.py's SECTION_HEADERS "Seafarer's Service Record" fix).
+    assert 'Example Maritime Services | M.V. Synthetic Horizon' in text
     from pipeline.parser import parse_resume
     parsed = parse_resume(text)
     assert 'Company Name | Vessel Name' in parsed['sections']['experience']

@@ -1,0 +1,4 @@
+# Optional CPU semantic matching and verification-only fuzzy candidate generation.
+# Install only in an isolated ML environment; neither package is required by the API.
+sentence-transformers==6.2.0
+rapidfuzz==3.14.6

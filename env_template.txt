@@ -36,6 +36,15 @@ ALLOWED_ORIGINS=https://marineYourCareer.com,https://app.marineYourCareer.com
 # from a burst of near-simultaneous uploads -- requests over this cap get
 # a clear 503, not silent queueing.
 MAX_CONCURRENT_JOBS=5
+CERT_EXPIRING_SOON_DAYS=183
+TESSERACT_OCR_ENABLED=1
+TESSERACT_CMD=tesseract
+OCR_MAX_PAGES=2
+OCR_TIMEOUT_SECONDS=6
+OCR_DPI=200
+SEMANTIC_MATCH_ENABLED=0
+SEMANTIC_MODEL_PATH=
+SEMANTIC_MATCH_THRESHOLD=0.65
 
 # Optional — Sentry error tracking. Leave unset to run without it (falls
 # back to logs-only, same as before this was added). Get a DSN from

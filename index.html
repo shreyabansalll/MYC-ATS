@@ -630,7 +630,8 @@
 <div class="toast" id="toast"></div>
 
 <script>
-const POLL_INTERVAL = 3000;
+const POLL_INTERVAL = 5000;
+const MAX_POLL_RETRIES = 60;
 const MAX_FILE = 5 * 1024 * 1024;
 
 let currentFile = null;
@@ -835,12 +836,13 @@ function verdictText(score) {
 function severityBadge(sev) {
   const s = (sev || '').toLowerCase();
   if (s === 'critical' || s === 'error' || s === 'high') return 'b-critical';
-  if (s === 'warning' || s === 'medium' || s === 'moderate') return 'b-warning';
+  if (s === 'warning' || s === 'medium' || s === 'moderate' || s === 'high_attention') return 'b-warning';
   return 'b-suggestion';
 }
 function severityLabel(sev) {
   const s = (sev || '').toLowerCase();
   if (s === 'critical' || s === 'error' || s === 'high') return 'Critical';
+  if (s === 'high_attention') return 'High attention';
   if (s === 'warning' || s === 'medium' || s === 'moderate') return 'Warning';
   return 'Suggestion';
 }
@@ -875,6 +877,77 @@ function renderScore(data) {
       </div>
     </div>`;
   }).join('') : '<div class="issue"><div class="it-body"><div class="it-msg" style="color:var(--text-dim);">No issues detected.</div></div></div>';
+  const certEvidence = data.cert_evidence && typeof data.cert_evidence === 'object'
+    ? Object.entries(data.cert_evidence).filter(([, state]) =>
+        ['not_evidenced', 'confirmed_missing', 'expired'].includes(String(state).toLowerCase()))
+    : [];
+  const certEvidenceHtml = certEvidence.length ? `
+    <div class="issues-head">Certificate evidence to verify</div>
+    ${certEvidence.map(([name, state]) => `
+      <div class="issue">
+        <span class="badge ${severityBadge(state === 'not_evidenced' ? 'suggestion' : 'warning')}">${escapeHtml(state.replace(/_/g, ' '))}</span>
+        <div class="it-body"><div class="it-msg">${escapeHtml(name)}</div>
+        ${state === 'not_evidenced' ? '<div class="it-meta">Not found in the resume; this does not establish that the candidate lacks it.</div>' : ''}</div>
+      </div>
+    `).join('')}
+  ` : '';
+  const formatFlags = [
+    ...(Array.isArray(data.format_check?.errors) ? data.format_check.errors : []),
+    ...(Array.isArray(data.format_check?.warnings) ? data.format_check.warnings : []),
+  ];
+  const formatHtml = formatFlags.length || data.format_check?.platform_assumption ? `
+    <div class="issues-head">Advisory format checks</div>
+    ${data.format_check?.platform_assumption ? `<div class="it-meta">ATS mapping assumption: ${escapeHtml(data.format_check.platform_assumption)}. ${escapeHtml(data.format_check.platform_source || '')}</div>` : ''}
+    <div class="it-meta">${escapeHtml(data.format_check?.note || 'These checks are advisory; employer configurations vary.')}</div>
+    ${formatFlags.map(item => `
+      <div class="issue">
+        <span class="badge ${severityBadge(item.severity)}">${severityLabel(item.severity)}</span>
+        <div class="it-body"><div class="it-msg">${escapeHtml(item.reason)}</div>
+        <div class="it-meta">${escapeHtml(item.code)}</div></div>
+      </div>
+    `).join('')}
+  ` : '';
+  const requirements = data.cert_requirements && typeof data.cert_requirements === 'object'
+    ? data.cert_requirements
+    : {};
+  const requirementGroups = [
+    ['MYC mandatory guidance', requirements.mandatory_certs],
+    ['Preferred guidance', requirements.preferred_certs],
+    ['Conditional guidance', requirements.conditional_certs],
+  ].filter(([, values]) => Array.isArray(values) && values.length);
+  const requirementsHtml = requirementGroups.length ? `
+    <div class="issues-head">Certificate guidance</div>
+    ${requirementGroups.map(([label, values]) => `
+      <div class="it-meta"><strong>${escapeHtml(label)}</strong>: ${values.map(escapeHtml).join(' · ')}</div>
+    `).join('')}
+    ${requirements.source ? `<div class="it-meta">Source: ${escapeHtml(requirements.source)}. This is placement guidance, not a complete regulatory ruling.</div>` : ''}
+  ` : '';
+  const companyMatches = Array.isArray(data.company_keyword_matches) ? data.company_keyword_matches : [];
+  const companySource = data.company_keyword_source
+    ? `<div class="it-meta">Source: ${escapeHtml(data.company_keyword_source)}</div>`
+    : '';
+  const companyHtml = data.company_keyword_score != null ? `
+    <div class="issues-head">Company-specific keyword signal <span class="count">${Number(data.company_keyword_score).toFixed(1)}/100</span></div>
+    <div class="it-meta">Separate advisory score; it does not change the generic ATS score.</div>
+    ${companySource}
+    ${companyMatches.length ? `<div class="it-meta">${companyMatches.map(escapeHtml).join(' · ')}</div>` : ''}
+  ` : '';
+  const rankMatches = Array.isArray(data.rank_keyword_matches) ? data.rank_keyword_matches : [];
+  const rankKeywordHtml = rankMatches.length ? `
+    <div class="issues-head">Rank-specific ATS keywords</div>
+    <div class="it-meta">${rankMatches.map(escapeHtml).join(' · ')}</div>
+    ${data.rank_keyword_source ? `<div class="it-meta">Source: ${escapeHtml(data.rank_keyword_source)}</div>` : ''}
+  ` : '';
+  const rank = data.rank_eligibility;
+  const rankHtml = rank ? `
+    <div class="issues-head">MYC rank placement guidance</div>
+    <div class="it-meta">${escapeHtml(rank.status === 'needs_review'
+      ? 'Needs management review; rank-specific service dates could not be established.'
+      : `${rank.basis} Recommended rank: ${rank.recommended_rank || 'not determined'}.`)}</div>
+    ${rank.eligible_for_target == null ? '' : `<div class="it-meta">Matches requested target rank: ${rank.eligible_for_target ? 'yes' : 'no'}.</div>`}
+    ${rank.policy_source ? `<div class="it-meta">Source: ${escapeHtml(rank.policy_source)}.</div>` : ''}
+    <div class="it-meta">Internal MYC policy, not a regulatory eligibility determination.</div>
+  ` : '';
 
   resultsBody.innerHTML = `
     <div class="score-hero">
@@ -902,6 +975,12 @@ function renderScore(data) {
 
     <div class="issues-head">Issues <span class="count">${issues.length}</span></div>
     <div id="issuesList">${issuesHtml}</div>
+    ${companyHtml}
+    ${rankKeywordHtml}
+    ${rankHtml}
+    ${requirementsHtml}
+    ${certEvidenceHtml}
+    ${formatHtml}
   `;
 }
 
@@ -929,6 +1008,91 @@ function renderRewriteDone(data) {
   const after = Number(data.score_after ?? data.after_score ?? data.rewritten_score ?? data.new_score ?? 0);
   const delta = after - before;
   const issues = Array.isArray(data.issues_fixed) ? data.issues_fixed : [];
+  const evaluation = data.rewrite_evaluation || {};
+  const rejectedEvaluation = data.rejected_rewrite_evaluation || {};
+  const integrityWarning = data.rewrite_integrity_warning || (
+    rejectedEvaluation.verdict === 'factual_integrity_risk'
+      ? 'An attempted rewrite introduced unsupported facts and was rejected. Source-derived content was returned for human review.'
+      : evaluation.verdict === 'factual_integrity_risk'
+        ? 'The rewrite contains unsupported material changes and requires MYC review.'
+        : ''
+  );
+  const evaluationHtml = evaluation.verdict ? `
+    <div class="config-note" role="status">
+      Rewrite fact check: ${escapeHtml(evaluation.verdict.replace(/_/g, ' '))}.
+      ${Array.isArray(evaluation.facts_changed) && evaluation.facts_changed.length
+        ? `<div class="it-meta">${evaluation.facts_changed.map(escapeHtml).join('<br>')}</div>`
+        : 'No material differences were detected by the comparison checks.'}
+    </div>
+  ` : '';
+  const certEvidence = data.cert_evidence && typeof data.cert_evidence === 'object'
+    ? Object.entries(data.cert_evidence).filter(([, state]) =>
+        ['not_evidenced', 'confirmed_missing', 'expired'].includes(String(state).toLowerCase()))
+    : [];
+  const certEvidenceHtml = certEvidence.length ? `
+    <div class="issues-head">Certificate evidence to verify</div>
+    ${certEvidence.map(([name, state]) => `
+      <div class="issue">
+        <span class="badge ${severityBadge(state === 'not_evidenced' ? 'suggestion' : 'warning')}">${escapeHtml(state.replace(/_/g, ' '))}</span>
+        <div class="it-body"><div class="it-msg">${escapeHtml(name)}</div>
+        ${state === 'not_evidenced' ? '<div class="it-meta">Not found in the resume; this does not establish that the candidate lacks it.</div>' : ''}</div>
+      </div>
+    `).join('')}
+  ` : '';
+  const formatFlags = [
+    ...(Array.isArray(data.format_check?.errors) ? data.format_check.errors : []),
+    ...(Array.isArray(data.format_check?.warnings) ? data.format_check.warnings : []),
+  ];
+  const formatHtml = formatFlags.length || data.format_check?.platform_assumption ? `
+    <div class="issues-head">Advisory format checks</div>
+    ${data.format_check?.platform_assumption ? `<div class="it-meta">ATS mapping assumption: ${escapeHtml(data.format_check.platform_assumption)}. ${escapeHtml(data.format_check.platform_source || '')}</div>` : ''}
+    <div class="it-meta">${escapeHtml(data.format_check?.note || 'These checks are advisory; employer configurations vary.')}</div>
+    ${formatFlags.map(item => `
+      <div class="issue">
+        <span class="badge ${severityBadge(item.severity)}">${severityLabel(item.severity)}</span>
+        <div class="it-body"><div class="it-msg">${escapeHtml(item.reason)}</div>
+        <div class="it-meta">${escapeHtml(item.code)}</div></div>
+      </div>
+    `).join('')}
+  ` : '';
+  const requirements = data.cert_requirements && typeof data.cert_requirements === 'object'
+    ? data.cert_requirements
+    : {};
+  const requirementGroups = [
+    ['MYC mandatory guidance', requirements.mandatory_certs],
+    ['Preferred guidance', requirements.preferred_certs],
+    ['Conditional guidance', requirements.conditional_certs],
+  ].filter(([, values]) => Array.isArray(values) && values.length);
+  const requirementsHtml = requirementGroups.length ? `
+    <div class="issues-head">Certificate guidance</div>
+    ${requirementGroups.map(([label, values]) => `
+      <div class="it-meta"><strong>${escapeHtml(label)}</strong>: ${values.map(escapeHtml).join(' · ')}</div>
+    `).join('')}
+    ${requirements.source ? `<div class="it-meta">Source: ${escapeHtml(requirements.source)}. This is placement guidance, not a complete regulatory ruling.</div>` : ''}
+  ` : '';
+  const companyMatches = Array.isArray(data.company_keyword_matches) ? data.company_keyword_matches : [];
+  const companyHtml = data.company_keyword_score != null ? `
+    <div class="issues-head">Company-specific keyword signal <span class="count">${Number(data.company_keyword_score).toFixed(1)}/100</span></div>
+    <div class="it-meta">Separate advisory score; it does not change the generic ATS score.</div>
+    ${data.company_keyword_source ? `<div class="it-meta">Source: ${escapeHtml(data.company_keyword_source)}</div>` : ''}
+    ${companyMatches.length ? `<div class="it-meta">${companyMatches.map(escapeHtml).join(' · ')}</div>` : ''}
+  ` : '';
+  const rankMatches = Array.isArray(data.rank_keyword_matches) ? data.rank_keyword_matches : [];
+  const rankKeywordHtml = rankMatches.length ? `
+    <div class="issues-head">Rank-specific ATS keywords</div>
+    <div class="it-meta">${rankMatches.map(escapeHtml).join(' · ')}</div>
+    ${data.rank_keyword_source ? `<div class="it-meta">Source: ${escapeHtml(data.rank_keyword_source)}</div>` : ''}
+  ` : '';
+  const rank = data.rank_eligibility;
+  const rankHtml = rank ? `
+    <div class="issues-head">MYC rank placement guidance</div>
+    <div class="it-meta">${escapeHtml(rank.status === 'needs_review'
+      ? 'Needs management review; rank-specific service dates could not be established.'
+      : `${rank.basis} Recommended rank: ${rank.recommended_rank || 'not determined'}.`)}</div>
+      ${rank.eligible_for_target == null ? '' : `<div class="it-meta">Matches requested target rank: ${rank.eligible_for_target ? 'yes' : 'no'}.</div>`}
+      ${rank.policy_source ? `<div class="it-meta">Source: ${escapeHtml(rank.policy_source)}.</div>` : ''}
+      <div class="it-meta">Internal MYC policy, not a regulatory eligibility determination.</div>
+  ` : '';
 
   const issuesHtml = issues.length ? issues.map(item => {
     const { severity, message, meta } = getIssueParts(item);
@@ -972,6 +1136,18 @@ function renderRewriteDone(data) {
     </div>
 
     ${aiMessage ? `<div class="config-note" role="status">${escapeHtml(aiMessage)}</div>` : ''}
+    ${integrityWarning ? `<div class="config-note" role="alert">${escapeHtml(integrityWarning)}${
+      Array.isArray(rejectedEvaluation.certs_added) && rejectedEvaluation.certs_added.length
+        ? `<div class="it-meta">Certificates flagged: ${rejectedEvaluation.certs_added.map(escapeHtml).join(', ')}</div>`
+        : ''
+    }</div>` : ''}
+    ${evaluationHtml}
+    ${companyHtml}
+    ${rankKeywordHtml}
+    ${rankHtml}
+    ${requirementsHtml}
+    ${certEvidenceHtml}
+    ${formatHtml}
 
     ${downloadUrl ? `
     <div class="download-bar">
@@ -1079,8 +1255,10 @@ async function doRewrite() {
 }
 
 function startPolling(jobId) {
+  let pollCount = 0;
   const poll = async () => {
     if (pollInFlight) return;
+    pollCount += 1;
     pollInFlight = true;
     try {
       const res = await apiFetch(`/ats/status/${encodeURIComponent(jobId)}`);
@@ -1100,6 +1278,14 @@ function startPolling(jobId) {
         renderError(errorMessage);
         showToast(errorMessage);
       } else {
+        if (pollCount >= MAX_POLL_RETRIES) {
+          stopPolling();
+          setBusy(btnRewrite, false);
+          const errorMessage = 'Job timed out after 5 minutes — please retry.';
+          renderError(errorMessage);
+          showToast(errorMessage);
+          return;
+        }
         const label = data.current_stage || (status === 'queued' ? 'Queued…' : 'Processing…');
         const indet = (pct == null || isNaN(pct));
         renderRewriteProgress(label, indet ? null : Math.max(0, Math.min(100, pct)), indet);

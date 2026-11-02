@@ -18,6 +18,59 @@ import uuid
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_api_state(monkeypatch, tmp_path):
+    from sqlalchemy import create_engine
+    import api
+
+    db_path = str(tmp_path / 'jobs.db')
+    engine = create_engine(f'sqlite:///{db_path}')
+    api.Base.metadata.create_all(engine)
+    temporary_uploads = tmp_path / 'uploads'
+    temporary_outputs = tmp_path / 'outputs'
+    temporary_uploads.mkdir()
+    temporary_outputs.mkdir()
+    monkeypatch.setattr(api, 'engine', engine)
+    monkeypatch.setattr(api, 'DB_PATH', db_path)
+    monkeypatch.setattr(api, 'TMP_DIR', str(temporary_uploads))
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(temporary_outputs))
+    yield
+    engine.dispose()
+
+
+def _write_synthetic_resume_pdf(path):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    document = canvas.Canvas(str(path), pagesize=letter)
+    document.setTitle('Fictional maritime resume test fixture')
+    y = 750
+    for line in [
+        'Sample Candidate',
+        'Deck Officer',
+        'sample@example.test',
+        'Professional Summary',
+        'Deck officer experienced in bridge watch, navigation, and safety procedures.',
+        'Experience',
+        'Deck Officer | Example Maritime Services | 01/2021 - 12/2023',
+        'Maintained bridge logs and conducted passage planning on a bulk carrier.',
+        'Sea Service Record',
+        'Example Maritime Services | M.V. Synthetic Horizon | 01/2022 - 12/2022',
+        'Certifications',
+        'STCW Basic Safety Training',
+        'Education',
+        'Diploma in Nautical Science, Example Maritime Academy, 2020',
+        'Skills',
+        'Navigation, bridge watch, passage planning, safety management',
+        'Languages',
+        'English',
+    ]:
+        document.drawString(50, y, line)
+        y -= 18
+    document.save()
+    return str(path)
+
+
 def test_ensure_schema_columns_repairs_a_genuinely_stale_database(tmp_path):
     """
     Real bug fixed, confirmed against the actual data/jobs.db: it was
@@ -83,6 +136,21 @@ def test_ensure_schema_columns_is_a_no_op_on_an_already_correct_schema():
     # The real data/jobs.db, already repaired by this same function at
     # module import time -- a second run must be a clean no-op.
     api._ensure_schema_columns()
+
+
+@pytest.mark.parametrize(
+    ('name', 'value'),
+    [
+        ('MAX_FILE_MB', 0),
+        ('JOB_TTL_HOURS', -1),
+        ('MAX_CONCURRENT_JOBS', 0),
+    ],
+)
+def test_nonpositive_runtime_limits_fail_with_clear_configuration_error(name, value):
+    import api
+
+    with pytest.raises(RuntimeError, match=f'{name} must be a positive integer'):
+        api._require_positive_setting(name, value)
 
 
 def _make_temp_jobs_db(tmp_path):
@@ -466,7 +534,7 @@ def test_output_generation_rejects_a_symlinked_job_directory(tmp_path, monkeypat
     import api
 
     output_root = tmp_path / 'outputs'
-    output_root.mkdir()
+    output_root.mkdir(exist_ok=True)
     external_dir = tmp_path / 'external'
     external_dir.mkdir()
     monkeypatch.setattr(api, 'OUTPUT_DIR', str(output_root))
@@ -552,6 +620,7 @@ def test_cleanup_expires_old_failed_jobs_and_removes_only_their_outputs(
     )
     assert response.status_code == 200
     assert response.json()['deleted_jobs'] == 1
+    assert response.json()['stale_uploads_deleted'] == 0
     assert not job_dir.exists()
     db = api.get_db()
     assert db.get(api.Job, 'failed-job') is None
@@ -576,11 +645,50 @@ def test_health_does_not_report_ok_when_database_check_fails(monkeypatch):
     assert result['total_jobs'] == -1
 
 
+def test_stale_upload_cleanup_removes_only_expired_orphan_uploads(tmp_path, monkeypatch):
+    import api
+    from datetime import datetime, timedelta
+
+    active_job_id = str(uuid.uuid4())
+    old_orphan_id = str(uuid.uuid4())
+    recent_id = str(uuid.uuid4())
+    temp_dir = tmp_path / 'uploads'
+    temp_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(api, 'TMP_DIR', str(temp_dir))
+
+    active_upload = temp_dir / f'{active_job_id}.pdf'
+    old_orphan = temp_dir / f'{old_orphan_id}.docx'
+    recent_upload = temp_dir / f'{recent_id}.pdf'
+    unrelated = temp_dir / 'notes.txt'
+    for path in (active_upload, old_orphan, recent_upload, unrelated):
+        path.write_text('synthetic test content')
+
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    old_time = cutoff - timedelta(seconds=1)
+    os.utime(active_upload, (old_time.timestamp(), old_time.timestamp()))
+    os.utime(old_orphan, (old_time.timestamp(), old_time.timestamp()))
+    os.utime(unrelated, (old_time.timestamp(), old_time.timestamp()))
+
+    symlink_id = str(uuid.uuid4())
+    symlink_upload = temp_dir / f'{symlink_id}.pdf'
+    symlink_upload.symlink_to(unrelated)
+    os.utime(symlink_upload, (old_time.timestamp(), old_time.timestamp()), follow_symlinks=False)
+
+    removed = api._cleanup_stale_uploads(cutoff, {active_job_id})
+
+    assert removed == 1
+    assert active_upload.exists()
+    assert recent_upload.exists()
+    assert unrelated.exists()
+    assert symlink_upload.is_symlink()
+    assert not old_orphan.exists()
+
+
 def test_rewrite_falls_back_on_new_numeric_claims_but_keeps_source_metrics(monkeypatch):
     import api
     from types import SimpleNamespace
 
-    profile = SimpleNamespace(license_rank='', sea_months=0)
+    profile = SimpleNamespace(license_rank='', sea_months=0, rank_detected='unknown')
     parsed = {
         'raw_text': 'Managed 5 vessels and generated $1.2M annual revenue.',
         'sections': {'summary': 'Managed a fleet.'},
@@ -616,6 +724,43 @@ def test_rewrite_falls_back_on_new_numeric_claims_but_keeps_source_metrics(monke
     )
     assert failed is False
     assert accepted['summary'].startswith('Oversaw 5 vessels')
+
+
+def test_rewrite_fallback_restores_source_certificates_education_and_languages(monkeypatch):
+    import api
+    from types import SimpleNamespace
+
+    parsed = {
+        'raw_text': (
+            'Deck Officer\nSummary\nExperienced deck officer.\n'
+            'Certifications\nSTCW Basic Safety Training\n'
+            'Education\nDiploma in Nautical Science 2018\n'
+            'Languages\nEnglish\nHindi\n'
+        ),
+        'sections': {
+            'summary': 'Experienced deck officer.',
+            'experience': 'Served as a deck officer.',
+            'certifications': 'STCW Basic Safety Training',
+            'education': 'Diploma in Nautical Science 2018',
+            'languages': 'English\nHindi',
+        },
+        'skills': ['Bridge watchkeeping'],
+    }
+    monkeypatch.setattr(api, 'rewrite_resume', lambda **_kwargs: {
+        'error': 'API_CALL_FAILED',
+    })
+
+    fallback, failed, _ = api._rewrite_or_fallback(
+        parsed, [], '', '', SimpleNamespace(
+    license_rank='', sea_months=0, rank_detected='unknown',
+        ),
+        '', False,
+    )
+
+    assert failed is True
+    assert 'STCW Basic Safety Training' in fallback['certifications']
+    assert 'Diploma in Nautical Science 2018' in fallback['education']
+    assert fallback['languages'] == ['English', 'Hindi']
 
 
 def test_run_pipeline_error_message_distinguishes_extraction_failure_reason(tmp_path):
@@ -673,7 +818,7 @@ def test_run_pipeline_rolls_back_rewrite_when_strict_retry_still_scores_lower(
             pass
 
     parsed = {
-        'name': 'Ada Lovelace',
+        'name': 'Sample Candidate',
         'rank': '',
         'contact': {'email': 'ada@example.com'},
         'skills': ['Python', 'FastAPI'],
@@ -704,7 +849,7 @@ def test_run_pipeline_rolls_back_rewrite_when_strict_retry_still_scores_lower(
     monkeypatch.setattr(api, 'update_job', lambda _db, _job_id, **values: saved.update(values))
     monkeypatch.setattr(
         api, '_extract_with_timeout',
-        lambda *_: {'raw_text': 'Ada Lovelace\nSoftware Engineer\nPython FastAPI', 'structural_issues': []},
+        lambda *_: {'raw_text': 'Sample Candidate\nSoftware Engineer\nPython FastAPI', 'structural_issues': []},
     )
     monkeypatch.setattr(api, 'parse_resume', lambda *_: parsed.copy())
     monkeypatch.setattr(api, 'score_layers', lambda *_args, **_kwargs: before)
@@ -737,7 +882,7 @@ def test_run_pipeline_rolls_back_rewrite_when_strict_retry_still_scores_lower(
         writes.append(content.copy()) or (f'{tmp_path}/resume.docx', f'{tmp_path}/resume.pdf')
     ))
     monkeypatch.setattr(api, 'extract_text', lambda *_: {
-        'raw_text': 'Ada Lovelace\nSoftware Engineer\nPython FastAPI',
+        'raw_text': 'Sample Candidate\nSoftware Engineer\nPython FastAPI',
         'structural_issues': [],
     })
     monkeypatch.setattr(
@@ -766,40 +911,40 @@ def test_run_pipeline_rolls_back_rewrite_when_strict_retry_still_scores_lower(
     assert saved['ats_score_after'] == 58
 
 
-def test_run_pipeline_falls_back_gracefully_on_total_claude_outage(monkeypatch):
+def test_run_pipeline_falls_back_gracefully_on_total_claude_outage(monkeypatch, tmp_path):
     """
-    Simulates a total Claude outage (client is None). The job must still
-    complete ('done', not 'failed') with the original content preserved.
+    Simulates a total Claude outage without a provider call. The job must
+    complete with fictional source content and isolated temporary storage.
     """
     import uuid
     import api
-    import services.ai_client as ai_client
-
-    monkeypatch.setattr(ai_client, 'ANTHROPIC_API_KEY', 'sk-invalid-fake-key-for-outage-test')
-    monkeypatch.setattr(ai_client, 'client', None)
-
-    real_resume = None
-    for candidate in [
-        '/Users/shreya/Desktop/marine-ats/data/myc_resume/1. 2024 Candidates/Gilfred Chettiar/GilfredChettiarResume.pdf',
-    ]:
-        if os.path.exists(candidate):
-            real_resume = candidate
-            break
-    if real_resume is None:
-        import pytest
-        pytest.skip('Real candidate fixture not present in this environment')
+    from pipeline import generator
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
 
     job_id = str(uuid.uuid4())
-    tmp_path_str = f'/tmp/{job_id}.pdf'
-    import shutil
-    shutil.copy(real_resume, tmp_path_str)
+    input_path = _write_synthetic_resume_pdf(tmp_path / f'{job_id}.pdf')
+    output_dir = tmp_path / 'outputs'
+    output_dir.mkdir(exist_ok=True)
+    test_engine = create_engine(
+        f'sqlite:///{tmp_path / "outage_jobs.db"}',
+        connect_args={'check_same_thread': False},
+    )
+    api.Base.metadata.create_all(test_engine)
+    monkeypatch.setattr(api, 'get_db', lambda: Session(test_engine))
+    monkeypatch.setattr(api, 'OUTPUT_DIR', str(output_dir))
+    monkeypatch.setattr(generator, 'OUTPUT_DIR', str(output_dir))
+    monkeypatch.setattr(
+        api, 'rewrite_resume',
+        lambda **_kwargs: {'error': 'API_CALL_FAILED'},
+    )
 
     db = api.get_db()
     db.add(api.Job(job_id=job_id, file_hash=f'test-claude-outage-{job_id}'))
     db.commit()
     db.close()
 
-    api.run_pipeline(job_id, tmp_path_str, 'pdf', '', '')
+    api.run_pipeline(job_id, input_path, 'pdf', '', '')
 
     db = api.get_db()
     job = db.get(api.Job, job_id)
@@ -807,6 +952,8 @@ def test_run_pipeline_falls_back_gracefully_on_total_claude_outage(monkeypatch):
 
     assert job.status == 'done', f'Expected the job to complete despite the Claude outage, got: {job.status}'
     assert job.output_docx and os.path.exists(job.output_docx)
+    assert str(tmp_path) in job.output_docx
+    test_engine.dispose()
 
 
 def test_submit_never_uses_the_raw_filename_for_the_saved_path(monkeypatch):
@@ -1005,6 +1152,15 @@ def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):
                 job_id='rewrite-success',
                 status='done',
                 issues_fixed_json=json.dumps(['Improved summary']),
+                cert_evidence_json=json.dumps({'Passport': 'not_evidenced'}),
+                company_keyword_matches_json=json.dumps(['OOW']),
+                company_keyword_source='MYC reference fixture',
+                rank_keyword_matches_json=json.dumps(['Bridge Watchkeeping']),
+                rank_keyword_rank='third_officer',
+                rank_keyword_source='ATS rank fixture',
+                vacancy_match_json=json.dumps({'provided': True, 'mandatory_eligibility': 'needs_review'}),
+                certificate_validity_json=json.dumps([{'certificate': 'Passport', 'status': 'EXPIRING_SOON'}]),
+                score_explanation_json=json.dumps({'total_score': 70}),
             ),
             api.Job(
                 job_id='rewrite-fallback',
@@ -1015,6 +1171,11 @@ def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):
                 job_id='rewrite-rollback',
                 status='done',
                 issues_fixed_json=json.dumps([api.AI_REWRITE_ROLLBACK_ISSUE]),
+            ),
+            api.Job(
+                job_id='rewrite-factuality-rejected',
+                status='done',
+                issues_fixed_json=json.dumps([api.AI_REWRITE_FACTUALITY_ISSUE]),
             ),
         ])
         db.commit()
@@ -1036,13 +1197,80 @@ def test_result_reports_whether_ai_rewrite_ran(monkeypatch, tmp_path):
         '/ats/result/rewrite-rollback',
         headers={'X-API-Key': api.API_KEY},
     ).json()
+    factuality_rejected = client.get(
+        '/ats/result/rewrite-factuality-rejected',
+        headers={'X-API-Key': api.API_KEY},
+    ).json()
 
     assert success['ai_rewrite'] is True
     assert success['note'] is None
+    assert success['cert_evidence'] == {'Passport': 'not_evidenced'}
+    assert success['company_keyword_matches'] == ['OOW']
+    assert success['company_keyword_source'] == 'MYC reference fixture'
+    assert success['rank_keyword_matches'] == ['Bridge Watchkeeping']
+    assert success['rank_keyword_rank'] == 'third_officer'
+    assert success['rank_keyword_source'] == 'ATS rank fixture'
+    assert success['vacancy_match'] == {'provided': True, 'mandatory_eligibility': 'needs_review'}
+    assert success['certificate_validity'] == [{'certificate': 'Passport', 'status': 'EXPIRING_SOON'}]
+    assert success['score_explanation'] == {'total_score': 70}
     assert fallback['ai_rewrite'] is False
+    assert fallback['vacancy_match'] == {}
+    assert fallback['certificate_validity'] == []
+    assert fallback['score_explanation'] == {}
     assert 'original resume content was preserved' in fallback['note']
     assert rollback['ai_rewrite'] is False
     assert 'scored below the original' in rollback['note']
+    assert factuality_rejected['ai_rewrite'] is False
+    assert 'unsupported numeric claims' in factuality_rejected['note']
+
+
+def test_stale_job_recovery_fails_old_queued_and_processing_jobs(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    import api
+
+    db_path = _make_temp_jobs_db(tmp_path)
+    test_engine = create_engine(f'sqlite:///{db_path}')
+    monkeypatch.setattr(api, 'engine', test_engine)
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    with api.Session(test_engine) as db:
+        db.add_all([
+            api.Job(
+                job_id='stale-processing',
+                status='processing',
+                created_at=now - timedelta(minutes=31),
+                progress=50,
+                current_stage='Rewriting',
+            ),
+            api.Job(
+                job_id='stale-queued',
+                status='queued',
+                created_at=now - timedelta(minutes=45),
+                progress=0,
+                current_stage='Queued',
+            ),
+            api.Job(
+                job_id='recent-processing',
+                status='processing',
+                created_at=now - timedelta(minutes=29),
+                progress=50,
+                current_stage='Rewriting',
+            ),
+        ])
+        db.commit()
+
+    assert api._recover_stale_processing_jobs(now=now) == 2
+    assert api._recover_stale_processing_jobs(now=now) == 0
+    with api.Session(test_engine) as db:
+        for job_id in ('stale-processing', 'stale-queued'):
+            job = db.get(api.Job, job_id)
+            assert job.status == 'failed'
+            assert job.current_stage == 'Failed'
+            assert job.error_detail == 'Server restarted during processing — please resubmit'
+            assert job.expires_at == now + timedelta(hours=api.JOB_TTL_HOURS)
+        recent = db.get(api.Job, 'recent-processing')
+        assert recent.status == 'processing'
+        assert recent.current_stage == 'Rewriting'
 
 
 def _build_zlib_bomb_pdf(decompressed_mb: int) -> bytes:
@@ -1145,45 +1373,29 @@ def test_extract_with_timeout_does_not_false_positive_on_a_large_but_legitimate_
     )
 
 
-def test_extract_with_timeout_still_works_normally_for_a_real_resume():
+def test_extract_with_timeout_still_works_normally_for_a_synthetic_resume(tmp_path):
     """
-    The timeout wrapper must not break the normal, fast path -- a real
-    resume should extract quickly and correctly through it, same as
-    calling extract_text() directly.
+    The timeout wrapper must preserve ordinary text extraction on a
+    generated fictional resume without requiring local candidate files.
     """
     import api
 
-    real_pdf = 'data/myc_resume/Srinivas Menon/SrinivasMenonResume.pdf'
-    if not os.path.exists(real_pdf):
-        import pytest
-        pytest.skip('Real candidate fixture not present in this environment')
-
-    result = api._extract_with_timeout(real_pdf, 'pdf')
-    assert result['raw_text'], 'Expected real, non-empty extracted text for a real resume'
+    synthetic_pdf = _write_synthetic_resume_pdf(tmp_path / 'synthetic_resume.pdf')
+    result = api._extract_with_timeout(synthetic_pdf, 'pdf')
+    assert 'Sample Candidate' in result['raw_text']
     assert 'EXTRACTION_TIMEOUT' not in result.get('structural_issues', [])
 
 
 # ── /ats/score — scoring only, no Claude dependency ─────────────────────
 
-def _real_pdf_fixture():
-    real_pdf = 'data/myc_resume/Srinivas Menon/SrinivasMenonResume.pdf'
-    if not os.path.exists(real_pdf):
-        pytest.skip('Real candidate fixture not present in this environment')
-    return real_pdf
-
-
-def test_score_endpoint_matches_the_real_submit_pipelines_stage_3_and_4(monkeypatch):
+def test_score_endpoint_matches_the_submit_pipelines_stages_3_and_4(monkeypatch, tmp_path):
     """
     The actual "no drift between the two code paths" guarantee: calls
     /ats/score via TestClient, then separately calls the exact same
     Stage 1-4 functions run_pipeline() itself calls for its "before"
-    scores (extract_text -> parse_resume -> score_resume ->
-    maritime_score) directly against the same real file, and asserts
-    the numbers are identical. This is a real behavioral check, not
-    just a code-reading claim that they share functions -- a future
-    edit to either call site that quietly diverges (different
-    argument, different stage order) would fail this test even if both
-    still "looked like" they called the same functions.
+    scores directly against the same generated fictional PDF and asserts
+    the numbers are identical. This is a behavioral check, not just a
+    code-reading claim that they share functions.
     """
     import api
     from pipeline.extractor import extract_text
@@ -1191,11 +1403,11 @@ def test_score_endpoint_matches_the_real_submit_pipelines_stage_3_and_4(monkeypa
     from services.two_layer import score_layers
     from fastapi.testclient import TestClient
 
-    real_pdf = _real_pdf_fixture()
+    synthetic_pdf = _write_synthetic_resume_pdf(tmp_path / 'score_resume.pdf')
     monkeypatch.setattr(api, 'API_KEY', 'score-endpoint-test-key')
     api.limiter.reset()
 
-    with open(real_pdf, 'rb') as f:
+    with open(synthetic_pdf, 'rb') as f:
         content = f.read()
 
     client = TestClient(api.app)
@@ -1209,14 +1421,15 @@ def test_score_endpoint_matches_the_real_submit_pipelines_stage_3_and_4(monkeypa
 
     # The same Stage 1-4 call sequence run_pipeline() makes, invoked
     # directly against the exact same bytes.
-    extracted        = extract_text(real_pdf, 'pdf')
+    extracted        = extract_text(synthetic_pdf, 'pdf')
     parsed           = parse_resume(extracted['raw_text'])
     parsed['raw_text'] = extracted['raw_text']
-    layers = score_layers(extracted, parsed, pdf_path=real_pdf, ext='pdf')
+    layers = score_layers(extracted, parsed, pdf_path=synthetic_pdf, ext='pdf')
     ats_result = layers['generic']
     maritime_result = layers['maritime']
 
     assert via_endpoint['ats_score'] == ats_result['total_score']
+    assert 'maritime_intelligence' in via_endpoint
     assert via_endpoint['ats_grade'] == ats_result['grade']
     if maritime_result:
         assert via_endpoint['maritime_score'] == maritime_result['maritime_score']
@@ -1226,6 +1439,26 @@ def test_score_endpoint_matches_the_real_submit_pipelines_stage_3_and_4(monkeypa
         assert via_endpoint['cert_coverage'] == maritime_result['cert_coverage']
     else:
         assert via_endpoint['maritime_score'] is None
+
+
+def test_compare_endpoint_returns_ranked_evidence_without_persisting_jobs(monkeypatch,tmp_path):
+    import api
+    from fastapi.testclient import TestClient
+    pdf=_write_synthetic_resume_pdf(tmp_path/'compare_resume.pdf')
+    payload=open(pdf,'rb').read()
+    monkeypatch.setattr(api,'API_KEY','compare-test-key')
+    api.limiter.reset()
+    client=TestClient(api.app)
+    response=client.post('/ats/compare',headers={'X-API-Key':api.API_KEY},
+        data={'job_description':'Third Officer\nRequired:\nGMDSS and ECDIS','target_rank':'third officer'},
+        files=[('files',('candidate-a.pdf',payload,'application/pdf')),
+               ('files',('candidate-b.pdf',payload,'application/pdf'))])
+    assert response.status_code==200,response.text
+    body=response.json()
+    assert body['eligibility_is_separate_from_ranking'] is True
+    assert len(body['candidates'])==2
+    assert body['candidates'][0]['comparison_position']==1
+    assert 'comparison_factors' in body['candidates'][0]
 
 
 def test_score_endpoint_requires_api_key():
@@ -1331,8 +1564,8 @@ def test_score_endpoint_does_not_persist_a_job_row(monkeypatch, tmp_path):
     api.limiter.reset()
     client = TestClient(api.app)
 
-    real_pdf = _real_pdf_fixture()
-    with open(real_pdf, 'rb') as f:
+    synthetic_pdf = _write_synthetic_resume_pdf(tmp_path / 'score_no_job.pdf')
+    with open(synthetic_pdf, 'rb') as f:
         content = f.read()
 
     conn = sqlite3.connect(api.DB_PATH)
@@ -1612,13 +1845,13 @@ def test_dashboard_proxy_forwards_resume_upload_without_browser_key(monkeypatch)
     assert received_options['job_description'] == 'Deck officer'
 
 
-def test_score_endpoint_includes_the_candidate_name(monkeypatch):
+def test_score_endpoint_includes_the_candidate_name(monkeypatch, tmp_path):
     """
     Real gap fixed after manual testing: the initial version of this
     endpoint returned scores/issues but not the candidate's name, even
     though it's already computed for free via build_candidate_profile()
     -- MYC's app would otherwise have no way to label a result without
-    an extra round trip. Confirmed with a real document, not a mock.
+    an extra round trip. Uses a generated fictional PDF.
     """
     from fastapi.testclient import TestClient
     import api
@@ -1627,8 +1860,8 @@ def test_score_endpoint_includes_the_candidate_name(monkeypatch):
     api.limiter.reset()
     client = TestClient(api.app)
 
-    real_pdf = _real_pdf_fixture()
-    with open(real_pdf, 'rb') as f:
+    synthetic_pdf = _write_synthetic_resume_pdf(tmp_path / 'score_name.pdf')
+    with open(synthetic_pdf, 'rb') as f:
         content = f.read()
 
     r = client.post(
@@ -1637,7 +1870,7 @@ def test_score_endpoint_includes_the_candidate_name(monkeypatch):
         files={'file': ('resume.pdf', content, 'application/pdf')},
     )
     assert r.status_code == 200
-    assert r.json().get('name'), f'Expected a real, non-empty candidate name, got: {r.json().get("name")!r}'
+    assert r.json().get('name') == 'Sample Candidate'
 
 
 def test_score_endpoint_works_for_a_real_docx_not_just_pdf(tmp_path, monkeypatch):
@@ -1653,8 +1886,8 @@ def test_score_endpoint_works_for_a_real_docx_not_just_pdf(tmp_path, monkeypatch
     import api
 
     doc = Document()
-    doc.add_paragraph('JANE TEST OFFICER')
-    doc.add_paragraph('jane.test@example.com | +91 9876543210')
+    doc.add_paragraph('SAMPLE CANDIDATE')
+    doc.add_paragraph('sample@example.test | +91-0000000000')
     doc.add_paragraph('SUMMARY')
     doc.add_paragraph('Third Officer with 5 years of sea service on oil tankers.')
     doc.add_paragraph('CERTIFICATIONS')
@@ -1663,7 +1896,7 @@ def test_score_endpoint_works_for_a_real_docx_not_just_pdf(tmp_path, monkeypatch
     doc.add_paragraph('GMDSS/GOC')
     doc.add_paragraph('ENG1 Medical Fitness Certificate')
     doc.add_paragraph('EXPERIENCE')
-    doc.add_paragraph('Third Officer, AG Maritime Pvt Ltd, 01/2021 - 12/2023')
+    doc.add_paragraph('Third Officer, Example Maritime Services, 01/2021 - 12/2023')
     doc.add_paragraph('Managed cargo operations and navigation watch.')
     docx_path = tmp_path / 'test.docx'
     doc.save(str(docx_path))

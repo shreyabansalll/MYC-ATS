@@ -1,6 +1,9 @@
 # pipeline/extractor.py
 import io
+import os
 import re
+import shutil
+import subprocess
 import pdfplumber
 import pymupdf
 from pdfminer.pdfdocument import PDFPasswordIncorrect
@@ -11,11 +14,49 @@ from docx import Document
 _GLUED_ALNUM_PATTERN = re.compile(r"^([A-Za-z][A-Za-z'\-]{1,})(\d{10,})$")
 
 
+def _ocr_pdf_page(path: str, page_number: int) -> dict:
+    """Run optional local Tesseract on one rendered page; never downloads models."""
+    if os.getenv('TESSERACT_OCR_ENABLED', '1').casefold() in {'0', 'false', 'no'}:
+        return {'text': '', 'status': 'disabled'}
+    command = os.getenv('TESSERACT_CMD', 'tesseract')
+    binary = shutil.which(command)
+    if not binary:
+        return {'text': '', 'status': 'not_installed'}
+    try:
+        timeout = max(1, int(os.getenv('OCR_TIMEOUT_SECONDS', '6')))
+        dpi = max(100, min(300, int(os.getenv('OCR_DPI', '200'))))
+        with pymupdf.open(path) as doc:
+            page = doc.load_page(page_number)
+            pixmap = page.get_pixmap(dpi=dpi, alpha=False)
+            image = PILImage.frombytes(
+                'RGB', (pixmap.width, pixmap.height), pixmap.samples,
+                'raw', 'RGB', pixmap.stride,
+            )
+        image_bytes = io.BytesIO()
+        image.save(image_bytes, format='PNG')
+        result = subprocess.run(
+            [binary, 'stdin', 'stdout', '--psm', '3'],
+            input=image_bytes.getvalue(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode:
+            return {'text': '', 'status': 'error'}
+        text = result.stdout.decode('utf-8', errors='replace').strip()
+        return {'text': text, 'status': 'ok' if text else 'empty'}
+    except subprocess.TimeoutExpired:
+        return {'text': '', 'status': 'timeout'}
+    except Exception:
+        return {'text': '', 'status': 'error'}
+
+
 def _split_glued_words(words: list) -> list:
     """
     Splits a single pdfplumber word that's actually two unrelated fields
     glued together with zero character-gap in the source PDF — e.g.
-    'Training10502363112502312' (confirmed on a real resume's Courses
+    'Training00000000000000000' in a synthetic glued-token regression
     table: an institute name wraps onto a second line ending in
     "Training", which sits immediately adjacent to that course's
     reference number with no separating whitespace character at all in
@@ -197,16 +238,9 @@ def _table_has_real_gridlines(page, table) -> bool:
     """
     pdfplumber's table-detection heuristics can produce a spurious
     "table" from mere text-block alignment even with zero actual
-    ruling lines on the page -- confirmed on a real resume: Ankur
-    Shrivastava's page 0 (a Summary/Technical Expertise page with no
-    real table at all) was detected as a 2-row, 1-col "table" spanning
-    almost the entire page, purely from rect-based heuristics, despite
-    page.lines being completely empty there. A genuine gridded table --
-    the kind this project's real Seafarer's Service Record tables
-    consistently have (confirmed via direct inspection: 46-66 real
-    ruling lines, 8 real columns) -- has actual ruling lines on the
-    page and multiple real columns; a false positive from whitespace/
-    rect heuristics alone doesn't clear both bars at once.
+    ruling lines on the page. A genuine gridded table has actual ruling
+    lines and multiple rows and columns; a false positive from
+    whitespace/rect heuristics alone doesn't clear all three checks.
     """
     if not page.lines:
         return False
@@ -221,16 +255,9 @@ def _render_table_as_text(table_data: list) -> str:
     """
     Renders a pdfplumber-extracted table (list of row lists) as clean,
     pipe-delimited text -- one row per line, every column preserved
-    and unambiguous. Confirmed real bug this replaces: the existing
-    word-coordinate/layout-based reconstruction can lose entire
-    columns outright on a real resume's Seafarer's Service Record
-    table (Gilfred Chettiar: "Company Name" and "Vessel Name" were
-    completely absent from the extracted text -- multi-line cell
-    wrapping, e.g. "Bulk\\nCarriers", broke the row-grouping heuristic
-    that reconstruction relies on), which starves the AI rewrite
-    prompt of company/vessel data it has no other source for on some
-    candidates -- a direct, confirmed contributor to fabricated
-    company names and blank vessel fields in real generated output.
+    and unambiguous. This avoids losing columns when multi-line cell
+    wrapping breaks word-coordinate row grouping, preserving company
+    and vessel fields for later stages.
     extract_tables() pairs every cell correctly regardless of
     multi-line wrapping, since it reads the table's actual ruling-line
     grid rather than inferring rows from word y-coordinates.
@@ -342,6 +369,32 @@ def extract_pdf(path: str) -> dict:
     text = ''
     issues = []
     is_multi_column = False
+    ocr_used = False
+    ocr_attempts = 0
+    try:
+        ocr_limit = min(20, max(0, int(os.getenv('OCR_MAX_PAGES', '2'))))
+    except ValueError:
+        ocr_limit = 0
+        issues.append('OCR_INVALID_PAGE_LIMIT')
+    ocr_statuses = []
+
+    def _maybe_ocr(page, page_number: int, page_text: str) -> str:
+        nonlocal ocr_used, ocr_attempts
+        if (
+            os.getenv('TESSERACT_OCR_ENABLED', '1').casefold() in {'0', 'false', 'no'}
+            or len((page_text or '').strip()) >= 30
+            or not page.images
+            or ocr_attempts >= ocr_limit
+        ):
+            return page_text
+        result = _ocr_pdf_page(path, page_number)
+        if result['status'] != 'disabled':
+            ocr_attempts += 1
+            ocr_statuses.append(result['status'])
+        if result['text']:
+            ocr_used = True
+            return result['text']
+        return page_text
 
     try:
         with pymupdf.open(path) as probe:
@@ -353,7 +406,7 @@ def extract_pdf(path: str) -> dict:
                 }
 
         with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
+            for page_number, page in enumerate(pdf.pages):
                 x0   = page.bbox[0]
                 y0   = page.bbox[1]
                 x1   = page.bbox[2]
@@ -363,22 +416,15 @@ def extract_pdf(path: str) -> dict:
                 words = page.extract_words()
                 if not words:
                     page_text = page.extract_text() or ''
+                    page_text = _maybe_ocr(page, page_number, page_text)
                     if page_text:
                         text += page_text + '\n'
                     continue
 
-                # Real gridded tables (Seafarer's Service Record, etc.) are
-                # extracted via their actual ruling-line grid FIRST, not the
-                # word-coordinate reconstruction below -- confirmed real
-                # data-loss bug (Gilfred Chettiar): the word-coordinate path
-                # lost the Company Name and Vessel Name columns entirely on
-                # a real service-record table (multi-line cell wrapping
-                # broke its row-grouping heuristic), while extract_tables()
-                # pairs every cell correctly regardless of wrapping, since
-                # it reads the grid directly rather than inferring rows from
-                # word y-coordinates. Table-covered words are excluded from
-                # `words` below so the same content isn't reconstructed a
-                # second time, scrambled, alongside the clean version.
+                # Gridded tables are extracted through their ruling lines
+                # before word-coordinate reconstruction, which can lose
+                # columns when cell text wraps. Exclude table-covered words
+                # below so the content is not reconstructed a second time.
                 table_text, table_bboxes = _extract_real_tables(page)
                 # A page-level view with table regions removed -- used for
                 # both extract_text() fallback calls below (the raw
@@ -486,6 +532,8 @@ def extract_pdf(path: str) -> dict:
                 elif table_text:
                     page_text = table_text
 
+                page_text = _maybe_ocr(page, page_number, page_text)
+
                 if page_text:
                     text += page_text + '\n'
 
@@ -510,10 +558,16 @@ def extract_pdf(path: str) -> dict:
             'is_ocr':            False,
         }
 
+    if ocr_used:
+        issues.append('LOCAL_TESSERACT_OCR_USED')
+    if ocr_statuses and not ocr_used:
+        issues.extend(sorted({f'OCR_{status.upper()}' for status in ocr_statuses}))
     if len(text.strip()) < 100:
+        scanned_issues = ['SCANNED_PDF_DETECTED_OCR_NEEDED']
+        scanned_issues.extend(issues)
         return {
             'raw_text':          text,
-            'structural_issues': ['SCANNED_PDF_DETECTED_OCR_NEEDED'],
+            'structural_issues': scanned_issues,
             'is_ocr':            True,
         }
 
@@ -525,7 +579,7 @@ def extract_pdf(path: str) -> dict:
     return {
         'raw_text':          text.strip(),
         'structural_issues': issues,
-        'is_ocr':            False,
+        'is_ocr':            ocr_used,
         'column_severity':   column_severity,
     }
 

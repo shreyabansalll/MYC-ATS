@@ -209,10 +209,9 @@ def enforce_length_limits(content: dict, rank: str) -> dict:
     # earned may be silently dropped for page-length reasons (a
     # certificate is the #1 thing a recruiter screens for; see CLAUDE.md's
     # Project Overview). A hardcoded [:8] cap used to drop real entries
-    # here — confirmed on real output: 2 of Mrinal Thapa's 10 real
-    # certs/courses were silently truncated by this exact cap even though
-    # services/ai_client.py's enforce_cert_completeness() had correctly
-    # preserved all 10 through the rewrite. Page length is now managed
+    # here — a hardcoded cap could silently drop valid certs/courses
+    # even though services/ai_client.py's enforce_cert_completeness()
+    # preserved them through the rewrite. Page length is now managed
     # entirely by trimming skills/bullets (below) and, as a last resort,
     # compact_mode (see the flag set at the end of this function).
     content['certifications'] = _as_list(content.get('certifications', []))
@@ -457,9 +456,7 @@ def add_sea_service_section(doc, content, compact=False):
         if row_key in seen_rows:
             continue
         seen_rows.add(row_key)
-        # A blank company/headline (real bug fixed, confirmed on real
-        # output: Ankur Shrivastava's rewrite returned an empty
-        # 'company' for every role) must not render as a dangling
+        # A blank company/headline must not render as a dangling
         # "—   " with nothing after it — join only the parts actually
         # present rather than always including every slot.
         parts = [p for p in (dates, headline, company) if p]
@@ -595,9 +592,7 @@ def generate_docx(content: dict, job_id: str = 'output',
         for idx, job in enumerate(experience):
             if not isinstance(job, dict):
                 continue
-            # A blank company (real bug fixed, confirmed on real output:
-            # Ankur Shrivastava's rewrite returned an empty 'company'
-            # for every role) must not render as "Role  —    |  Dates"
+            # A blank company must not render as "Role  —    |  Dates"
             # with a dangling separator and nothing between it and the
             # next one — join only the parts actually present.
             head_parts = [p for p in (_job_field(job, 'role'), _job_field(job, 'company')) if p]

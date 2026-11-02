@@ -294,11 +294,9 @@ def _drop_fabricated_reference_numbers(certifications: list, raw_text: str) -> l
     Strips a certification's reference/serial number when that exact
     number does not appear anywhere in the source resume text at all --
     the model has no ground truth for a number beyond source, so one
-    that isn't there can only be invented. Confirmed on real output
-    (Ankur Shrivastava): two separate "Certificate of Competency (CoC)"
-    entries with numbers "123456" and "789012", neither of which appears
-    anywhere in the source PDF -- classic sequential placeholder-number
-    fabrication. Distinct from _drop_fabricated_acronym_number_pairs
+    that isn't there can only be invented. This catches sequential
+    placeholder-number fabrication, distinct from
+    _drop_fabricated_acronym_number_pairs
     (which only catches the SAME number reused across multiple entries):
     here each entry has its own invented number, so that check never
     fires. Strips the number rather than the whole entry -- the cert
@@ -554,7 +552,7 @@ def _normalize_rewrite_result(result, finish_reason) -> dict:
     if isinstance(result.get('certifications'), list):
         result['certifications'] = [_stringify_cert(c) for c in result['certifications']]
         # Real bug fixed, confirmed on real output: the model extracted a
-        # Courses table's bare reference numbers ("10502363112502312")
+        # Courses table's bare reference numbers ("00000000000000000")
         # as standalone certification entries, IN ADDITION to using them
         # correctly inside a full course-card entry elsewhere in the
         # same list. A bare number with no letters at all carries zero
@@ -650,8 +648,8 @@ def _reclassify_document_like_certs(result: dict) -> dict:
 def _cert_item_covered(item: str, coverage_text: str) -> bool:
     """
     Token-overlap check, not exact/substring match -- a rewritten cert
-    line is allowed to be reformatted or reordered ('CDC | MUM 549153 |
-    16/APR/2034' vs the source's 'CDC No. MUM549153 valid till 16 Apr
+    line is allowed to be reformatted or reordered ('CDC | TEST-CDC-0001 |
+    16/APR/2034' vs the source's 'CDC No. TEST-CDC-0001 valid till 16 Apr
     2034'), so this only asks whether most of the item's meaningful
     (3+ char, non-noise) words survive somewhere in the final output --
     not that the exact string does. An item with no meaningful tokens at
@@ -742,8 +740,8 @@ _DANGLING_LINE_CONNECTORS = {'&', 'and', 'or'}
 def _merge_wrapped_cert_lines(lines: list) -> list:
     """
     A certificate name that wraps across two source lines must not
-    become two separate source items. Confirmed real bug (Ankur
-    Shrivastava): source has "Passenger Familiarization and Crowd &" /
+    become two separate source items. A source may have
+    "Passenger Familiarization and Crowd &" /
     "Crisis Management Certification." as two consecutive lines (a
     plain PDF line-wrap, not column bleed -- pipeline/parser.py's own
     section-split already produces exactly these two lines). Coverage-
@@ -1845,8 +1843,7 @@ def enforce_minimum_quality(result: dict, rank: str, generic_mode: bool = False)
     # has_real_exp:` branch above, as the `else` case -- which only runs
     # when has_real_exp is FALSE, i.e. when NO entry has real company/
     # dates. That's structurally unreachable for the actual failure this
-    # was written for (confirmed on real generated output, Mrinal Thapa):
-    # an entry with perfectly real company/dates but an empty 'role'
+    # was written for: an entry can have real company/dates but an empty 'role'
     # makes has_real_exp TRUE, so the whole outer `if` is skipped and this
     # backfill never ran at all -- the role stayed blank in both the Sea
     # Service Record row and Work Experience's bold header line. This is
@@ -1931,6 +1928,24 @@ def _call_claude_with_retry(prompt: str, *, generic_mode: bool = False):
         'Copy names, companies, dates, vessel names, GRT, and document numbers '
         'EXACTLY as given in the source — never approximate or invent them. '
         'Never invent qualifications, sea service, or certificates. '
+        'MARITIME-SPECIFIC REWRITE RULES: Never fabricate a certificate, rank, '
+        'sea-service duration, vessel name, or quantified achievement. Do not '
+        'add an unsupported skill or qualification to the resume body. If the '
+        'response schema supports suggested_additions, put relevant unverified '
+        'skills there, separate from resume content; otherwise omit them. '
+        'Include a rank-specific STCW code in the Professional Summary only '
+        'when both the rank and matching Certificate of Competency are evidenced '
+        'in the source. Use company-specific language only when the source '
+        'supports the underlying experience; hospitality-focused wording requires '
+        'source evidence of cruise hospitality experience. Avoid em dashes. '
+        'Give each experience bullet a clear action verb, using present tense for '
+        'current roles and past tense for completed roles. Keep certifications '
+        'under a dedicated Certifications heading, one certificate per line. '
+        'Use the exact Skills heading when the target is associated with '
+        'SuccessFactors. Treat ATS mappings as MYC-supplied assumptions, not '
+        'verified employer system behavior. Distinguish MYC placement advice '
+        'from regulatory requirements, and never describe an MYC preference as '
+        'a regulation. Preserve all source-backed numbers exactly. '
         'Your response must start with { and end with }.'
     )
     if not generic_mode:

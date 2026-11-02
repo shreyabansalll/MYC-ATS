@@ -246,8 +246,7 @@ def test_score_format_flags_when_truly_no_numbers():
 
 def test_score_sections_single_role_not_flagged_non_chronological():
     """
-    Real bug fixed, confirmed on real generated output (Mrinal Thapa,
-    single role): the old check compared the very first 4-digit year in
+    The old check compared the very first 4-digit year in
     the whole experience block to the very last one. For a single role
     written as "09/2024 - 05/2025", that's the role's own start year vs
     its own end year -- start < end is true by definition for a role

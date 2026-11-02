@@ -1,0 +1,24 @@
+{
+  "dataset_type": "synthetic_regression_only",
+  "not_for_training": true,
+  "cases": [
+    {
+      "vacancy_id": "synthetic_deck_officer",
+      "job_description": "Third Officer\nRequired: ECDIS, Bridge Resource Management, Passage Planning\nPreferred: Dynamic Positioning",
+      "candidates": [
+        {"candidate_id": "candidate_a", "relevance": 2, "text": "Third Officer. ECDIS operations. Bridge team management and voyage passage planning. Dynamic positioning exposure."},
+        {"candidate_id": "candidate_b", "relevance": 1, "text": "Second Officer. ECDIS watchkeeping and passage planning. Bridge resource management."},
+        {"candidate_id": "candidate_c", "relevance": 0, "text": "Chief Engineer. Main engine maintenance, HVAC, fuel systems, and planned maintenance."}
+      ]
+    },
+    {
+      "vacancy_id": "synthetic_engine_officer",
+      "job_description": "Second Engineer\nRequired: Auxiliary Machinery, Planned Maintenance System, Engine Room Resource Management\nPreferred: HVAC Systems",
+      "candidates": [
+        {"candidate_id": "candidate_d", "relevance": 2, "text": "Second Engineer. Auxiliary machinery operations, PMS, engine room resource management, and HVAC systems."},
+        {"candidate_id": "candidate_e", "relevance": 1, "text": "Third Engineer. Auxiliary machinery and preventive maintenance experience."},
+        {"candidate_id": "candidate_f", "relevance": 0, "text": "Third Officer. Bridge watchkeeping, voyage planning, ECDIS and GMDSS."}
+      ]
+    }
+  ]
+}

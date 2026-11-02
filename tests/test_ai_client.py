@@ -316,7 +316,7 @@ def test_build_rewrite_prompt_includes_verified_sea_months():
 def test_rewrite_prompts_include_protected_terms():
     signals = [
         {'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'},
-        {'text': 'CDC MUM123456', 'kind': 'certificate', 'section': 'documents'},
+        {'text': 'CDC TEST-CDC-0001', 'kind': 'certificate', 'section': 'documents'},
     ]
 
     maritime_prompt = build_rewrite_prompt(
@@ -331,7 +331,7 @@ def test_rewrite_prompts_include_protected_terms():
         assert 'PROTECTED TERMS' in prompt
         assert 'do not rephrase, remove, or alter' in prompt
         assert '- FastAPI' in prompt
-        assert '- CDC MUM123456' in prompt
+        assert '- CDC TEST-CDC-0001' in prompt
 
 
 def test_rewrite_resume_restores_a_model_dropped_protected_keyword(monkeypatch):
@@ -375,14 +375,14 @@ def test_restore_protected_signals_puts_omitted_terms_in_their_source_sections()
     }
     signals = [
         {'text': 'FastAPI', 'kind': 'keyword', 'section': 'skills'},
-        {'text': 'MUM123456', 'kind': 'certificate_code', 'section': 'documents', 'restore_text': 'CDC No. MUM123456'},
+        {'text': 'TEST-CDC-0001', 'kind': 'certificate_code', 'section': 'documents', 'restore_text': 'CDC No. TEST-CDC-0001'},
         {'text': '27 months', 'kind': 'metric', 'section': 'experience', 'restore_text': 'Served 27 months aboard Example Vessel.'},
     ]
 
     fixed = restore_protected_signals(result, {}, signals)
 
     assert 'FastAPI' in fixed['skills']
-    assert 'CDC No. MUM123456' in fixed['documents']['other']
+    assert 'CDC No. TEST-CDC-0001' in fixed['documents']['other']
     assert 'Served 27 months aboard Example Vessel.' in fixed['experience_bullets'][0]['bullets']
 
 
@@ -626,8 +626,8 @@ def test_normalize_rewrite_result_stringifies_dict_valued_summary():
 
 def test_normalize_rewrite_result_drops_bare_number_certification_entries():
     """
-    Real bug fixed, confirmed on real output: the model extracted a
-    Courses table's bare reference number ("10502363112502312") as a
+    The model must not extract a synthetic table's bare reference
+    number ("00000000000000000") as a
     standalone certification entry, in ADDITION to using it correctly
     inside a full course-card entry elsewhere in the same list. A bare
     number with no letters carries no identifiable information on its
@@ -635,47 +635,44 @@ def test_normalize_rewrite_result_drops_bare_number_certification_entries():
     """
     result = {
         'certifications': [
-            'Certificate of Proficiency in Advanced Fire Fighting | Centre For Maritime Training | 10502363112502312',
-            '10502363112502312',
-            '1050233223250248',
+            'Certificate of Proficiency in Advanced Fire Fighting | Example Maritime Training | 00000000000000000',
+            '00000000000000000',
+            '00000000000000001',
             'STCW (STCW)',
         ],
     }
     fixed = _normalize_rewrite_result(result, 'stop')
     assert fixed['certifications'] == [
-        'Certificate of Proficiency in Advanced Fire Fighting | Centre For Maritime Training | 10502363112502312',
+        'Certificate of Proficiency in Advanced Fire Fighting | Example Maritime Training | 00000000000000000',
         'STCW (STCW)',
     ]
 
 
 def test_normalize_rewrite_result_drops_fabricated_acronym_number_pair():
     """
-    Real bug fixed, confirmed on real generated output: given a source
-    Courses table with a reference number sitting near (but not
+    A source table can contain a synthetic reference number sitting near (but not
     describing) generic maritime acronyms elsewhere in the source, the
-    model fabricated an entry shaped exactly '(ECDIS) | 10502364112502510'
-    -- the SAME reference number that legitimately belongs to a
-    different, real course-card entry ("...Medical First Aid... |
-    10502364112502510"). The bare acronym-in-parens-plus-number shape,
-    when its number is confirmed to belong to a different real entry, is
+    model fabricated an entry shaped exactly '(ECDIS) | 00000000000000002'
+    -- the same synthetic reference number that belongs to a different
+    course-card entry. The bare acronym-in-parens-plus-number shape,
+    when its number is confirmed to belong to a different entry, is
     dropped as fabrication.
     """
     result = {
         'certifications': [
-            'Certificate of Proficiency in Medical First Aid | Centre For Maritime | 10502364112502510',
-            '(ECDIS) | 10502364112502510',
+            'Certificate of Proficiency in Medical First Aid | Example Maritime Training | 00000000000000002',
+            '(ECDIS) | 00000000000000002',
         ],
     }
     fixed = _normalize_rewrite_result(result, 'stop')
     assert fixed['certifications'] == [
-        'Certificate of Proficiency in Medical First Aid | Centre For Maritime | 10502364112502510',
+        'Certificate of Proficiency in Medical First Aid | Example Maritime Training | 00000000000000002',
     ]
 
 
 def test_normalize_rewrite_result_drops_fabrication_regardless_of_exact_wording():
     """
-    Generalized on purpose, not matched to one fixed string: confirmed
-    across multiple real live calls that the fabricated wording itself
+    Generalized on purpose, not matched to one fixed string: the fabricated wording
     varies ('(ECDIS) | <number>' one call, '(ECDIS) Course | <number>'
     another, a real-sounding title paired with a DIFFERENT course's
     number a third time) -- this is genuinely nondeterministic LLM
@@ -685,16 +682,16 @@ def test_normalize_rewrite_result_drops_fabrication_regardless_of_exact_wording(
     """
     result = {
         'certifications': [
-            'Certificate of Proficiency in Medical First Aid | Centre For Maritime | 10502364112502510',
-            '(ECDIS) Course | 10502364112502510',
-            'Oil and Chemical Tanker Cargo Operations | Centre for Maritime Training-Noida | 10502351112402515',
-            'Medical First Aid | 10502351112402515',
+            'Certificate of Proficiency in Medical First Aid | Example Maritime Training | 00000000000000002',
+            '(ECDIS) Course | 00000000000000002',
+            'Oil and Chemical Tanker Cargo Operations | Example Maritime Training | 00000000000000003',
+            'Medical First Aid | 00000000000000003',
         ],
     }
     fixed = _normalize_rewrite_result(result, 'stop')
     assert fixed['certifications'] == [
-        'Certificate of Proficiency in Medical First Aid | Centre For Maritime | 10502364112502510',
-        'Oil and Chemical Tanker Cargo Operations | Centre for Maritime Training-Noida | 10502351112402515',
+        'Certificate of Proficiency in Medical First Aid | Example Maritime Training | 00000000000000002',
+        'Oil and Chemical Tanker Cargo Operations | Example Maritime Training | 00000000000000003',
     ]
 
 
@@ -705,9 +702,9 @@ def test_normalize_rewrite_result_keeps_bare_acronym_pair_when_number_unconfirme
     duplicate from this data alone -- kept rather than guessed at, since
     dropping real (if terse) content is the worse failure mode.
     """
-    result = {'certifications': ['(GMDSS) | 19999999999999']}
+    result = {'certifications': ['(GMDSS) | 00000000000000004']}
     fixed = _normalize_rewrite_result(result, 'stop')
-    assert fixed['certifications'] == ['(GMDSS) | 19999999999999']
+    assert fixed['certifications'] == ['(GMDSS) | 00000000000000004']
 
 
 def test_normalize_rewrite_result_recovers_from_real_partial_wrapper_drift():
@@ -796,7 +793,7 @@ def test_rewrite_resume_recovers_from_real_wrapper_and_field_name_drift(monkeypa
             'firstName': 'TEST',
             'lastName': 'CANDIDATE',
             'email': 'test.candidate@example.com',
-            'phone': '+91 9000000000',
+            'phone': '+91-0000000000',
             'currentRank': 'Eto',
             'summary': (
                 'A motivated Electrical Cadet with a solid foundation in '
@@ -852,10 +849,10 @@ def test_rewrite_resume_recovers_from_real_wrapper_and_field_name_drift(monkeypa
                 'Generators - Expertise in fuel-efficient engines; proficient in Yanmar.',
             ],
             'certifications': [
-                {'type': 'PASSPORT', 'number': 'X0000000', 'expirationDate': '21/JAN/2030'},
-                {'type': 'US VISA', 'number': 'X0000001', 'expirationDate': '16/JUN/2029'},
-                {'type': 'CDC', 'number': 'MUM 000000', 'expirationDate': '16/APR/2034'},
-                {'type': 'INDOS No.', 'number': '24AB0000'},
+                {'type': 'PASSPORT', 'number': 'TEST-PASSPORT-0000', 'expirationDate': '21/JAN/2030'},
+                {'type': 'US VISA', 'number': 'TEST-VISA-0000', 'expirationDate': '16/JUN/2029'},
+                {'type': 'CDC', 'number': 'TEST-CDC-0000', 'expirationDate': '16/APR/2034'},
+                {'type': 'INDOS No.', 'number': 'TEST-INDOS-0000'},
                 {'type': 'High Voltage Training Certificate'},
             ],
             'references': 'Available on request',
@@ -946,10 +943,10 @@ _SOURCE_SECTIONS = {
         'High Voltage Safety and Switch Gear Course\n'
     ),
     'documents': (
-        'Passport No. X0000000 Exp 21/01/2030\n'
-        'US Visa No. X0000001 Exp 16/06/2029\n'
-        'CDC No. MUM000000 Exp 16/04/2034\n'
-        'INDOS No. 24AB0000\n'
+        'Passport No. TEST-PASSPORT-0000 Exp 21/01/2030\n'
+        'US Visa No. TEST-VISA-0000 Exp 16/06/2029\n'
+        'CDC No. TEST-CDC-0000 Exp 16/04/2034\n'
+        'INDOS No. TEST-INDOS-0000\n'
         'Yellow Fever Certificate No. 000000\n'
     ),
     'license': '',
@@ -982,8 +979,8 @@ def test_enforce_cert_completeness_appends_dropped_items():
             # 'High Voltage Safety and Switch Gear Course' -- dropped
         ],
         'documents': {
-            'passport': 'X0000000, exp 21/01/2030',
-            'cdc':      'MUM000000, exp 16/04/2034',
+            'passport': 'TEST-PASSPORT-0000, exp 21/01/2030',
+            'cdc':      'TEST-CDC-0000, exp 16/04/2034',
             'indos':    '24AB0000',
             # US Visa and Yellow Fever have no dedicated documents field
             # and weren't restated anywhere else either -- also dropped.
@@ -1028,11 +1025,11 @@ def test_enforce_cert_completeness_no_op_when_everything_already_covered():
             'High Voltage Safety and Switch Gear Course',
         ],
         'documents': {
-            'passport': 'X0000000',
-            'cdc':      'MUM000000',
+            'passport': 'TEST-PASSPORT-0000',
+            'cdc':      'TEST-CDC-0000',
             'indos':    '24AB0000',
         },
-        'skills': ['US Visa X0000001', 'Yellow Fever Certificate 000000'],
+        'skills': ['US Visa TEST-VISA-0000', 'Yellow Fever Certificate 000000'],
     }
     original_certs = list(result['certifications'])
 
@@ -1118,7 +1115,7 @@ def test_enforce_cert_completeness_never_appends_extraction_noise():
             '​21/12/1999\n'            # bare header-row DOB
             'hands-\n'                      # isolated word swept in from Summary
             'industry\n'                    # isolated word swept in from Summary
-            'Training10502363112502312\n'   # institute name glued to a reference number
+            'Training00000000000000000\n'   # synthetic institute name glued to a reference number
         ),
         'documents': '',
         'license': '',
@@ -1130,7 +1127,7 @@ def test_enforce_cert_completeness_never_appends_extraction_noise():
     assert '21/12/1999' not in combined, f'Bare date leaked into output: {fixed["certifications"]}'
     assert 'hands-' not in fixed['certifications'], f'Stray word leaked into output: {fixed["certifications"]}'
     assert 'industry' not in fixed['certifications'], f'Stray word leaked into output: {fixed["certifications"]}'
-    assert 'Training10502363112502312' not in combined, (
+    assert 'Training00000000000000000' not in combined, (
         f'Glued table artifact leaked into output: {fixed["certifications"]}'
     )
     # The one genuine line in that noisy blob must still survive.
@@ -1139,7 +1136,7 @@ def test_enforce_cert_completeness_never_appends_extraction_noise():
 
 def test_enforce_cert_completeness_merges_wrapped_cert_line_not_a_fragment():
     """
-    Real bug fixed, confirmed on real output (Ankur Shrivastava): the
+    A wrapped source certificate must be merged instead of split. The
     source resume wraps one certificate's name across two consecutive
     lines -- pipeline/parser.py's own clean section split produces
     exactly 'Passenger Familiarization and Crowd &\nCrisis Management
@@ -1183,20 +1180,18 @@ def test_enforce_cert_completeness_merges_wrapped_cert_line_not_a_fragment():
 
 def test_normalize_rewrite_result_drops_certification_number_not_in_source():
     """
-    Real bug fixed, confirmed on real output (Ankur Shrivastava): the AI
-    rewrite's own certifications list contained two separate
+    The rewrite's certifications list can contain separate
     "Certificate of Competency (CoC)" entries with numbers "123456" and
-    "789012" -- neither appears anywhere in the source resume text at
-    all (confirmed by grepping the actual source PDF). Classic
-    sequential placeholder-number fabrication, distinct from
+    "789012" -- neither appears anywhere in source text. This
+    reproduces sequential placeholder-number fabrication, distinct from
     _drop_fabricated_acronym_number_pairs (which only catches the SAME
     number reused across entries -- here each entry has its own
     invented number, so that check never fires). The fabricated numbers
     must be stripped and the now-identical entries deduped.
     """
     raw_text = (
-        'Ankur Shrivastava Second Engineer ... COC 95X - 9194 - 12/06/2026 '
-        'MEO CLASS II Passport Y1683454 CDC CH51310 INDoS 04EL0592'
+        'Sample Candidate Second Engineer ... COC ORIGINAL-REF-01 '
+        'MEO CLASS II Passport TEST-PASSPORT CDC TEST-CDC INDoS TEST-INDOS'
     )
     result = {
         'certifications': [
@@ -1236,7 +1231,11 @@ def test_rewrite_resume_full_pipeline_restores_dropped_certs(monkeypatch):
             'All required Basic & Advanced STCW Courses',
         ],
         'education': ['Some Degree — Some University — 2020'],
-        'documents': {'passport': 'X0000000', 'cdc': 'MUM000000', 'indos': '24AB0000'},
+        'documents': {
+            'passport': 'TEST-PASSPORT-0000',
+            'cdc': 'TEST-CDC-0000',
+            'indos': 'TEST-INDOS-0000',
+        },
         'languages': [],
     })
 

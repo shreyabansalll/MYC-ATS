@@ -18,31 +18,10 @@ def cert_present(cert_key: str, raw_text: str) -> bool:
     return any(alias in text_lower for alias in aliases)
 
 
-# Strips constructions like "coordinated with the Chief Engineer to
-# implement..." or "...under the direction of the Chief Engineer to
-# ensure..." before any rank pattern matching runs. Three confirmed real
-# false positives share the identical shape -- a rank title used as the
-# object of a sentence about interacting with a supervisor/colleague,
-# preceded by "the " and followed by " to " (an infinitive describing
-# what that OTHER person's role was for):
-#   - Victor John: original source has "...working under the direction
-#     of the Chief Engineer to ensure...". His actual rank is ETO, but
-#     detect_rank returned 'chief engineer', which then fed the AI
-#     rewrite prompt's "Current Sailing Rank" and corrupted the
-#     generated Professional Summary itself: "Chief Engineer with 31
-#     months of sea service..." for an actual ETO.
-#   - Ankur Shrivastava: an AI-rewritten bullet, "Coordinated with the
-#     Chief Engineer to implement PMS...", caused the same false
-#     positive when Stage 7's re-score ran detect_rank against the
-#     regenerated DOCX text.
-#   - Gilfred Chettiar: original source has "Coordinated with the
-#     Master and Chief Officer to maintain operational efficiency...",
-#     a COMPOUND object (two ranks chained by "and" before "to") --
-#     detect_rank returned 'chief officer' though he's never held that
-#     role (his real progression: Deck Cadet -> Third Officer -> Second
-#     Officer, and his cert is OOW, not a Chief Mate CoC), and this
-#     wrong rank was likewise baked into his AI-generated Summary:
-#     "Chief Officer with over 11 years of sea service...".
+# Strips third-party rank mentions such as "coordinated with the Chief
+# Engineer to implement..." before rank matching. These false positives
+# share a shape: a rank used as the object of a sentence about interacting
+# with a supervisor, preceded by "the " and followed by " to ".
 # A candidate describing their OWN rank in a seafarer resume essentially
 # never takes this exact "the <rank[, rank...] and <rank>> to" shape --
 # resumes state a rank as a title/header ("Chief Officer") or with
@@ -65,25 +44,19 @@ _THIRD_PARTY_RANK_MENTION = re.compile(
 
 
 # Checked FIRST, before any full-document scan: a resume's own
-# header/title line ("Jaideep Verma / Fourth Assistant Engineer",
-# "VICTOR JOHN / Electro Technical Officer") is the candidate's own,
-# authoritative self-declared rank. Confirmed via three real candidates
-# (Victor John, Gilfred Chettiar, Jaideep Verma) that checking this
-# first structurally dodges the ENTIRE family of "someone else's rank
+# header/title line ("Sample Candidate / Fourth Assistant Engineer",
+# "SAMPLE CANDIDATE / Electro Technical Officer") is the candidate's
+# authoritative self-declared rank. Checking this first structurally
+# dodges the family of "someone else's rank
 # mentioned further down" false positives -- bullets describing a
 # supervisor, a References section footer naming a referee's rank,
 # possessive "Chief Engineer's guidance" phrasing -- in one general
 # way, rather than requiring a fresh narrow regex for every new
-# grammatical shape those mentions take. Confirmed real shapes NOT
-# caught by _THIRD_PARTY_RANK_MENTION alone (found on Jagdish Nair and
-# Abdullah Tauqir Khan, both real candidates whose actual rank is
-# junior but whose detected rank was 'chief engineer'): "under Chief
+# grammatical shape those mentions take. Shapes not caught by
+# _THIRD_PARTY_RANK_MENTION alone include "under Chief
 # Engineer's guidance" (possessive, no "the"/"to") and "supporting the
-# Chief Engineer and senior officers" (no trailing "to"). And Jaideep
-# Verma's actual rank (Fourth Assistant Engineer, an entry-level
-# trainee) was overridden by "Mr. Amit Kumar Lathar - Chief Engineer"
-# in his References section -- a referee's title, not even a
-# supervisor mentioned in a duty bullet. The full-document scan (with
+# Chief Engineer and senior officers" (no trailing "to"), or a referee's
+# title in a References section. The full-document scan (with
 # _THIRD_PARTY_RANK_MENTION still applied as defense-in-depth) remains
 # the fallback for resumes whose header states no rank at all.
 _HEADER_CHARS = 300
@@ -110,8 +83,8 @@ def detect_rank(text: str) -> str:
         # British Chief/Second/Third/Fourth numbering the rest of this
         # system uses -- both are 4-tier systems counting down from
         # Chief, just numbered differently (US doesn't count Chief as
-        # "first"). Confirmed real gap: Abdullah Tauqir Khan's actual
-        # rank, "Third Assistant Engineer", wasn't recognized by this
+        # "first"). The "Third Assistant Engineer" title wasn't
+        # recognized by this
         # list at all (only by parser.py's separate, rarely-reached
         # RANK_KEYWORDS fallback) -- since the header-priority check
         # below only consults THIS list, his header match failed

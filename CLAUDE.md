@@ -54,7 +54,7 @@ Only Stage 5 (AI Rewrite) is non-deterministic. Both scoring layers are rules an
 
 | # | Stage | File | What it does | Tech |
 |---|---|---|---|---|
-| 1 | Extract | `pipeline/extractor.py` | Reads PDF/DOCX, detects two-column layouts, reconstructs reading order using word x/y coordinates. Flags structural ATS violations (tables, headers/footers, images, scanned PDFs). | pdfplumber, python-docx |
+| 1 | Extract | `pipeline/extractor.py` | Reads PDF/DOCX, detects two-column layouts, reconstructs reading order using word x/y coordinates. Flags structural ATS violations and optionally OCRs image pages with little/no text when local Tesseract is installed. | pdfplumber, PyMuPDF, optional Tesseract executable |
 | 2 | Parse | `pipeline/parser.py` | Extracts name, contact, sections, skills, rank. Pulls sea-service months from PDF service-record tables (`extract_sea_months`), with a text-based fallback (`extract_sea_months_from_text`) for when there's no PDF — e.g. re-scoring a generated DOCX. | spaCy (`en_core_web_lg`), regex, `python-dateutil` |
 | 3 | Generic ATS Score | `services/two_layer.py` + `generic_ats/` | Always-on Resume Matcher-compatible score: 40% parse/layout checks + 60% content score (keywords, skills, title, sections, dates). | Deterministic rules and whole-term keyword matching |
 | 4 | Maritime Overlay | `services/two_layer.py` + `pipeline/maritime.py` | Optional maritime rules for certs, sea service, vessel types, and rank. Activates for a detected seafarer rank or explicit maritime target fields. | Custom rule engine over `rules/cert_rules.py`, `rules/aliases.py` |
@@ -146,7 +146,7 @@ It is **not** force-fit everywhere: `rewrite_resume()`'s internal signature stil
 venv/bin/python main.py <resume_file_path> [job_description]
 
 # Example with a custom job description
-venv/bin/python main.py data/test_resumes/ShreyaBansal_Resume_v2.pdf "Seeking Python developer with FastAPI experience"
+venv/bin/python main.py data/test_resumes/sample_resume.pdf "Seeking Python developer with FastAPI experience"
 
 # Batch-process the validation set (regression check after any rules/ or scoring change)
 venv/bin/python pipeline/batch_processor.py
@@ -156,7 +156,12 @@ venv/bin/uvicorn api:app --reload --port 8000
 
 # Run tests
 venv/bin/python -m pytest tests/
+
+# Run the offline synthetic parsing/scoring regression harness
+venv/bin/python -m evaluation.run_synthetic_evaluation
 ```
+
+The synthetic evaluation uses fictional generated PDF/DOCX inputs and is not a real-world accuracy benchmark; see `EVALUATION_GUIDE.md`.
 
 ## Scoring engine design
 
@@ -198,17 +203,20 @@ All protected endpoints require `X-API-Key`: client endpoints use `MYC_API_KEY`,
 |---|---|---|
 | GET | `/` | Service info, links to docs/health |
 | POST | `/ats/submit` | Upload a PDF/DOCX resume (+ optional `job_description`, `target_rank`, `target_cruise_line`, `career_track`). Returns `job_id` immediately; processing runs in `BackgroundTasks`. Dedup by SHA-256 within 24h. |
-| POST | `/ats/score` | Stages 1-4 only (extract/parse/ATS score/maritime score) — no AI rewrite, no LLM dependency, no `job_id`/polling. Synchronous, returns the full result in one response. Same file validation/rate-limit/auth posture as `/ats/submit`. Calls the exact same underlying functions `run_pipeline()` does for its "before" scores — see "Known-fixed bugs" for how that's actually verified, not just claimed. |
+| POST | `/ats/score` | Stages 1-4 only (extract/parse/ATS score/maritime score) — no AI rewrite, no LLM dependency, no `job_id`/polling. Synchronous, returns the full result in one response, including additive certificate evidence and expiry dates, vacancy requirement/skill-gap evidence when an explicit vacancy JD is supplied, score explanation, company/rank keyword signals, ATS-format advisories, and MYC placement guidance. Same file validation/rate-limit/auth posture as `/ats/submit`. |
+| POST | `/ats/compare` | Compares 2-10 resumes synchronously without creating retained job records. Returns vacancy evidence, ATS/maritime scores, and advisory ranking and placement-review factors. |
 | GET | `/ats/status/{job_id}` | Poll every 2-3s: `queued`/`processing`/`done`/`failed`, `progress`, `current_stage`. |
-| GET | `/ats/result/{job_id}` | Full before/after ATS + maritime scores and grades, issues, recommendations, missing certs, keyword data, download URL. |
+| GET | `/ats/result/{job_id}` | Full before/after ATS + maritime scores and grades, issues, recommendations, missing certs, keyword data, certificate evidence, company/rank keyword signals, format advisories, MYC placement guidance, rewrite-integrity evaluation, and download URL. |
 | GET | `/ats/download/{job_id}` | Downloads the optimised DOCX. 410 if past the 48h TTL. |
 | DELETE | `/ats/job/{job_id}` | Deletes the job record and output files — GDPR right-to-erasure. |
-| POST | `/ats/cleanup` | Deletes all jobs past their TTL. Wire to cron (see `crontab_example.txt`). |
+| POST | `/ats/cleanup` | Deletes expired jobs/outputs and orphaned UUID-named temporary uploads older than `JOB_TTL_HOURS`; skips uploads belonging to queued/processing jobs. Wire to cron (see `crontab_example.txt`). |
 | GET | `/ats/admin/metrics` | Aggregate stats — requires `MYC_ADMIN_KEY`, never the client key. |
 | GET | `/health` | No auth. Disk space + database check; status is `degraded` if either check fails. |
 | GET | `/health/deep` | Auth required. Claude API, DB, and disk checks, for monitoring alerts. |
 
 `/ats/result/{job_id}` returns `maritime_score_before`/`maritime_grade_before` and `maritime_score_after`/`maritime_grade_after` as distinct, independently-computed values (plus `maritime_score`/`maritime_grade` back-compat aliases pointing at the before-value) — see "Known-fixed bugs."
+
+Domain-specific additions are advisory and additive: `cert_evidence` uses `evidenced`, `not_evidenced`, `confirmed_missing`, `expired`, and `not_applicable`; absence from a resume is only `not_evidenced`, not proof of absence. `vacancy_match` is assessed only for an explicitly supplied vacancy; generated generic/rank templates do not count as vacancy postings. Missing evidence yields review status, never proof a candidate lacks a qualification. `certificate_validity` reports only explicit document dates and does not infer universal validity periods or underlying qualification validity. `company_keyword_score`, vacancy match and rank-keyword matches are separate from the generic ATS score. ATS platform mappings are MYC-supplied operational assumptions, not verified employer configurations. `rank_eligibility` is internal MYC placement guidance, not a regulatory determination; uncertain rank/date evidence requires management review.
 
 ## Observability
 
@@ -232,7 +240,7 @@ Copy `env_template.txt` to `.env` (never commit `.env`).
 | `DASHBOARD_ACCESS_KEY` | No | unset | Separate key for trusted team access to the internal dashboard over ngrok. Required before remote dashboard access is allowed; testers receive an eight-hour HttpOnly session. Never reuse `MYC_API_KEY`. |
 | `ANTHROPIC_API_KEY` | For rewriting | — | Anthropic API key for Claude resume tailoring and rewrites. Scoring-only requests do not need it; without it, submissions preserve source-derived content instead of running an AI rewrite. |
 | `MAX_FILE_MB` | No | `5` | Upload size limit. |
-| `JOB_TTL_HOURS` | No | `48` | How long output files + job records are retained before `/ats/cleanup` deletes them. This is the PII retention boundary — do not extend without a data-retention reason, and don't add long-term storage of intermediate pipeline stages (extracted text, raw parses) elsewhere either; structured logging covers debugging needs. |
+| `JOB_TTL_HOURS` | No | `48` | How long completed outputs and job records are retained before `/ats/cleanup` deletes them; orphaned UUID-named temporary uploads are also swept after this age. Normal pipeline runs remove source uploads in `finally`, but a process crash can leave an orphan until the nightly cleanup runs. This is the configured retention target, not a guarantee if cron is not installed or cleanup fails. Do not extend without a data-retention reason, and don't add long-term storage of intermediate pipeline stages (extracted text, raw parses) elsewhere; structured logging covers debugging needs. |
 | `TMP_DIR` | No | `/tmp/ycm-ats` | Scratch space for uploaded files before/during processing. |
 | `ALLOWED_ORIGINS` | Production | `*` in development | Comma-separated exact browser origins. Production startup rejects an empty or wildcard list; set the actual MYC frontend origins. |
 | `MAX_CONCURRENT_JOBS` | No | `5` | Max resumes processing at once, service-wide — `submit()` returns 503 (not silent queueing) once `_try_acquire_job_slot()`'s atomic check against the real `jobs.db` (status IN `queued`/`processing`) is at capacity. Enforced correctly across `uvicorn --workers N` since the check reads the one shared database, not per-process memory — confirmed via a real `--workers 2` load test (see "Known-fixed bugs"). Distinct from the 10/minute per-IP rate limit on `/ats/submit` (via `slowapi`), which only throttles new submissions, not concurrent in-flight jobs — that limiter's state is still per-worker-process (real ceiling with 2 workers is ~2x the configured value), a deliberately accepted tradeoff given this service has one shared `MYC_API_KEY` across all of MYC's traffic. |
@@ -296,12 +304,12 @@ rm -f data/jobs.db-wal data/jobs.db-shm   # stale WAL/SHM from the old process, 
 
 **Job stuck in `processing`**
 - Since `BackgroundTasks` runs in-process (no separate worker/queue — see "Architecture"), a job stuck in `processing` almost always means the worker process died mid-job (OOM, crash, manual restart) without reaching the `except`/`finally` block that would mark it `failed`.
-- There is currently no automatic sweeper that requeues or times out stuck jobs (a known open item — whether a monitoring/requeue system exists elsewhere or needs building is still an unresolved product/eng decision, not something to build speculatively here). Until that's resolved: identify stuck jobs with `SELECT job_id, current_stage, created_at FROM jobs WHERE status='processing' AND created_at < datetime('now', '-1 hour')`, and either manually mark them `failed` via a one-off script or delete them via `DELETE /ats/job/{job_id}` so the candidate can resubmit.
+- On startup, each worker marks `queued` or `processing` jobs older than 30 minutes as failed with a resubmission message, freeing their concurrency slots. This is age-based recovery, not a requeue; a job that legitimately runs longer than 30 minutes can be marked failed. `/ats/cleanup` separately removes expired rows and orphaned uploads.
 - Check server logs around the job's `job_id` for the last stage it reached (`"stage":"..."` log lines) to diagnose which pipeline stage hung.
 
 ## Testing
 
-`tests/` covers the API, CLI, Claude client, generic ATS layer, maritime overlay, extraction, generation, and legacy scoring functions. Run with `venv/bin/python -m pytest tests/`.
+`tests/` covers the API, CLI, Claude client, generic ATS layer, maritime overlay, extraction, generation, and legacy scoring functions. Resume inputs in the test suite are generated fictional fixtures; tests do not require the ignored local candidate-resume directory. Run with `venv/bin/python -m pytest tests/`.
 
 After scoring-rule changes, run the test suite. `pipeline/batch_processor.py` exercises the legacy scorer, not the production two-layer scorer; a full 269-resume regression run for the new two-layer path is still needed before publishing updated performance claims.
 

@@ -282,7 +282,7 @@ def score_sections(parsed: dict, raw_text: str = '') -> tuple:
         # by definition for a role that hasn't ended before it began, so
         # a candidate with exactly ONE role was flagged as
         # "non-chronological" on every single resume, unconditionally.
-        # Confirmed on real output (Mrinal Thapa, single role).
+        # Reproduced by the single-role chronology regression test.
         # Reverse-chronological order is a property of the ORDER roles
         # are listed in relative to each other, not of any one role's own
         # date range — so this only takes each range's START year (via

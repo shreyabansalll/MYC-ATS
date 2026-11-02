@@ -16,10 +16,8 @@ nlp = spacy.load('en_core_web_lg')
 # Maritime seafarer resumes use non-standard headings — these must all be covered
 SECTION_HEADERS = {
     'summary':          r'(?i)^\s*(summary|professional summary|profile|objective|about me|career objective|personal profile)\s*$',
-    # "Seafarer['']s Service Record[s]" is the standard heading for the
-    # structured sign-on/sign-off table on real Indian seafarer resumes
-    # (confirmed verbatim on two real candidates, Gilfred Chettiar and
-    # Ankur Shrivastava) -- the bare "service record"/"sea record"
+    # "Seafarer['']s Service Record[s]" is a common heading for the
+    # structured sign-on/sign-off table -- the bare "service record"/"sea record"
     # alternatives below never matched it, since split_sections() requires
     # a heading line to match a pattern IN FULL (^...$), and "Seafarer's
     # Service Record" isn't equal to "service record" as a whole line.
@@ -27,7 +25,7 @@ SECTION_HEADERS = {
     # via pdfplumber's actual table grid, not word-coordinate guessing --
     # see extractor.py's _extract_real_tables) fell through to whatever
     # section preceded it in the raw text instead -- confirmed landing in
-    # "skills" on both candidates -- so the AI rewrite prompt's Experience
+    # "skills" on affected resumes -- so the AI rewrite prompt's Experience
     # field (which reads sections['experience'] specifically) never saw
     # this authoritative company/vessel/date data at all. The apostrophe
     # is optional and matches straight/curly/absent (source PDFs use a
@@ -338,8 +336,8 @@ def _parse_flex_date(token: str):
     """
     Parses either MM/YYYY (the format the AI rewrite prompt requires) or
     YYYY-MM-DD (ISO, what the model actually returns often enough in
-    practice to matter -- confirmed on real output: Ankur Shrivastava's
-    experience_bullets dates came back as "2018-01-01 - 2020-12-31"
+    practice to matter -- the AI may return dates as
+    "2018-01-01 - 2020-12-31"
     despite the schema explicitly asking for "MM/YYYY - MM/YYYY"). A
     date-range regex hard-coded to MM/YYYY alone silently found zero
     matches against ISO dates, so extract_sea_months_from_text returned
@@ -431,22 +429,22 @@ def extract_skills(text: str) -> list:
     KNOWN_SKILLS = [
     # Maritime Certificates
     'STCW', 'Standards of Training Certification and Watchkeeping',
-    'CoC', 'Certificate of Competency', 'GMDSS', 'ENG1',
+    'CoC', 'Certificate of Competency', 'GMDSS','GOC','ENG1',
     'BOSIET', 'HUET', 'OPITO', 'CBSP',
     'Basic Safety Training', 'BST',
-    'Advanced Firefighting', 'Medical First Aid',
-    'Proficiency in Survival Craft', 'PSC',
-    'Crowd Management', 'Crisis Management',
-    'Security Awareness', 'ISPS',
-    'High Voltage', 'DP', 'Dynamic Positioning',
+    'Advanced Firefighting', 'Medical First Aid', 'MFA','EFA','PST','PSSR','FPFF',
+    'PSCRB', 'Proficiency in Survival Craft and Rescue Boats',
+    'Crowd Management', 'Crisis Management', 'IGF', 'International Gas Carrier Familiarization',
+    'Security Awareness', 'ISPS', 'SSO', 'Ship Security Officer', 'Ship Security Awareness',
+    'High Voltage', 'DP', 'Dynamic Positioning', 'RAC'
     'Tanker Familiarization', 'Chemical Tanker',
     'Oil Tanker', 'Liquefied Gas Tanker',
-    'ECDIS', 'Electronic Chart Display',
+    'ECDIS', 'Electronic Chart Display and Information System',
     'ARPA', 'Radar', 'AIS',
-    'Passenger Ship Familiarization',
+    'Passenger Ship Familiarization', 'STSDSD', 'Standard of Training for Seafarers Designated Security Duties',
 
     # Regulations & Codes
-    'COLREGS', 'COLREGs', 'MARPOL', 'SOLAS', 'ISM',
+    'COLREGs', 'MARPOL', 'SOLAS', 'ISM',
     'ISM Code', 'ISPS Code', 'MLC', 'Maritime Labour Convention',
     'SMS', 'Safety Management System',
     'ISGOTT', 'COSWP', 'IMO',
@@ -464,23 +462,28 @@ def extract_skills(text: str) -> list:
     # Vessel Types
     'Chemical Tanker', 'Oil Tanker', 'Product Tanker',
     'Crude Oil Tanker', 'LNG', 'LPG',
-    'Bulk Carrier', 'Container Vessel', 'Container Ship',
+    'Bulk Carrier', 'Container Vessel', 'Cruise Vessel',
     'Ro-Ro', 'Car Carrier', 'Passenger Vessel',
     'Offshore', 'AHTS', 'PSV', 'OSV',
     'General Cargo', 'Reefer',
 
     # Navigation & Operations
-    'Watchkeeping', 'Bridge Watch', 'Engine Watch',
+    'Watchkeeping', 'Bridge Watch', 'Engine Watch', 'Independent Watchkeeping',
+    'Cargo Handling', 'Cargo Operations', 'Ballast Operations',
     'Passage Planning', 'Chart Correction',
     'Cargo Operations', 'Ballast Management',
     'Mooring', 'Anchoring', 'Stability',
     'Planned Maintenance System', 'PMS',
-    'Bunkering', 'Tank Cleaning',
+    'Bunkering', 'Tank Cleaning', 'Navigation', 'Ship Handling', 'Ship Maneuvering',
 
     # Soft Skills
     'Leadership', 'Communication', 'Teamwork',
     'Problem Solving', 'Safety Culture',
-    'Crisis Management', 'Decision Making',
+    'Crisis Management', 'Decision Making', 'Multi Cultural Awareness', 'Multi Cultural',
+    'Adaptability', 'Time Management', 'Conflict Resolution', 'Stress Management',
+    'Attention to Detail', 'Critical Thinking', 'Interpersonal Skills',
+    'Collaboration', 'Resilience', 'Ethical Judgment', 'Situational Awareness',
+    'Decision Making Under Pressure', 'Continuous Learning', 'Mentoring and Coaching',
 ]
     text_lower = text.lower()
     found = [skill for skill in KNOWN_SKILLS if skill.lower() in text_lower]

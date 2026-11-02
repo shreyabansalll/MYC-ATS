@@ -26,3 +26,6 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest tests/ -v
+
+      - name: Run synthetic evaluation
+        run: python -m evaluation.run_synthetic_evaluation
